@@ -117,7 +117,38 @@ class LSEClient:
             expiry = datetime.date.fromisoformat(str(raw)[:10])
             if expiry >= today:
                 expiries.add(expiry)
-        return sorted(expiries)
+        if expiries:
+            return sorted(expiries)
+        return await self._probe_expiries(underlying, today)
+
+    async def _probe_expiries(
+        self, underlying: str, today: datetime.date, *, window_days: int = 14
+    ) -> list[datetime.date]:
+        """Fallback for extremely dense chains (confirmed live 2026-08-04:
+        SPY, QQQ). `options()` with no filter — or with min_dte/max_dte,
+        which made no difference — returns a stale, capped page (exactly
+        the 5000-row limit, every row months-old) instead of an error, so
+        the normal path above silently comes back empty for these two.
+        Querying a single *exact* `expiry=` date works correctly and
+        returns live, current-day data — this probes the next
+        `window_days` calendar days directly rather than trust the
+        vendor's broken range filter, stopping once 2 expiries are found
+        (all a caller ever uses — ARCHITECTURE.md §6's "nearest 2
+        expiries")."""
+        found: list[datetime.date] = []
+        for offset in range(window_days):
+            day = today + datetime.timedelta(days=offset)
+            try:
+                rows = await asyncio.to_thread(
+                    self._client.options, underlying, expiry=day.isoformat()
+                )
+            except LSEError:
+                continue
+            if rows:
+                found.append(day)
+            if len(found) >= 2:
+                break
+        return found
 
     async def bars(
         self, key: str, tf: Timeframe, start: datetime.date, end: datetime.date
