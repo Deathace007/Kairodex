@@ -1,0 +1,38 @@
+name: kairodex
+
+services:
+  timescaledb:
+    # "-all" tag: includes compression policies + continuous aggregates (Timescale
+    # License, not Apache-2/-oss) — both are load-bearing for §6 capacity plan.
+    image: timescale/timescaledb-ha:pg16.14-ts2.28.1-all
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-kairodex}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-kairodex_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-kairodex}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - timescaledb_data:/home/postgres/pgdata/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-kairodex} -d ${POSTGRES_DB:-kairodex}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  timescaledb_data:
+  redis_data:

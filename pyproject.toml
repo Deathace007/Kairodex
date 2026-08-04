@@ -1,0 +1,79 @@
+[project]
+name = "kairodex"
+version = "0.1.0"
+description = "AI-assisted options-buying paper trading research platform"
+requires-python = ">=3.12"
+dependencies = [
+  "pydantic>=2.9",
+  "pydantic-settings>=2.6",
+  "sqlalchemy[asyncio]>=2.0.36",
+  "asyncpg>=0.30",
+  "alembic>=1.14",
+  "httpx>=0.28",
+  "websockets>=14.1",
+  "structlog>=24.4",
+  "typer>=0.15",
+  "polars>=1.17",
+  "numpy>=2.1",
+  "redis>=5.2",
+  "pyyaml>=6.0.2",
+  "tenacity>=9.0",
+  "apscheduler>=3.11",
+  "lse-data>=0.14.0",
+]
+
+[dependency-groups]
+dev = [
+  "ruff>=0.8",
+  "mypy>=1.13",
+  "pytest>=8.3",
+  "pytest-asyncio>=0.24",
+  "testcontainers[postgres]>=4.9",
+  "import-linter>=2.1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kairodex"]
+
+[project.scripts]
+kairodex = "kairodex.cli:app"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["alembic/versions"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+# Typer's Option()/Argument() defaults are call-in-default by design.
+"src/kairodex/cli.py" = ["B008"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.importlinter]
+root_package = "kairodex"
+
+[[tool.importlinter.contracts]]
+name = "API is glue, not business logic"
+type = "forbidden"
+source_modules = ["kairodex.api"]
+forbidden_modules = ["kairodex.strategy", "kairodex.risk", "kairodex.engine", "kairodex.backtest"]
+
+[[tool.importlinter.contracts]]
+name = "Optuna stays out of the live trading path"
+type = "forbidden"
+source_modules = ["kairodex.engine", "kairodex.strategy", "kairodex.risk", "kairodex.execution"]
+forbidden_modules = ["optuna"]

@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.python-version
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+htmlcov/
+.coverage
+
+# Secrets & env
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+broker_tokens.json
+
+# Data & runtime artifacts (never committed — see docs/ARCHITECTURE.md §6)
+# Anchored to repo root only — an unanchored "data/" would also match the
+# src/kairodex/data package (the vendor adapters), which must be tracked.
+/data/
+!/data/.gitkeep
+
+# Node / frontend
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Alembic
+alembic/versions/__pycache__/
