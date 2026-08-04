@@ -49,7 +49,6 @@ logger = logging.getLogger(__name__)
 T1_POLL_INTERVAL = datetime.timedelta(seconds=60)
 WS_FLUSH_INTERVAL = datetime.timedelta(seconds=3)
 WS_FLUSH_SIZE = 200
-WS_EXPECTED_TICK_INTERVAL = datetime.timedelta(seconds=2)
 BACKFILL_LOOKBACK_DAYS = 5  # how far back to search for the last recorded bar on a cold start
 
 
@@ -276,9 +275,17 @@ async def ws_stream_loop(
                 async for tick in client.subscribe(vendor_keys, FeedMode.FULL):
                     now = datetime.datetime.now(datetime.UTC)
                     prev = prev_ticks.get(tick.instrument_key)
-                    quality = flag_tick(
-                        tick, now=now, prev_tick=prev, expected_interval=WS_EXPECTED_TICK_INTERVAL
-                    )
+                    # No `expected_interval` here: SEQUENCE_GAP is a
+                    # per-instrument tick-to-tick spacing check, but options
+                    # (especially thin strikes) can legitimately go minutes
+                    # between prints — that's normal market microstructure,
+                    # not a feed problem. A live 2s threshold flagged most of
+                    # the book as "gapped" during a healthy connection,
+                    # which would have made the gap-rate exit criterion
+                    # meaningless. Stream-level liveness (did the connection
+                    # drop) is what feed_health.connected/last_message_at
+                    # already tracks — that's the real gap signal.
+                    quality = flag_tick(tick, now=now, prev_tick=prev)
                     prev_ticks[tick.instrument_key] = tick
 
                     async with sessionmaker() as session:
