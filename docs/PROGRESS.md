@@ -4,9 +4,11 @@
 **Current phase:** P1 (The Recorder) — verified against live infra for US
 (LSE, market open at test time): migrations applied, T0/T1 sync, and
 `ingest run` confirmed writing real option_quotes with `kairodex status`
-showing a connected, streaming feed. NSE (Upstox) still needs a live pass
-during market hours (9:15–15:30 IST) — see §7. **US_INDEX segment now
-trades SPY/QQQ/DIA/IWM (ADR 0007)** — LSE carries no true index options.
+showing a connected, streaming feed, **0.02% gap rate** (target <0.5%).
+US_INDEX (ADR 0007: SPY/QQQ/DIA/IWM) fully live-verified — all four
+streaming correctly-tagged quotes, including a real vendor bug found and
+fixed in SPY/QQQ's expiry discovery (see §1). NSE (Upstox) still needs a
+live pass during market hours (9:15–15:30 IST) — see §7.
 **Next phase:** finish NSE live verification, then P2 (Pricing & features).
 
 > Read this file first, every session. Update it whenever a phase
@@ -34,6 +36,7 @@ Don't re-litigate these — each overrides SPEC.md or an earlier assumption. Ful
 | **Alert delivery (desktop/webhook) deferred** — P1 only logs + `kairodex status` | User's explicit choice — nothing downstream reads a push alert yet | Wire `structlog` + a sink (ARCHITECTURE.md §17) when something needs paging, not pulling |
 | **Upstox WS wire format sourced from the vendor's own `.proto`** (fetched from `github.com/upstox/upstox-python`), not guessed from docs prose | Reaction to the LSE field-name mistake below (§6 #2) — same mistake here would poison every recorded quote, not just one test | `src/kairodex/data/upstox/proto/MarketDataFeedV3.proto` |
 | **US_INDEX segment trades SPY/QQQ/DIA/IWM (ETF proxies), not SPX/NDX/RUT** | LSE carries no true index options at all (verified live against its full 3,186-underlying catalog — `list_expiries()` for SPX/NDX/RUT returns zero, no error). User's explicit decision, overriding SPEC_REVIEW.md §B1's original SPX/NDX/RUT-only call | ADR 0007; `config/watchlist.yaml`. These are real ETF shares (`InstrumentKind.UNDERLYING`, not `INDEX`) on the American/physically-settled pricing path, not the European/cash-settled one §B1 assumed — matters once P2 pricing lands. Must not also appear in `us_stock` — same option legs, segment would flip depending on iteration order |
+| **LSE's date-range `options()` filter is broken for SPY/QQQ specifically** | Live-discovered: unfiltered or `min_dte`/`max_dte`-filtered calls return exactly 5000 rows, all months-old, for these two tickers only (every other tested ticker works). An exact `expiry=` date query returns correct live data | `kairodex/data/lse/client.py`'s `_probe_expiries` — probes exact dates directly when the normal call comes back empty, bounded to 14 days / stops at 2 matches. All four `us_index` constituents live-verified end to end after the fix: real quotes, correct `segment` tag, 0.02% gap rate |
 | **Per-tick SEQUENCE_GAP quality flag removed from the WS path** | Live-verified: a 2s expected-interval threshold flagged most of a healthy live book as "gapped," since individual option contracts (especially thin strikes) legitimately go minutes between prints — that's normal, not a feed problem. `feed_health.connected`/`last_message_at` is the real stream-liveness signal | `kairodex/data/recorder.py` — `flag_tick()` still checks STALE/CROSSED_BOOK/ZERO_VOLUME/OUTLIER per tick |
 
 ---
@@ -165,6 +168,7 @@ flag used too tight a per-contract threshold and was removed from that path.
 6. **`ws_stream_loop`'s periodic flush used `asyncio.wait_for(anext(stream), timeout=...)`** — caught in self-review before deploying, not live. Cancelling a pending `anext()` on the WS async generator tears the connection down instead of just flushing. Fixed by running the flush as an independent task. See §4a.
 7. **`config/watchlist.yaml`'s TATAMOTORS / "Nifty Bank" don't match live Upstox symbols** — TATAMOTORS isn't a currently-listed NSE symbol (2025 demerger); Bank Nifty's real `trading_symbol` is `BANKNIFTY`. `sync-watchlist`'s miss-reporting caught both; fixed by using `M&M` and `BANKNIFTY`.
 8. **WS SEQUENCE_GAP flag used a 2s per-contract threshold** — flagged most of a healthy live options book as "gapped," since individual contracts (thin strikes especially) legitimately go minutes between prints. Removed from the WS path; see §1 and §4a.
+9. **LSE's `options()` date-range filter is broken for SPY/QQQ** — returns a stale, capped 5000-row page regardless of `min_dte`/`max_dte`; every other tested ticker (DIA, IWM, AAPL, TSLA) works correctly unfiltered. Exact `expiry=` queries return correct live data for SPY/QQQ too. Fixed with a bounded exact-date probe fallback; see §1.
 
 ---
 
@@ -179,11 +183,10 @@ actually populated the way `MarketFullFeed` implies) are still unconfirmed.
 The LSE field-name mistake in §6 #2 is exactly the class of bug to look
 for. Fix and log any surprises the same way #2 was handled.
 
-**US_INDEX is resolved** (ADR 0007) — trades SPY/QQQ/DIA/IWM. `sync-watchlist
---market us` needs a re-run to seed the corrected list (SPY/QQQ moved out
-of `us_stock` into `us_index`); not yet re-run against the VM as of this
-write-up.
+**US_INDEX is resolved and fully live-verified** (ADR 0007) — SPY/QQQ/DIA/IWM
+all streaming correctly-tagged quotes on the VM, including the SPY/QQQ
+expiry-discovery fix (§6 #9). Nothing further needed here.
 
-**Exit criterion** (ARCHITECTURE.md §19, unchanged): 5 consecutive trading sessions recorded, < 0.5% gap rate on T1, clean restart mid-session with no data loss. `kairodex status`'s gap-rate line is the number to watch — now STALE-driven only (see §1), so it should actually mean something.
+**Exit criterion** (ARCHITECTURE.md §19, unchanged): 5 consecutive trading sessions recorded, < 0.5% gap rate on T1, clean restart mid-session with no data loss. `kairodex status`'s gap-rate line is the number to watch — now STALE-driven only (see §1), so it should actually mean something. US/LSE measured **0.02%** on the last verification pass, well inside target; NSE/Upstox is the remaining unknown.
 
 Once NSE is verified, P2 (Pricing & features) is next: Black-76 + Bjerksund, IV solve, forward derivation, feature registry.
