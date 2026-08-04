@@ -5,10 +5,15 @@
 #
 # This is a proposed default (liquid F&O / most-traded names), not a
 # strategy decision — edit freely before `kairodex ingest sync-watchlist`.
+#
+# Verified against a live sync-instruments pull on the VM, 2026-08-04:
+# TATAMOTORS is no longer a listed NSE symbol as of this session's live
+# instrument master (superseded by its 2025 demerger); Bank Nifty's real
+# trading_symbol is "BANKNIFTY", not "Nifty Bank".
 
 nse_index:
   - "Nifty 50"
-  - "Nifty Bank"
+  - BANKNIFTY
 
 nse_stock:
   - RELIANCE
@@ -25,7 +30,7 @@ nse_stock:
   - HINDUNILVR
   - BAJFINANCE
   - MARUTI
-  - TATAMOTORS
+  - M&M
   - SUNPHARMA
   - TATASTEEL
   - ADANIENT
