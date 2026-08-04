@@ -37,10 +37,13 @@ nse_stock:
   - WIPRO
   - ONGC
 
-us_index:
-  - SPX
-  - NDX
-  - RUT
+# EMPTY, deliberately: verified live (2026-08-04) that LSE's entire options
+# catalog (3,186 underlyings) carries no SPX/NDX/RUT — equity/ETF options
+# only (SPY/QQQ/IWM are the closest listed proxies, already in us_stock).
+# `list_expiries()` for all three returns zero contracts, no error, just an
+# empty vendor catalog. This isn't a watchlist typo — it's a vendor-coverage
+# gap for the whole US_INDEX segment. See docs/PROGRESS.md for the decision.
+us_index: []
 
 us_stock:
   - AAPL
