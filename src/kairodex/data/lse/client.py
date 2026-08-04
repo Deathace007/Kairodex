@@ -9,17 +9,13 @@ The vendor client is synchronous (urllib-based REST, though it has native
 async streaming); each call here runs it in a thread via asyncio.to_thread
 so it behaves like the rest of this async codebase.
 
-Field-name confidence, since this was built by reading the client's source
-(github.com/londonstrategicedge/lse-data) rather than a live authenticated
-call — no test key was available while writing this:
-  - CONFIRMED (present in lse.client._OPTION_ROUND / candles()/Tick):
-    last_price, underlying_price, iv, delta, gamma, theta, vega, rho,
-    volume, premium_today, open/high/low/close, timestamp.
-  - BEST-EFFORT (plausible names, not seen in a real response): the OSI
-    ticker field on a chain row, bid/ask, open interest. Verify these
-    against one real `options()` call once UPSTOX_ACCESS_TOKEN's LSE
-    counterpart (LSE_API_KEY) is available, and fix the `.get()` keys in
-    _parse_chain_row below if the vault uses different names.
+Chain-row field names below are confirmed against a real authenticated
+`options()` call (2026-08-04): ticker, underlying, strike, expiry,
+contract_type ("call"/"put" — not "type"), last_price, volume_today (not
+"volume"), premium_today, underlying_price, dte, iv, delta, gamma, theta,
+vega, rho, last_trade_at, updated_at. Notably: **no bid/ask/open-interest
+fields exist on this endpoint** — the docs mentioning a "chain with bid/ask"
+were wrong for this vendor; those Tick fields stay None for LSE quotes.
 """
 
 from __future__ import annotations
@@ -126,17 +122,15 @@ class LSEClient:
 
 
 def _parse_chain_row(row: dict[str, Any], ts: datetime.datetime) -> Tick:
-    otype = row.get("type")  # best-effort field name — see module docstring
+    otype = row.get("contract_type")
     return Tick(
-        instrument_key=row.get("ticker") or row.get("symbol") or "",
+        instrument_key=row.get("ticker") or "",
         ts=ts,
         strike=to_decimal(row.get("strike")),
-        option_type=({"call": "C", "put": "P"}.get(str(otype).lower()) if otype else None),
+        option_type={"call": "C", "put": "P"}.get(str(otype).lower()) if otype else None,
         ltp=to_decimal(row.get("last_price")),
-        bid=to_decimal(row.get("bid") or row.get("bid_price")),
-        ask=to_decimal(row.get("ask") or row.get("ask_price")),
-        volume=row.get("volume"),
-        oi=row.get("oi") or row.get("open_interest"),
+        # No bid/ask/open-interest on this endpoint — left None (see module docstring).
+        volume=row.get("volume_today"),
         underlying_px=to_decimal(row.get("underlying_price")),
         vendor_iv=to_decimal(row.get("iv")),
         delta=to_decimal(row.get("delta")),
