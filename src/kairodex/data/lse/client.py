@@ -25,7 +25,7 @@ import datetime
 from collections.abc import AsyncIterator
 from typing import Any
 
-from lse import LSE, LSEError
+from lse import LSE, LSEError, OptionTick
 
 from kairodex.core.enums import InstrumentKind
 from kairodex.core.errors import AuthError, VendorError
@@ -73,11 +73,18 @@ class LSEClient:
             )
 
     async def subscribe(self, keys: list[str], mode: FeedMode) -> AsyncIterator[Tick]:
-        # ponytail: live streaming wiring is P1 (the recorder) scope, same as
-        # the Upstox adapter — P0 only needs chain()/bars(). The vendor client
-        # already supports this (stream_async/subscribe_options) when P1 needs it.
-        raise NotImplementedError("LSE streaming lands with the P1 recorder")
-        yield  # pragma: no cover - makes this an async generator for typing
+        """Stream option ticks for the given underlyings (`keys` — e.g.
+        ["AAPL", "TSLA"], not individual contract keys: `subscribe_options`
+        subscribes to every strike/expiry for an underlying in one call).
+
+        LSE's feed has no mode selection (ltp/quote/full) — `mode` is
+        accepted only to satisfy MarketDataProvider's shared signature.
+        """
+        self._client.subscribe_options(keys)
+        async for lse_tick in self._client.stream_async([], reconnect=True):
+            tick = _parse_stream_tick(lse_tick)
+            if tick is not None:
+                yield tick
 
     async def chain(self, underlying: str, expiry: datetime.date) -> ChainSnapshot:
         try:
@@ -90,6 +97,25 @@ class LSEClient:
         now = to_utc(datetime.datetime.now(datetime.UTC))
         quotes = [_parse_chain_row(row, now) for row in rows]
         return ChainSnapshot(underlying=underlying, expiry=expiry, ts=now, quotes=quotes)
+
+    async def list_expiries(self, underlying: str) -> list[datetime.date]:
+        # options() with no expiry filter returns every listed expiry's
+        # contracts at once (confirmed against the installed client's
+        # signature: `options(underlying, type=None, expiry=None, ...)`).
+        try:
+            rows = await asyncio.to_thread(self._client.options, underlying)
+        except LSEError as e:
+            raise VendorError(f"LSE options() failed: [{e.status}] {e.message}") from e
+        today = datetime.date.today()
+        expiries: set[datetime.date] = set()
+        for row in rows:
+            raw = row.get("expiry")
+            if not raw:
+                continue
+            expiry = datetime.date.fromisoformat(str(raw)[:10])
+            if expiry >= today:
+                expiries.add(expiry)
+        return sorted(expiries)
 
     async def bars(
         self, key: str, tf: Timeframe, start: datetime.date, end: datetime.date
@@ -119,6 +145,39 @@ class LSEClient:
             return QuotaStatus(used_pct=0.0, raw={"available": False})
         used = raw.get("used_pct") or raw.get("used")
         return QuotaStatus(used_pct=float(used) if used is not None else 0.0, raw=raw)
+
+
+def _parse_stream_tick(lse_tick: object) -> Tick | None:
+    """lse.Tick/OptionTick (from stream_async, subscribed via
+    subscribe_options) -> our Tick. Confirmed against the installed
+    lse-data==0.14.0 source (lse/client.py): OptionTick.from_symbol parses
+    the OSI contract symbol into strike/right/expiry; the base Tick carries
+    price/bid/ask/volume/timestamp regardless."""
+    price = getattr(lse_tick, "price", None)
+    if price is None:
+        return None
+    symbol = getattr(lse_tick, "symbol", "") or ""
+    ts = getattr(lse_tick, "datetime", None) or to_utc(datetime.datetime.now(datetime.UTC))
+    bid = getattr(lse_tick, "bid", None)
+    ask = getattr(lse_tick, "ask", None)
+    volume = getattr(lse_tick, "volume", None)
+
+    option_type = None
+    strike = None
+    if isinstance(lse_tick, OptionTick):
+        option_type = {"call": "C", "put": "P"}.get(lse_tick.right)
+        strike = to_decimal(lse_tick.strike)
+
+    return Tick(
+        instrument_key=symbol,
+        ts=ts,
+        strike=strike,
+        option_type=option_type,
+        ltp=to_decimal(price),
+        bid=to_decimal(bid) if bid is not None else None,
+        ask=to_decimal(ask) if ask is not None else None,
+        volume=int(volume) if volume is not None else None,
+    )
 
 
 def _parse_chain_row(row: dict[str, Any], ts: datetime.datetime) -> Tick:

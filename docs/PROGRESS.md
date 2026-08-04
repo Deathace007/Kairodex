@@ -1,8 +1,10 @@
 # Kairodex — Development Progress
 
 **Last updated:** 2026-08-04
-**Current phase:** P0 (Foundations) — complete, verified against live infra.
-**Next phase:** P1 (The Recorder) — not started.
+**Current phase:** P1 (The Recorder) — code complete, **not yet run against
+live infra**. Everything below the "unverified" line in §4a needs a VM pass
+with real credentials during market hours before it's trusted.
+**Next phase:** P2 (Pricing & features) — not started.
 
 > Read this file first, every session. Update it whenever a phase
 > completes, a decision changes, or a command/location changes. Deeper
@@ -24,6 +26,10 @@ Don't re-litigate these — each overrides SPEC.md or an earlier assumption. Ful
 | **Upstox auth = long-lived Analytics Token, not daily OAuth** | Originally designed around daily reauth (flagged as #1 operational risk); corrected once user pointed out the actual product Upstox offers | ADR 0006 |
 | **Project renamed `otp` → `kairodex`** mid-P0 | Avoid the OTP/one-time-password acronym collision. Package, CLI, DB user/name, Compose project, env var prefixes all follow | — |
 | **All Docker/DB/test execution moved to a remote VM**; laptop is code-editing only | Not in the original architecture — added once user clarified their actual working setup | memory `infra_vm_workflow.md` |
+| **T1 watchlist default list is a Claude proposal**, not a strategy call | User explicitly asked for a proposed default rather than specifying symbols | `config/watchlist.yaml` — edit freely before `sync-watchlist` |
+| **Status page is a CLI command** (`kairodex status`), not an API endpoint | User's explicit choice — full dashboard/API is P6 scope, a text report is enough to know the recorder is alive | `kairodex/status.py` |
+| **Alert delivery (desktop/webhook) deferred** — P1 only logs + `kairodex status` | User's explicit choice — nothing downstream reads a push alert yet | Wire `structlog` + a sink (ARCHITECTURE.md §17) when something needs paging, not pulling |
+| **Upstox WS wire format sourced from the vendor's own `.proto`** (fetched from `github.com/upstox/upstox-python`), not guessed from docs prose | Reaction to the LSE field-name mistake below (§6 #2) — same mistake here would poison every recorded quote, not just one test | `src/kairodex/data/upstox/proto/MarketDataFeedV3.proto`; still **unverified against a live message**, see §4a |
 
 ---
 
@@ -61,17 +67,24 @@ uv run alembic upgrade head && uv run alembic current
 # Lint / type-check / test (same locally or on VM)
 uv run ruff check . && uv run mypy src/kairodex/ && uv run pytest -q
 
-# The CLI (only real command so far)
+# One-shot chain pull (P0 exit criterion, still works)
 uv run kairodex ingest pull-chain --market nse --underlying "NSE_INDEX|Nifty 50" --expiry YYYY-MM-DD
 uv run kairodex ingest pull-chain --market us  --underlying AAPL --expiry YYYY-MM-DD
+
+# P1: bring up the recorder for a market, in order
+uv run kairodex ingest sync-instruments --market nse   # T0: full instrument master -> instruments
+uv run kairodex ingest sync-watchlist   --market nse    # T1: seed watchlist_membership from config/watchlist.yaml
+uv run kairodex ingest run              --market nse    # long-lived: T1 REST poll + WS stream (repeat for --market us)
+uv run kairodex status                                  # per-provider connection state, last message age, gap rate
+uv run kairodex jobs                                    # long-lived: annual Upstox token-expiry check
 
 # Inspect the DB directly
 docker exec kairodex-timescaledb-1 psql -U kairodex -d kairodex -c "SELECT count(*) FROM instruments;"
 ```
 
-NIFTY expiries are Tuesdays, not obvious guesses — find real ones via `client.instruments()` filtered on `underlying_symbol == "NIFTY"` before calling `pull-chain`.
+NIFTY expiries are Tuesdays, not obvious guesses — `ingest run`/`poll_chain_once` resolve them live via `list_expiries()` (Upstox: `GET /v2/option/contract`; LSE: `options()` with no expiry filter), not a guess or a hardcoded date.
 
-**Local-only is fine for:** `ruff`, `mypy`, `pytest` (no DB dependency yet). **VM only:** anything touching Postgres/Redis/live vendor calls.
+**Local-only is fine for:** `ruff`, `mypy`, `pytest` (no DB dependency — all P1 unit tests use synthetic protobuf/Tick fixtures, not a live DB). **VM only:** anything touching Postgres/Redis/live vendor calls, i.e. every command in the "P1: bring up the recorder" block above.
 
 ---
 
@@ -89,12 +102,35 @@ All verified against live systems, not just "should work":
 - CLI (`kairodex ingest pull-chain`) proving the path end to end.
 - 6 ADRs in `docs/adr/` — see §1 for the ones that matter most.
 
-## 5. Not done yet (explicitly out of P0 scope)
+---
 
-- No WebSocket/live streaming either vendor (`subscribe()` raises `NotImplementedError` — P1).
-- No tiering, quality flags, feed-health monitoring, quota-aware scheduling — all P1.
+## 4a. Completed — P1 (The Recorder)
+
+Built and locally lint/type/test-clean (`ruff`, `mypy --strict`, `pytest` —
+28 tests, all DB-free: synthetic protobuf `FeedResponse` and `lse.Tick`
+fixtures, not live payloads). **Not yet run against live infra** — no VM
+pass, no real credentials, no market-hours session yet. Next session should
+open with the VM checklist in §7.
+
+- **Schema**: `feed_health` table (migration `8ed0be22cd84`), `instruments.underlying_symbol` column (migration `85cff23c02d8`, fixes a P0 gap — `InstrumentRecord.underlying_symbol` was parsed but silently dropped on write).
+- **T0/T1 seeding**: `kairodex ingest sync-instruments` (full instrument master), `kairodex ingest sync-watchlist` (seeds `watchlist_membership` from `config/watchlist.yaml`, ~20 underlyings/segment).
+- **Quality flagging** (`kairodex/data/quality.py`): staleness, crossed book, zero-volume, outlier, sequence-gap → `IntFlag` bitmask. Wired into both the REST chain path (`store_chain_snapshot`) and the WS path.
+- **Upstox WS feed** (`kairodex/data/upstox/feed.py`): real `MarketDataFeedV3.proto` fetched verbatim from `github.com/upstox/upstox-python` (not hand-transcribed), compiled via `grpcio-tools` (`uv run python -m grpc_tools.protoc ...`, see the `.proto` file's header for the exact command), decode logic pinned by `tests/unit/test_upstox_feed.py` against synthetic messages. **Wire protocol (authorize handshake, subscribe JSON, FeedResponse shape) matches the vendor's own published example verbatim — but field *values* are unverified against a real live message.**
+- **LSE WS feed**: wired directly onto the installed `lse-data==0.14.0` client's real `subscribe_options()` + `stream_async()` (confirmed by reading its installed source, not docs) in `kairodex/data/lse/client.py`.
+- **`list_expiries()`** added to `MarketDataProvider`: Upstox via `GET /v2/option/contract` (real endpoint, confirmed via independent public usages, not in Upstox's own doc site nav), LSE via `options()` with no expiry filter. Replaces any hardcoded/guessed expiry date.
+- **Batched writer** (`kairodex/data/ingest.py`): `write_option_quotes_batch`/`write_underlying_bars_batch`, multi-row `INSERT ... ON CONFLICT DO NOTHING` rather than Timescale `COPY` (ARCHITECTURE.md §7 names COPY — swap in if batch-insert latency ever becomes the bottleneck at T1's ~2M rows/day/market).
+- **Recorder loop** (`kairodex/data/recorder.py`, `kairodex ingest run --market {nse,us}`): T1 REST poll (60s) + WS stream running concurrently, restart recovery (backfills missing `underlying_bars` via REST on startup — **option-quote history can't be backfilled, no vendor sells it, ADR 0002** — recovery for quotes just means resuming), feed_health heartbeat.
+- **`kairodex jobs`**: APScheduler, daily Upstox token-expiry check (+ once at startup).
+- **`kairodex status`**: text report — connection state, last message age, subscribed count, quota, 24h gap rate, last error — per provider.
+- Redis latest-state/pub-sub (ARCHITECTURE.md §7) explicitly **not built** — no consumer exists until P3 (engine) or P6 (API WS fanout); building it now would be untestable against nothing.
+- No compose services added for `ingest`/`jobs` — there's no `Dockerfile` and the established pattern (per this file's own command reference) runs `kairodex` processes as bare `uv run` commands on the VM, only DB/Redis are containerized. Process supervision (systemd/tmux/something else) is an open operational choice, not decided here.
+
+## 5. Not done yet (explicitly out of P1 scope)
+
 - No pricing module (Greeks/IV) — P2. No engine/strategy/risk/execution — P3. No backtest — P4. No API/dashboards — P6.
 - `config/segments/*.yaml` (per-segment risk config) doesn't exist yet — deferred to P3.
+- T2 (focus-tier, 1–5s cadence) has DB/writer support (`tier` column, quality pipeline) but no automatic promotion logic — ARCHITECTURE.md §6 says promotion is scanner-driven, and the scanner doesn't exist until P3.
+- Redis latest-state/pub-sub, alert delivery (desktop/webhook), and `ingest`/`jobs` compose services — see §4a's last two bullets.
 
 ## 6. Implementation bugs found and fixed (not decisions — just gotchas)
 
@@ -102,18 +138,14 @@ All verified against live systems, not just "should work":
 2. **LSE chain field names were guessed wrong** (`type`/`volume` vs. real `contract_type`/`volume_today`) — written without a test key. Caused a Postgres unique-constraint violation on first live test. Fixed once real credentials allowed verification.
 3. **Local `.venv` broke after the repo folder was renamed** (`OptionTradingSystem` → `Kairodex`) — venv shebangs bake in absolute paths. Fixed by deleting and re-running `uv sync`. If local commands give "bad interpreter" after moving the repo, this is why.
 4. **`scp` fails on the VM** — no SFTP subsystem in sshd. Use `scp -O` (legacy protocol).
+5. **P0's `upsert_instrument` silently dropped `InstrumentRecord.underlying_symbol`** — parsed from the vendor payload but never written to a column. Not caught by tests since nothing read it back. Fixed in P1 (migration `85cff23c02d8`) once T1 chain polling needed it to resolve expiries.
 
 ---
 
-## 7. Next up — P1: The Recorder
+## 7. Next up — verify P1 against live infra, then start P2
 
-Highest priority per `docs/ARCHITECTURE.md` §19 — every session that passes before this is live is market data that can never be recovered.
+**Before trusting any of §4a**, on the VM: `alembic upgrade head`, `sync-instruments` + `sync-watchlist` for both markets, run `ingest run` for both during market hours, watch `kairodex status`, and diff a few real WS messages against `kairodex/data/upstox/feed.py`'s field mapping — the LSE field-name mistake in §6 #2 is exactly the class of bug to look for. Fix and log any surprises the same way #2 was handled.
 
-- Tiered ingestion (T0/T1/T2, §6 capacity plan)
-- WebSocket streaming for both vendors (wire up `subscribe()`)
-- Quality flagging (`kairodex/data/quality.py`) + feed-health tracking (`feed_health` table)
-- Upstox token expiry check (annual reminder, not daily)
-- Restart recovery (resume from `max(ts)` per instrument)
-- Minimal status page (full dashboard is P6)
+**Exit criterion** (ARCHITECTURE.md §19, unchanged): 5 consecutive trading sessions recorded, < 0.5% gap rate on T1, clean restart mid-session with no data loss. `kairodex status`'s gap-rate line is the number to watch.
 
-**Exit criterion:** 5 consecutive trading sessions recorded, < 0.5% gap rate on T1, clean restart mid-session with no data loss.
+Once that holds, P2 (Pricing & features) is next: Black-76 + Bjerksund, IV solve, forward derivation, feature registry.

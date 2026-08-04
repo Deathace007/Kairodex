@@ -10,10 +10,9 @@ import datetime
 
 import typer
 
-from kairodex.config import get_settings
 from kairodex.core.enums import InstrumentKind, Market, Segment
+from kairodex.data.factory import make_client
 from kairodex.data.ingest import store_chain_snapshot
-from kairodex.data.ports import MarketDataProvider
 from kairodex.data.types import InstrumentRecord
 from kairodex.store.base import get_sessionmaker
 
@@ -40,16 +39,10 @@ def pull_chain(
 
 
 async def _pull_chain(market: Market, underlying: str, expiry: datetime.date) -> None:
-    settings = get_settings()
     sessionmaker = get_sessionmaker()
+    client, provider = make_client(market)
 
     if market is Market.NSE:
-        from kairodex.data.upstox.auth import AnalyticsToken
-        from kairodex.data.upstox.client import UpstoxClient
-
-        token = AnalyticsToken(settings.upstox_access_token, settings.upstox_token_expires_at)
-        client: MarketDataProvider = UpstoxClient(token)
-        provider = "upstox"
         underlying_symbol = underlying.split("|")[-1]
         currency = "INR"
         is_index = "INDEX" in underlying
@@ -62,10 +55,6 @@ async def _pull_chain(market: Market, underlying: str, expiry: datetime.date) ->
             provider_ids={provider: underlying},
         )
     else:
-        from kairodex.data.lse.client import LSEClient
-
-        client = LSEClient(settings.lse_api_key)
-        provider = "lse"
         currency = "USD"
         is_index_symbol = underlying.upper() in {"SPX", "NDX", "RUT"}
         segment = Segment.US_INDEX if is_index_symbol else Segment.US_STOCK
@@ -89,6 +78,98 @@ async def _pull_chain(market: Market, underlying: str, expiry: datetime.date) ->
         typer.echo(f"Stored chain_snapshot {snap_id} with {snapshot.contract_count} quotes.")
     finally:
         await client.aclose()
+
+
+@ingest_app.command("sync-instruments")
+def sync_instruments_cmd(market: Market = typer.Option(..., help="nse or us")) -> None:
+    """T0: pull the full instrument master for a market into `instruments`.
+
+    Run this before `sync-watchlist` — watchlist seeding matches against
+    whatever is already in the table.
+    """
+    asyncio.run(_sync_instruments(market))
+
+
+async def _sync_instruments(market: Market) -> None:
+    from kairodex.data.sync import sync_instruments
+
+    sessionmaker = get_sessionmaker()
+    client, provider = make_client(market)
+    try:
+        async with sessionmaker() as session:
+            count = await sync_instruments(session, client, provider)
+        typer.echo(f"Synced {count} {market.value} instruments from {provider}.")
+    finally:
+        await client.aclose()
+
+
+@ingest_app.command("sync-watchlist")
+def sync_watchlist_cmd(
+    market: Market = typer.Option(..., help="nse or us"),
+    watchlist_file: str = typer.Option("config/watchlist.yaml", help="Path to watchlist YAML"),
+) -> None:
+    """T1: seed `watchlist_membership` from config/watchlist.yaml.
+
+    Requires `sync-instruments` to have run for this market first.
+    """
+    asyncio.run(_sync_watchlist(market, watchlist_file))
+
+
+async def _sync_watchlist(market: Market, watchlist_file: str) -> None:
+    import yaml
+
+    from kairodex.data.sync import sync_watchlist
+
+    with open(watchlist_file) as f:
+        config = yaml.safe_load(f)
+
+    sessionmaker = get_sessionmaker()
+    segments = [s for s in Segment if s.market is market]
+    async with sessionmaker() as session:
+        for segment in segments:
+            symbols = config.get(segment.value, [])
+            if not symbols:
+                continue
+            matched, missed = await sync_watchlist(session, segment, symbols)
+            typer.echo(f"{segment.value}: {len(matched)} matched, {len(missed)} missed {missed}")
+
+
+@ingest_app.command("run")
+def run_cmd(market: Market = typer.Option(..., help="nse or us")) -> None:
+    """The P1 recorder: long-lived T1 REST poll + WS stream for one market.
+
+    Matches ARCHITECTURE.md §3's `ingest --market {nse,us}` process — run one
+    of these per market, restart-policy `always`. Requires `sync-instruments`
+    and `sync-watchlist` to have populated the watchlist first.
+    """
+    from kairodex.data.recorder import run_market
+
+    asyncio.run(run_market(market))
+
+
+@app.command("status")
+def status_cmd() -> None:
+    """Minimal status page (ARCHITECTURE.md §19 P1 exit criterion): per-market
+    connection state, last message age, gap rate, from `feed_health` /
+    `option_quotes`."""
+    asyncio.run(_status())
+
+
+async def _status() -> None:
+    from kairodex.status import build_report
+
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        typer.echo(await build_report(session))
+
+
+@app.command("jobs")
+def jobs_cmd() -> None:
+    """The periodic-checks process (ARCHITECTURE.md §3) — currently just the
+    annual Upstox token-expiry check."""
+    from kairodex.jobs import run
+
+    run()
 
 
 if __name__ == "__main__":

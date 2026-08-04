@@ -36,6 +36,12 @@ class MarketDataProvider(Protocol):
         """One atomic option-chain read for `underlying` at `expiry`."""
         ...
 
+    async def list_expiries(self, underlying: str) -> list[datetime.date]:
+        """Every future expiry currently listed for `underlying`, ascending.
+        Used by the T1 recorder to pick "nearest 2 expiries" (ARCHITECTURE.md
+        §6) without hardcoding or guessing a date."""
+        ...
+
     async def bars(
         self, key: str, tf: Timeframe, start: datetime.date, end: datetime.date
     ) -> list[Bar]:

@@ -1,0 +1,60 @@
+# T1 watchlist (ARCHITECTURE.md §6) — ~20 underlyings/segment, 60s cadence,
+# full chain (2 expiries x ~40 strikes x 2). Symbols are matched against
+# `instruments.symbol` after `kairodex ingest sync-instruments` has run for
+# that market — this file only lists tickers, not vendor keys.
+#
+# This is a proposed default (liquid F&O / most-traded names), not a
+# strategy decision — edit freely before `kairodex ingest sync-watchlist`.
+
+nse_index:
+  - "Nifty 50"
+  - "Nifty Bank"
+
+nse_stock:
+  - RELIANCE
+  - HDFCBANK
+  - ICICIBANK
+  - INFY
+  - TCS
+  - SBIN
+  - AXISBANK
+  - KOTAKBANK
+  - LT
+  - BHARTIARTL
+  - ITC
+  - HINDUNILVR
+  - BAJFINANCE
+  - MARUTI
+  - TATAMOTORS
+  - SUNPHARMA
+  - TATASTEEL
+  - ADANIENT
+  - WIPRO
+  - ONGC
+
+us_index:
+  - SPX
+  - NDX
+  - RUT
+
+us_stock:
+  - AAPL
+  - MSFT
+  - NVDA
+  - AMZN
+  - GOOGL
+  - META
+  - TSLA
+  - AMD
+  - NFLX
+  - JPM
+  - SPY
+  - QQQ
+  - XOM
+  - BAC
+  - WMT
+  - DIS
+  - INTC
+  - CRM
+  - ORCL
+  - COST

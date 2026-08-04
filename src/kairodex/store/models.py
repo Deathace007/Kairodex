@@ -53,6 +53,13 @@ class Instrument(Base):
     exchange: Mapped[str] = mapped_column(String, nullable=False)
     currency: Mapped[str] = mapped_column(String(3), nullable=False)
     underlying_id: Mapped[int | None] = mapped_column(ForeignKey("instruments.instrument_id"))
+    # Plain string, not just the underlying_id FK: an option's underlying_id
+    # can only be backfilled once the underlying's own row exists, but the
+    # vendor instrument dump doesn't guarantee that ordering. This column is
+    # always known from the option's own record, so T1 chain polling
+    # (kairodex.data.recorder) can resolve "which expiries exist for
+    # RELIANCE" without depending on ingestion order.
+    underlying_symbol: Mapped[str | None] = mapped_column(String)
     strike: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
     option_type: Mapped[str | None] = mapped_column(String(1))  # C|P — core.enums.OptionType
     expiry: Mapped[datetime.date | None] = mapped_column(Date)
@@ -209,6 +216,26 @@ class MarketDepth(Base):
     price: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
     qty: Mapped[int] = mapped_column(Integer, nullable=False)
     orders: Mapped[int | None] = mapped_column(Integer)
+
+
+class FeedHealth(Base):
+    """One row per vendor connection — P1's feed-health tracking
+    (ARCHITECTURE.md §7, §17). Per-instrument gap/staleness is derived from
+    `option_quotes`/`underlying_bars` at query time (their `quality` bitmask
+    and `max(ts)`), not duplicated here — this table is only the thing a
+    per-instrument query can't tell you: is the socket itself up."""
+
+    __tablename__ = "feed_health"
+
+    provider: Mapped[str] = mapped_column(String, primary_key=True)
+    connected: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    last_message_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(String)
+    last_error_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
+    clock_skew_ms: Mapped[int | None] = mapped_column(Integer)
+    quota_used_pct: Mapped[float | None] = mapped_column(Numeric(5, 2))
+    subscribed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class OptionsFlow(Base):

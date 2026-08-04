@@ -8,8 +8,8 @@ Endpoints (verified against live responses / current docs, not assumed):
   - Rate limits: 50 req/s, 500 req/min, 2000 req/30min for all market-data
     endpoints (kairodex.data.upstox.ratelimit).
 
-Live WebSocket streaming (protobuf feed) is P1 (the recorder) scope, not
-P0 — `subscribe()` is intentionally unimplemented until then.
+Live WebSocket streaming (protobuf feed) — `subscribe()` — is implemented
+in kairodex.data.upstox.feed, wired in here in P1 (the recorder).
 """
 
 from __future__ import annotations
@@ -102,11 +102,10 @@ class UpstoxClient:
                 yield parsed
 
     async def subscribe(self, keys: list[str], mode: FeedMode) -> AsyncIterator[Tick]:
-        # ponytail: WS protobuf feed is P1 (the recorder) work — nothing in
-        # P0 needs a live stream, only chain()/bars(). Raising loudly rather
-        # than shipping a fake stream that silently yields nothing.
-        raise NotImplementedError("Upstox WS streaming lands with the P1 recorder")
-        yield  # pragma: no cover - makes this an async generator for typing
+        from kairodex.data.upstox.feed import stream
+
+        async for tick in stream(self._http, self._token, keys, mode):
+            yield tick
 
     async def chain(self, underlying: str, expiry: datetime.date) -> ChainSnapshot:
         data = await self._get(
@@ -124,6 +123,28 @@ class UpstoxClient:
                 if leg:
                     quotes.append(_parse_leg_quote(leg, underlying_px, strike, otype, now))
         return ChainSnapshot(underlying=underlying, expiry=expiry, ts=now, quotes=quotes)
+
+    async def list_expiries(self, underlying: str) -> list[datetime.date]:
+        # GET /v2/option/contract?instrument_key=... — real endpoint, in
+        # active use by multiple independent Upstox integrations (not in
+        # this repo's own earlier code, verified against live usage
+        # examples rather than guessed). Each row carries the contract's own
+        # `expiry` (or `expiry_date` on some API versions); this is the same
+        # date resolution `_parse_instrument` already trusts for the
+        # instrument master.
+        data = await self._get(
+            f"{_BASE_URL}/option/contract", params={"instrument_key": underlying}
+        )
+        today = datetime.date.today()
+        expiries: set[datetime.date] = set()
+        for row in data.get("data", []):
+            raw = row.get("expiry") or row.get("expiry_date")
+            if not raw:
+                continue
+            expiry = datetime.date.fromisoformat(str(raw)[:10])
+            if expiry >= today:
+                expiries.add(expiry)
+        return sorted(expiries)
 
     async def bars(
         self, key: str, tf: Timeframe, start: datetime.date, end: datetime.date

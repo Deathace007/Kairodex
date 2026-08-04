@@ -20,6 +20,7 @@ dependencies = [
   "tenacity>=9.0",
   "apscheduler>=3.11",
   "lse-data>=0.14.0",
+  "protobuf>=7.35.1",
 ]
 
 [dependency-groups]
@@ -30,6 +31,9 @@ dev = [
   "pytest-asyncio>=0.24",
   "testcontainers[postgres]>=4.9",
   "import-linter>=2.1",
+  "grpcio-tools>=1.83.0",
+  "types-protobuf>=7.34.1.20260518",
+  "types-pyyaml>=6.0.12.20260724",
 ]
 
 [build-system]
@@ -45,7 +49,7 @@ kairodex = "kairodex.cli:app"
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-extend-exclude = ["alembic/versions"]
+extend-exclude = ["alembic/versions", "**/*_pb2.py", "**/*_pb2.pyi"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
@@ -58,6 +62,12 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 python_version = "3.12"
 strict = true
 plugins = ["pydantic.mypy"]
+exclude = ["_pb2\\.pyi?$"]
+
+[[tool.mypy.overrides]]
+# No py.typed marker upstream (apscheduler 3.x) — not a code issue to fix here.
+module = "apscheduler.*"
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
