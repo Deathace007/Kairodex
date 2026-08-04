@@ -5,8 +5,8 @@
 (LSE, market open at test time): migrations applied, T0/T1 sync, and
 `ingest run` confirmed writing real option_quotes with `kairodex status`
 showing a connected, streaming feed. NSE (Upstox) still needs a live pass
-during market hours (9:15–15:30 IST) — see §7. **US_INDEX segment has a
-real vendor-coverage gap**, see §1's last row and §4a.
+during market hours (9:15–15:30 IST) — see §7. **US_INDEX segment now
+trades SPY/QQQ/DIA/IWM (ADR 0007)** — LSE carries no true index options.
 **Next phase:** finish NSE live verification, then P2 (Pricing & features).
 
 > Read this file first, every session. Update it whenever a phase
@@ -33,7 +33,7 @@ Don't re-litigate these — each overrides SPEC.md or an earlier assumption. Ful
 | **Status page is a CLI command** (`kairodex status`), not an API endpoint | User's explicit choice — full dashboard/API is P6 scope, a text report is enough to know the recorder is alive | `kairodex/status.py` |
 | **Alert delivery (desktop/webhook) deferred** — P1 only logs + `kairodex status` | User's explicit choice — nothing downstream reads a push alert yet | Wire `structlog` + a sink (ARCHITECTURE.md §17) when something needs paging, not pulling |
 | **Upstox WS wire format sourced from the vendor's own `.proto`** (fetched from `github.com/upstox/upstox-python`), not guessed from docs prose | Reaction to the LSE field-name mistake below (§6 #2) — same mistake here would poison every recorded quote, not just one test | `src/kairodex/data/upstox/proto/MarketDataFeedV3.proto` |
-| **LSE carries no SPX/NDX/RUT options at all** — `us_index` watchlist shipped empty | Verified live 2026-08-04: `list_expiries()` for all three returns zero contracts against LSE's full 3,186-underlying catalog, no error, just not offered. Equity/ETF options only (SPY/QQQ/IWM, already in `us_stock`) | `config/watchlist.yaml`; **US_INDEX segment (SPEC.md's 4th segment) has no viable data source with the current vendor** — needs a call: different vendor, proxy via SPY/QQQ options, or drop the segment |
+| **US_INDEX segment trades SPY/QQQ/DIA/IWM (ETF proxies), not SPX/NDX/RUT** | LSE carries no true index options at all (verified live against its full 3,186-underlying catalog — `list_expiries()` for SPX/NDX/RUT returns zero, no error). User's explicit decision, overriding SPEC_REVIEW.md §B1's original SPX/NDX/RUT-only call | ADR 0007; `config/watchlist.yaml`. These are real ETF shares (`InstrumentKind.UNDERLYING`, not `INDEX`) on the American/physically-settled pricing path, not the European/cash-settled one §B1 assumed — matters once P2 pricing lands. Must not also appear in `us_stock` — same option legs, segment would flip depending on iteration order |
 | **Per-tick SEQUENCE_GAP quality flag removed from the WS path** | Live-verified: a 2s expected-interval threshold flagged most of a healthy live book as "gapped," since individual option contracts (especially thin strikes) legitimately go minutes between prints — that's normal, not a feed problem. `feed_health.connected`/`last_message_at` is the real stream-liveness signal | `kairodex/data/recorder.py` — `flag_tick()` still checks STALE/CROSSED_BOOK/ZERO_VOLUME/OUTLIER per tick |
 
 ---
@@ -131,9 +131,9 @@ nse_stock + 2 nse_index + 20 us_stock (after fixing two stale symbols, see
 §1); `ingest run --market us` connected, streamed real ticks, and
 `kairodex status` showed `connected: yes` with quotes landing in
 `option_quotes` within seconds. Two more things live data caught (§1):
-**LSE has no SPX/NDX/RUT options at all** (`us_index` ships empty, needs a
-product decision), and the WS path's SEQUENCE_GAP flag used too tight a
-per-contract threshold and was removed from that path.
+**LSE has no SPX/NDX/RUT options at all** — resolved via ADR 0007,
+`us_index` now trades SPY/QQQ/DIA/IWM — and the WS path's SEQUENCE_GAP
+flag used too tight a per-contract threshold and was removed from that path.
 
 - **Schema**: `feed_health` table (migration `8ed0be22cd84`), `instruments.underlying_symbol` column (migration `85cff23c02d8`, fixes a P0 gap — `InstrumentRecord.underlying_symbol` was parsed but silently dropped on write).
 - **T0/T1 seeding**: `kairodex ingest sync-instruments` (full instrument master), `kairodex ingest sync-watchlist` (seeds `watchlist_membership` from `config/watchlist.yaml`).
@@ -179,13 +179,11 @@ actually populated the way `MarketFullFeed` implies) are still unconfirmed.
 The LSE field-name mistake in §6 #2 is exactly the class of bug to look
 for. Fix and log any surprises the same way #2 was handled.
 
-**Needs a product decision, not more code:** the US_INDEX segment (§1) has
-no viable data source with LSE as the vendor. Options: find/add a vendor
-that carries SPX/NDX/RUT, treat SPY/QQQ/IWM 0DTE options as an explicit
-proxy (different settlement/exercise characteristics — a real product
-change, not equivalent), or drop US_INDEX from scope. `config/watchlist.yaml`
-ships with `us_index: []` until this is decided.
+**US_INDEX is resolved** (ADR 0007) — trades SPY/QQQ/DIA/IWM. `sync-watchlist
+--market us` needs a re-run to seed the corrected list (SPY/QQQ moved out
+of `us_stock` into `us_index`); not yet re-run against the VM as of this
+write-up.
 
-**Exit criterion** (ARCHITECTURE.md §19, unchanged): 5 consecutive trading sessions recorded, < 0.5% gap rate on T1, clean restart mid-session with no data loss. `kairodex status`'s gap-rate line is the number to watch — now STALE-driven only (see §1/#8), so it should actually mean something.
+**Exit criterion** (ARCHITECTURE.md §19, unchanged): 5 consecutive trading sessions recorded, < 0.5% gap rate on T1, clean restart mid-session with no data loss. `kairodex status`'s gap-rate line is the number to watch — now STALE-driven only (see §1), so it should actually mean something.
 
-Once NSE is verified and US_INDEX is decided, P2 (Pricing & features) is next: Black-76 + Bjerksund, IV solve, forward derivation, feature registry.
+Once NSE is verified, P2 (Pricing & features) is next: Black-76 + Bjerksund, IV solve, forward derivation, feature registry.

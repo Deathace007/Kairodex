@@ -16,6 +16,15 @@ contract_type ("call"/"put" — not "type"), last_price, volume_today (not
 vega, rho, last_trade_at, updated_at. Notably: **no bid/ask/open-interest
 fields exist on this endpoint** — the docs mentioning a "chain with bid/ask"
 were wrong for this vendor; those Tick fields stay None for LSE quotes.
+
+Every entry in `options_underlyings()` is a real, tradable security (stock
+or ETF) — this vendor's options catalog carries no true INDEX-kind
+instruments at all (confirmed live, ADR 0007: SPX/NDX/RUT return zero
+contracts, not an error, they're simply not offered). `instruments()`
+below always yields `InstrumentKind.UNDERLYING`; which trading segment
+(US_STOCK vs. US_INDEX) an underlying belongs to is a watchlist/product
+classification (`config/watchlist.yaml`, ADR 0007), not something derivable
+from the vendor's own data.
 """
 
 from __future__ import annotations
@@ -40,10 +49,6 @@ from kairodex.data.types import (
     Timeframe,
 )
 
-# SPEC_REVIEW.md B1: the US Index segment is SPX/NDX/RUT (European, cash-
-# settled); SPY/QQQ/IWM and everything else live in US Stock instead.
-_US_INDEX_SYMBOLS = {"SPX", "NDX", "RUT"}
-
 
 class LSEClient:
     def __init__(self, api_key: str | None) -> None:
@@ -61,15 +66,12 @@ class LSEClient:
     async def instruments(self) -> AsyncIterator[InstrumentRecord]:
         rows = await asyncio.to_thread(self._client.options_underlyings)
         for row in rows:
-            symbol = row["symbol"].upper()
-            is_index = symbol in _US_INDEX_SYMBOLS
-            kind = InstrumentKind.INDEX if is_index else InstrumentKind.UNDERLYING
             yield InstrumentRecord(
                 exchange="US",
-                symbol=symbol,
-                kind=kind,
+                symbol=row["symbol"].upper(),
+                kind=InstrumentKind.UNDERLYING,
                 currency="USD",
-                provider_ids={"lse": symbol},
+                provider_ids={"lse": row["symbol"].upper()},
             )
 
     async def subscribe(self, keys: list[str], mode: FeedMode) -> AsyncIterator[Tick]:

@@ -20,6 +20,14 @@ app = typer.Typer(help="AI-assisted options-buying paper trading platform")
 ingest_app = typer.Typer(help="Market data ingestion")
 app.add_typer(ingest_app, name="ingest")
 
+# ADR 0007: LSE carries no true index instruments (SPX/NDX/RUT return zero
+# contracts) — the US_INDEX segment trades these index-tracking ETF options
+# instead. Keep in sync with config/watchlist.yaml's us_index list; this
+# constant only classifies segment for the one-shot pull-chain debug
+# command below, the recorder's real classification comes from the
+# watchlist (kairodex/data/recorder.py).
+_US_INDEX_PROXY_SYMBOLS = {"SPY", "QQQ", "DIA", "IWM"}
+
 
 @ingest_app.command("pull-chain")
 def pull_chain(
@@ -56,12 +64,16 @@ async def _pull_chain(market: Market, underlying: str, expiry: datetime.date) ->
         )
     else:
         currency = "USD"
-        is_index_symbol = underlying.upper() in {"SPX", "NDX", "RUT"}
+        is_index_symbol = underlying.upper() in _US_INDEX_PROXY_SYMBOLS
         segment = Segment.US_INDEX if is_index_symbol else Segment.US_STOCK
         underlying_rec = InstrumentRecord(
             exchange="US",
             symbol=underlying.upper(),
-            kind=InstrumentKind.INDEX if segment is Segment.US_INDEX else InstrumentKind.UNDERLYING,
+            # Always UNDERLYING, never INDEX — these are real ETF shares,
+            # not index values (ADR 0007). `segment` (US_INDEX vs US_STOCK)
+            # is the product classification; `kind` describes what the
+            # instrument technically is, and the two aren't the same axis.
+            kind=InstrumentKind.UNDERLYING,
             currency=currency,
             provider_ids={provider: underlying.upper()},
         )

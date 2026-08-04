@@ -37,13 +37,19 @@ nse_stock:
   - WIPRO
   - ONGC
 
-# EMPTY, deliberately: verified live (2026-08-04) that LSE's entire options
-# catalog (3,186 underlyings) carries no SPX/NDX/RUT — equity/ETF options
-# only (SPY/QQQ/IWM are the closest listed proxies, already in us_stock).
-# `list_expiries()` for all three returns zero contracts, no error, just an
-# empty vendor catalog. This isn't a watchlist typo — it's a vendor-coverage
-# gap for the whole US_INDEX segment. See docs/PROGRESS.md for the decision.
-us_index: []
+# ADR 0007: LSE's options catalog (3,186 underlyings, verified live) has no
+# SPX/NDX/RUT at all — index-option data isn't offered by this vendor.
+# User's decision: trade index-tracking ETF options instead — S&P 500
+# (SPY), NASDAQ 100 (QQQ), Dow Jones (DIA), Russell 2000 (IWM). Real ETF
+# shares, not index values, priced/risk-managed on the same American-style
+# physically-settled path as us_stock — see the ADR for why that matters.
+# Must NOT also appear in us_stock: the same option-leg rows would have
+# their `segment` column overwritten depending on watchlist iteration order.
+us_index:
+  - SPY
+  - QQQ
+  - DIA
+  - IWM
 
 us_stock:
   - AAPL
@@ -56,8 +62,6 @@ us_stock:
   - AMD
   - NFLX
   - JPM
-  - SPY
-  - QQQ
   - XOM
   - BAC
   - WMT
