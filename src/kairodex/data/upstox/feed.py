@@ -78,15 +78,18 @@ async def stream(
     wire_mode = _MODE_MAP[mode]
 
     async with websockets.connect(uri) as ws:
-        await ws.send(
-            json.dumps(
-                {
-                    "guid": str(uuid.uuid4()),
-                    "method": "sub",
-                    "data": {"mode": wire_mode, "instrumentKeys": keys},
-                }
-            )
-        )
+        # Sent as a binary frame, matching the vendor's own example exactly
+        # (json.dumps(...).encode("utf-8") before .send()) rather than a
+        # text frame — unverified live, so mirror their proven behavior
+        # rather than assume the server treats both frame types the same.
+        subscribe_msg = json.dumps(
+            {
+                "guid": str(uuid.uuid4()),
+                "method": "sub",
+                "data": {"mode": wire_mode, "instrumentKeys": keys},
+            }
+        ).encode("utf-8")
+        await ws.send(subscribe_msg)
         async for message in ws:
             if not isinstance(message, bytes):
                 continue  # text frames are protocol chatter, not feed data

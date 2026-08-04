@@ -23,6 +23,7 @@ the loop does by running.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime
 import logging
 
@@ -195,6 +196,7 @@ async def _resolve_ws_keys(
         return []
     rows = await session.scalars(
         select(Instrument).where(
+            Instrument.exchange == underlyings[0].exchange,
             Instrument.underlying_symbol.in_(symbols),
             Instrument.kind == InstrumentKind.OPTION,
             Instrument.expiry.is_not(None),
@@ -229,18 +231,36 @@ async def ws_stream_loop(
     buffer: list[dict[str, object]] = []
     reconnect_wait = 1.0
 
-    async def flush(session: AsyncSession, connected: bool) -> None:
-        if buffer:
-            n = await write_option_quotes_batch(session, list(buffer))
-            buffer.clear()
-            logger.debug("flushed %d ticks for %s", n, provider)
-        await update_feed_health(
-            session,
-            provider,
-            connected=connected,
-            last_message_at=datetime.datetime.now(datetime.UTC),
-            subscribed_count=len(instrument_ids),
-        )
+    async def flush(connected: bool) -> None:
+        # `buffer[:] = []` after snapshotting is synchronous (no `await`
+        # in between), so it can't interleave with the main loop's
+        # `buffer.append` — safe without a lock under cooperative
+        # scheduling, same reasoning as CPython's GIL for plain lists.
+        pending, buffer[:] = list(buffer), []
+        async with sessionmaker() as session:
+            if pending:
+                n = await write_option_quotes_batch(session, pending)
+                logger.debug("flushed %d ticks for %s", n, provider)
+            await update_feed_health(
+                session,
+                provider,
+                connected=connected,
+                last_message_at=datetime.datetime.now(datetime.UTC),
+                subscribed_count=len(instrument_ids),
+            )
+
+    async def periodic_flush() -> None:
+        # Runs as an independent task against its own session, purely so a
+        # quiet period doesn't hold ticks in memory indefinitely. Must NOT
+        # share a timeout/cancellation path with the tick consumer below:
+        # cancelling a pending `anext()` on the WS async generator tears
+        # down its `async with websockets.connect(...)` and kills the
+        # connection — an earlier version of this loop did exactly that via
+        # `asyncio.wait_for(anext(stream), timeout=...)`, reconnecting from
+        # scratch every ~3s during any lull instead of just flushing.
+        while True:
+            await asyncio.sleep(WS_FLUSH_INTERVAL.total_seconds())
+            await flush(connected=True)
 
     while True:
         try:
@@ -251,28 +271,9 @@ async def ws_stream_loop(
                 await asyncio.sleep(T1_POLL_INTERVAL.total_seconds())
                 continue
 
-            stream = client.subscribe(vendor_keys, FeedMode.FULL)
-            async with sessionmaker() as session:
-                last_flush = datetime.datetime.now(datetime.UTC)
-                while True:
-                    remaining = (
-                        last_flush + WS_FLUSH_INTERVAL - datetime.datetime.now(datetime.UTC)
-                    ).total_seconds()
-                    try:
-                        tick = await asyncio.wait_for(anext(stream), timeout=max(remaining, 0.1))
-                    except TimeoutError:
-                        await flush(session, connected=True)
-                        last_flush = datetime.datetime.now(datetime.UTC)
-                        continue
-                    except StopAsyncIteration:
-                        # A clean end (connection closed, no exception) still
-                        # gets a short pause before resubscribing — otherwise
-                        # a persistent rejection (e.g. an expired token) would
-                        # hot-loop the authorize handshake instead of backing off.
-                        await flush(session, connected=False)
-                        await asyncio.sleep(2.0)
-                        break
-
+            flush_task = asyncio.create_task(periodic_flush())
+            try:
+                async for tick in client.subscribe(vendor_keys, FeedMode.FULL):
                     now = datetime.datetime.now(datetime.UTC)
                     prev = prev_ticks.get(tick.instrument_key)
                     quality = flag_tick(
@@ -280,9 +281,10 @@ async def ws_stream_loop(
                     )
                     prev_ticks[tick.instrument_key] = tick
 
-                    instrument_id = await _resolve_instrument_id(
-                        session, provider, tick.instrument_key, instrument_ids
-                    )
+                    async with sessionmaker() as session:
+                        instrument_id = await _resolve_instrument_id(
+                            session, provider, tick.instrument_key, instrument_ids
+                        )
                     if instrument_id is None:
                         continue  # T1 poll hasn't upserted this contract yet
                     row = option_quote_row(
@@ -290,8 +292,18 @@ async def ws_stream_loop(
                     )
                     buffer.append(row)
                     if len(buffer) >= WS_FLUSH_SIZE:
-                        await flush(session, connected=True)
-                        last_flush = datetime.datetime.now(datetime.UTC)
+                        await flush(connected=True)
+            finally:
+                flush_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await flush_task
+                await flush(connected=False)
+
+            # The stream ended cleanly (no exception) — still a short pause
+            # before resubscribing, so a persistent rejection (e.g. an
+            # expired token) backs off instead of hot-looping the authorize
+            # handshake.
+            await asyncio.sleep(2.0)
             reconnect_wait = 1.0
         except Exception as e:
             logger.warning(
