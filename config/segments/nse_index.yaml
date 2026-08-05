@@ -1,0 +1,12 @@
+capital: 50000
+currency: INR
+base_risk_pct: 0.07
+hard_ceiling_pct: 0.25
+max_premium_pct: 0.35
+max_concurrent: 2
+daily_loss_limit_pct: 0.14
+weekly_loss_limit_pct: 0.28
+max_drawdown_pct: 0.35
+exposure_cap_pct: 0.30
+min_liquidity_score: 0.3
+reentry_cooldown_minutes: 30

@@ -438,3 +438,97 @@ class TradeEvent(Base):
     payload: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
     prev_hash: Mapped[bytes] = mapped_column(nullable=False)
     hash: Mapped[bytes] = mapped_column(nullable=False)
+
+
+class Order(Base):
+    """§5.4/§12 — one row per order the simulator (or `ShadowLogger`)
+    places. `sim_params` records the latency/fill-model parameters in
+    force at order time (ARCHITECTURE.md §12), so a fill can always be
+    explained after the fact without guessing what config was live then."""
+
+    __tablename__ = "orders"
+
+    order_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    trade_id: Mapped[int] = mapped_column(ForeignKey("trades.trade_id"), nullable=False)
+    ts: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    instrument_id: Mapped[int] = mapped_column(
+        ForeignKey("instruments.instrument_id"), nullable=False
+    )
+    side: Mapped[Side] = mapped_column(_side_enum, nullable=False)
+    qty: Mapped[int] = mapped_column(Integer, nullable=False)
+    order_type: Mapped[str] = mapped_column(String, nullable=False)
+    limit_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    sim_params: Mapped[dict[str, object] | None] = mapped_column(JSONB)
+
+
+class Fill(Base):
+    """§5.4/§12 — one row per fill (an order may fill in more than one
+    piece, per the partial-fill model)."""
+
+    __tablename__ = "fills"
+
+    fill_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.order_id"), nullable=False)
+    ts: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    qty: Mapped[int] = mapped_column(Integer, nullable=False)
+    price: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
+    spread_bps: Mapped[Decimal | None] = mapped_column(Numeric(10, 4))
+    slippage_bps: Mapped[Decimal | None] = mapped_column(Numeric(10, 4))
+    fill_model: Mapped[dict[str, object] | None] = mapped_column(JSONB)
+
+
+class PositionMark(Base):
+    """§5.4/§12 — hypertable; every open position marked every tick, which
+    is what makes MFE/MAE exact rather than estimated from OHLC."""
+
+    __tablename__ = "position_marks"
+
+    trade_id: Mapped[int] = mapped_column(ForeignKey("trades.trade_id"), primary_key=True)
+    ts: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
+    mark: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
+    unrealized: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
+    underlying_px: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
+    greeks: Mapped[dict[str, object] | None] = mapped_column(JSONB)
+
+
+class EquitySnapshot(Base):
+    """§5.4/§12 — hypertable, per segment. `run_id` uses a `0` sentinel
+    for "live paper book" rather than NULL — deviating from `Trade.run_id`'s
+    NULL convention deliberately: `run_id` is part of THIS table's primary
+    key (needed so a live snapshot and a backtest-run snapshot for the
+    same segment/instant don't collide), and Postgres forbids a nullable
+    column in a primary key at all. `backtest_runs` (P4) doesn't exist
+    yet, so its real IDs (bigserial, starting at 1) can never collide
+    with the 0 sentinel."""
+
+    __tablename__ = "equity_snapshots"
+
+    segment: Mapped[Segment] = mapped_column(_segment_enum, primary_key=True)
+    ts: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
+    run_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, default=0)
+    cash: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
+    unrealized: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
+    realized: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
+    equity: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
+    exposure: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
+    utilization: Mapped[Decimal] = mapped_column(Numeric(8, 4), nullable=False)
+    high_water_mark: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
+    drawdown: Mapped[Decimal] = mapped_column(Numeric(8, 4), nullable=False)
+
+
+class RiskState(Base):
+    """§5.4/§11 — one row per segment, the risk gate chain's own working
+    state (daily/weekly P&L, consecutive losses, breaker status)."""
+
+    __tablename__ = "risk_state"
+
+    segment: Mapped[Segment] = mapped_column(_segment_enum, primary_key=True)
+    as_of: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    daily_pnl: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False, default=0)
+    weekly_pnl: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False, default=0)
+    consecutive_losses: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    breaker_status: Mapped[str] = mapped_column(String, nullable=False, default="ARMED")
+    breaker_reason: Mapped[str | None] = mapped_column(String)
+    blocked_until: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
+    risk_multiplier: Mapped[Decimal] = mapped_column(Numeric(6, 4), nullable=False, default=1)
