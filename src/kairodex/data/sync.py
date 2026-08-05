@@ -69,15 +69,25 @@ async def sync_watchlist(
             logger.warning("watchlist symbol not found in instruments: %s (%s)", symbol, exchange)
             continue
 
-        existing = await session.get(
-            WatchlistMembership,
-            {
-                "segment": segment,
-                "instrument_id": instrument.instrument_id,
-                "valid_from": today,
-            },
+        # An already-open membership (valid_to still infinity, from ANY
+        # valid_from, not just today) means this symbol is already an
+        # active member — leave it alone. Checking only `valid_from ==
+        # today` (the original bug, caught live) meant re-running
+        # sync-watchlist on a later day always inserted a second row
+        # instead of recognizing the symbol was already active, since the
+        # first row's `valid_to` was never closed — both rows then read
+        # as "currently valid" together, and every downstream consumer of
+        # `watchlist_instruments` (this includes the already-deployed
+        # live engine, not just backtesting) evaluated/could double-enter
+        # that underlying on every single tick.
+        already_active = await session.scalar(
+            select(WatchlistMembership).where(
+                WatchlistMembership.segment == segment,
+                WatchlistMembership.instrument_id == instrument.instrument_id,
+                WatchlistMembership.valid_to == datetime.date.max,
+            )
         )
-        if existing is None:
+        if already_active is None:
             session.add(
                 WatchlistMembership(
                     segment=segment,
