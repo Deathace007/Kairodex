@@ -1,9 +1,10 @@
-"""ORM models for ARCHITECTURE.md §5.1 (reference) and §5.2 (market data).
+"""ORM models for ARCHITECTURE.md §5.1 (reference), §5.2 (market data), and
+§5.3 (features — P2's `FeatureVector`, added once P2's registry actually
+reads and writes it).
 
-Scope note: only the tables P0 (instrument master) and P1 (the recorder)
-need are defined here. §5.3 features, §5.4 trading, §5.5 research/ops land
-with the phases that actually read and write them (P2/P3/P5) — declaring
-empty tables now would be schema with no consumer.
+Scope note: §5.4 trading, §5.5 research/ops still land with the phases
+that actually read and write them (P3/P5) — declaring empty tables now
+would be schema with no consumer.
 
 Hypertable conversion, compression, and retention policies are not
 expressible in the ORM; they're applied as raw SQL in the Alembic migration
@@ -252,3 +253,37 @@ class OptionsFlow(Base):
     premium: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
     aggressor: Mapped[str | None] = mapped_column(String(1))
     greeks_at_print: Mapped[dict[str, object] | None] = mapped_column(JSONB)
+
+
+class FeatureVector(Base):
+    """ARCHITECTURE.md §5.3 — one row per (segment, instrument, as_of,
+    registry_version), every registered feature's value/quality bundled
+    into the two JSONB columns rather than one row per feature: "the
+    feature set will churn weekly during research" is exactly why jsonb
+    was the spec's own call here, not a P2 shortcut.
+
+    `id bigserial` is a convenience row identifier, **not** a primary key
+    or otherwise globally-unique column — deliberately, deviating from
+    the literal SQL in ARCHITECTURE.md §5.3. TimescaleDB requires every
+    unique index on a hypertable to include the partitioning column
+    (`as_of`); `id bigserial PRIMARY KEY` alone doesn't, and
+    `create_hypertable` rejects it. The composite below both satisfies
+    that constraint and *is* the spec's stated `UNIQUE(...)` intent — see
+    the migration for the real DDL. If a future `signals.feature_vector_id`
+    FK (§5.4, P3) needs to reference a row, it'll need to carry `as_of`
+    alongside `id` and FK on the composite — the standard Timescale
+    pattern for this, not solved here since nothing consumes it yet.
+    """
+
+    __tablename__ = "feature_vectors"
+
+    id: Mapped[int] = mapped_column(BigInteger, autoincrement=True, nullable=False)
+    segment: Mapped[Segment] = mapped_column(_segment_enum, primary_key=True)
+    instrument_id: Mapped[int] = mapped_column(
+        ForeignKey("instruments.instrument_id"), primary_key=True
+    )
+    as_of: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
+    event_ts: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    registry_version: Mapped[str] = mapped_column(String, primary_key=True)
+    values: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
+    quality: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
