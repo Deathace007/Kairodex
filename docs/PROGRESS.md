@@ -80,16 +80,23 @@ uv run ruff check . && uv run mypy src/kairodex/ && uv run pytest -q
 uv run kairodex ingest pull-chain --market nse --underlying "NSE_INDEX|Nifty 50" --expiry YYYY-MM-DD
 uv run kairodex ingest pull-chain --market us  --underlying AAPL --expiry YYYY-MM-DD
 
-# P1: bring up the recorder for a market, in order
+# P1: seed a market (one-time / whenever the watchlist changes)
 uv run kairodex ingest sync-instruments --market nse   # T0: full instrument master -> instruments
 uv run kairodex ingest sync-watchlist   --market nse    # T1: seed watchlist_membership from config/watchlist.yaml
-uv run kairodex ingest run              --market nse    # long-lived: T1 REST poll + WS stream (repeat for --market us)
 uv run kairodex status                                  # per-provider connection state, last message age, gap rate
-uv run kairodex jobs                                    # long-lived: annual Upstox token-expiry check
+
+# P1: the recorder + jobs processes themselves — systemd-supervised, not manual (see §4a)
+systemctl status kairodex-ingest-nse kairodex-ingest-us kairodex-jobs
+journalctl -u kairodex-ingest-nse -f          # tail live logs (repeat with -us / -jobs)
+systemctl restart kairodex-ingest-nse         # e.g. after a code deploy — see below
 
 # Inspect the DB directly
 docker exec kairodex-timescaledb-1 psql -U kairodex -d kairodex -c "SELECT count(*) FROM instruments;"
 ```
+
+**Deploying a code change to the live recorder:** `git pull origin main` alone does *not*
+pick up a running process's code — `systemctl restart kairodex-ingest-{nse,us,jobs}`
+after every pull that touches `kairodex/data/` or `kairodex/jobs`.
 
 NIFTY expiries are Tuesdays, not obvious guesses — `ingest run`/`poll_chain_once` resolve them live via `list_expiries()` (Upstox: `GET /v2/option/contract`; LSE: `options()` with no expiry filter), not a guess or a hardcoded date.
 
@@ -150,7 +157,8 @@ flag used too tight a per-contract threshold and was removed from that path.
 - **`kairodex jobs`**: APScheduler, daily Upstox token-expiry check (+ once at startup).
 - **`kairodex status`**: text report — connection state, last message age, subscribed count, quota, 24h gap rate, last error — per provider. **Live-verified** against the US run above.
 - Redis latest-state/pub-sub (ARCHITECTURE.md §7) explicitly **not built** — no consumer exists until P3 (engine) or P6 (API WS fanout); building it now would be untestable against nothing.
-- No compose services added for `ingest`/`jobs` — there's no `Dockerfile` and the established pattern (per this file's own command reference) runs `kairodex` processes as bare `uv run` commands on the VM, only DB/Redis are containerized. Process supervision (systemd/tmux/something else) is an open operational choice, not decided here.
+- No compose services added for `ingest`/`jobs` — there's no `Dockerfile` and the established pattern (per this file's own command reference) runs `kairodex` processes as bare `uv run` commands on the VM, only DB/Redis are containerized.
+- **Process supervision: systemd**, decided and deployed 2026-08-05. Three units (`kairodex-ingest-nse`, `kairodex-ingest-us`, `kairodex-jobs`) in `/etc/systemd/system/` on the VM (not checked into the repo — VM-local config, same as `.env`), `Restart=always`, `WantedBy=multi-user.target` (survives reboot; docker's own `restart: unless-stopped` on the compose services means DB/Redis come back first). Output goes to journald (`journalctl -u <unit> -f`), replacing the ad-hoc `nohup ... > file.log` pattern used during live verification — that pattern block-buffered under file redirection and made `tail -f` show nothing for minutes at a time; journald doesn't have that problem. Not reboot-tested (didn't want to bounce a VM with live positions/data mid-session for a self-check) — the config itself (`enabled`, `WantedBy=multi-user.target`) is the standard, trusted mechanism, so this is a reasonable risk to accept rather than test destructively.
 
 ## 5. Not done yet (explicitly out of P1 scope)
 
@@ -203,6 +211,6 @@ worth resolving before P2 groups features by underlying.
 all streaming correctly-tagged quotes on the VM, including the SPY/QQQ
 expiry-discovery fix (§6 #9). Nothing further needed here.
 
-**Exit criterion** (ARCHITECTURE.md §19, unchanged): 5 consecutive trading sessions recorded, < 0.5% gap rate on T1, clean restart mid-session with no data loss. `kairodex status`'s gap-rate line is the number to watch — now STALE-driven only (see §1), so it should actually mean something. Both markets now individually verified inside target (US/LSE 0.02%, NSE/Upstox 0.00% post-fix) — what's left to actually *measure* the exit criterion is process supervision (§4a's last bullet — still an open operational choice, `ingest run`/`jobs` have only run in bounded test windows) so 5 consecutive sessions can be recorded unattended.
+**Exit criterion** (ARCHITECTURE.md §19, unchanged): 5 consecutive trading sessions recorded, < 0.5% gap rate on T1, clean restart mid-session with no data loss. `kairodex status`'s gap-rate line is the number to watch — now STALE-driven only (see §1), so it should actually mean something. Both markets now individually verified inside target (US/LSE 0.02%, NSE/Upstox 0.00% post-fix), and process supervision is now live (§4a) — the 5-session clock is running unattended as of 2026-08-05 12:31 IST. Nobody has watched it complete yet; check `systemctl status kairodex-ingest-{nse,us}` / `kairodex status` on a future session and confirm 5 sessions have actually elapsed clean before calling P1 formally done.
 
-Once NSE is verified, P2 (Pricing & features) is next: Black-76 + Bjerksund, IV solve, forward derivation, feature registry.
+P2 (Pricing & features) starts now in parallel — see §8. It doesn't depend on the exit criterion (pricing math is pure functions, DB-free to build and test); P1 just needs to keep quietly running underneath.
