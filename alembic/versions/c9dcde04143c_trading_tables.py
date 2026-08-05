@@ -17,17 +17,21 @@ down_revision: Union[str, Sequence[str], None] = 'f1ac2a76a6ba'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
-# segment_enum already exists (354672f0f639) — create_type=False, same
-# lesson as feature_vectors' migration (generic sa.Enum doesn't honor it
-# reliably; postgresql.ENUM does). side_enum/strategy_status are new here.
+# segment_enum already exists (354672f0f639). side_enum/strategy_status
+# are new here, created explicitly below via .create() before any table
+# uses them. create_type=False on ALL three either way: a column's enum
+# type independently fires CREATE TYPE again via its own _on_table_create
+# dispatch when op.create_table runs, regardless of whether the type was
+# already created (explicitly, or by an earlier migration) — caught live
+# a second time here, same root cause as feature_vectors' migration.
 _segment_enum = postgresql.ENUM(
     'nse_stock', 'nse_index', 'us_stock', 'us_index',
     name='segment_enum', create_type=False,
 )
-_side_enum = postgresql.ENUM('buy', 'sell', name='side_enum')
+_side_enum = postgresql.ENUM('buy', 'sell', name='side_enum', create_type=False)
 _strategy_status_enum = postgresql.ENUM(
     'draft', 'backtested', 'validated', 'shadow', 'paper_small', 'paper_full', 'retired',
-    name='strategy_status',
+    name='strategy_status', create_type=False,
 )
 
 
