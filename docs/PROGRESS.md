@@ -1,15 +1,15 @@
 # Kairodex — Development Progress
 
-**Last updated:** 2026-08-04
-**Current phase:** P1 (The Recorder) — verified against live infra for US
-(LSE, market open at test time): migrations applied, T0/T1 sync, and
-`ingest run` confirmed writing real option_quotes with `kairodex status`
-showing a connected, streaming feed, **0.02% gap rate** (target <0.5%).
-US_INDEX (ADR 0007: SPY/QQQ/DIA/IWM) fully live-verified — all four
-streaming correctly-tagged quotes, including a real vendor bug found and
-fixed in SPY/QQQ's expiry discovery (see §1). NSE (Upstox) still needs a
-live pass during market hours (9:15–15:30 IST) — see §7.
-**Next phase:** finish NSE live verification, then P2 (Pricing & features).
+**Last updated:** 2026-08-05
+**Current phase:** P1 (The Recorder) — **both markets now live-verified.**
+US/LSE: migrations applied, T0/T1 sync, `ingest run` confirmed writing real
+option_quotes, **0.02% gap rate** (target <0.5%). US_INDEX (ADR 0007:
+SPY/QQQ/DIA/IWM) fully live-verified. NSE/Upstox: live-verified
+2026-08-05 during market hours — real bug found and fixed (WS silently
+drops the whole subscription above ~2000-3000 keys, no error surfaced;
+see §1). Post-fix: `subscribed_count` climbing past 1000+ real
+instruments, **0.00% gap rate**, real per-tick timestamps confirmed.
+**Next phase:** decide process supervision (§7), then P2 (Pricing & features).
 
 > Read this file first, every session. Update it whenever a phase
 > completes, a decision changes, or a command/location changes. Deeper
@@ -38,6 +38,7 @@ Don't re-litigate these — each overrides SPEC.md or an earlier assumption. Ful
 | **US_INDEX segment trades SPY/QQQ/DIA/IWM (ETF proxies), not SPX/NDX/RUT** | LSE carries no true index options at all (verified live against its full 3,186-underlying catalog — `list_expiries()` for SPX/NDX/RUT returns zero, no error). User's explicit decision, overriding SPEC_REVIEW.md §B1's original SPX/NDX/RUT-only call | ADR 0007; `config/watchlist.yaml`. These are real ETF shares (`InstrumentKind.UNDERLYING`, not `INDEX`) on the American/physically-settled pricing path, not the European/cash-settled one §B1 assumed — matters once P2 pricing lands. Must not also appear in `us_stock` — same option legs, segment would flip depending on iteration order |
 | **LSE's date-range `options()` filter is broken for SPY/QQQ specifically** | Live-discovered: unfiltered or `min_dte`/`max_dte`-filtered calls return exactly 5000 rows, all months-old, for these two tickers only (every other tested ticker works). An exact `expiry=` date query returns correct live data | `kairodex/data/lse/client.py`'s `_probe_expiries` — probes exact dates directly when the normal call comes back empty, bounded to 14 days / stops at 2 matches. All four `us_index` constituents live-verified end to end after the fix: real quotes, correct `segment` tag, 0.02% gap rate |
 | **Per-tick SEQUENCE_GAP quality flag removed from the WS path** | Live-verified: a 2s expected-interval threshold flagged most of a healthy live book as "gapped," since individual option contracts (especially thin strikes) legitimately go minutes between prints — that's normal, not a feed problem. `feed_health.connected`/`last_message_at` is the real stream-liveness signal | `kairodex/data/recorder.py` — `flag_tick()` still checks STALE/CROSSED_BOOK/ZERO_VOLUME/OUTLIER per tick |
+| **Upstox WS "full" mode subscription hard-capped at 2000 keys** | Live-discovered 2026-08-05: NSE's real future-expiry universe for the 22-underlying watchlist is ~7,400 option-contract keys — Upstox's WS silently accepts the oversized subscribe list, reports a normal connection, and then never sends a single message (no error, no rejection frame). Bisected live: 2000 keys streams real ticks in seconds, 3000 produces zero in 25s+. All quotes recorded during the broken window actually came from the T1 REST poll, not WS — masked because the WS periodic-flush heartbeat updates `feed_health.last_message_at` unconditionally, so `kairodex status` showed `connected: yes` the whole time regardless | `kairodex/data/recorder.py`'s `MAX_WS_SUBSCRIBE_KEYS` / `_resolve_ws_keys` — orders by expiry ascending, truncates at the cap, dropping farthest-dated legs first (T1's REST poll still records those, just not at WS cadence) |
 
 ---
 
@@ -169,24 +170,39 @@ flag used too tight a per-contract threshold and was removed from that path.
 7. **`config/watchlist.yaml`'s TATAMOTORS / "Nifty Bank" don't match live Upstox symbols** — TATAMOTORS isn't a currently-listed NSE symbol (2025 demerger); Bank Nifty's real `trading_symbol` is `BANKNIFTY`. `sync-watchlist`'s miss-reporting caught both; fixed by using `M&M` and `BANKNIFTY`.
 8. **WS SEQUENCE_GAP flag used a 2s per-contract threshold** — flagged most of a healthy live options book as "gapped," since individual contracts (thin strikes especially) legitimately go minutes between prints. Removed from the WS path; see §1 and §4a.
 9. **LSE's `options()` date-range filter is broken for SPY/QQQ** — returns a stale, capped 5000-row page regardless of `min_dte`/`max_dte`; every other tested ticker (DIA, IWM, AAPL, TSLA) works correctly unfiltered. Exact `expiry=` queries return correct live data for SPY/QQQ too. Fixed with a bounded exact-date probe fallback; see §1.
+10. **Upstox WS "full" mode has an undocumented ~2000-3000-key subscription ceiling** — see §1. `kairodex status` gave no hint anything was wrong (`connected: yes`, fresh `last message`) because the flush heartbeat fires regardless of whether any tick was actually received; only cross-checking `feed_health.subscribed_count` staying at 0 for several minutes, then bisecting live with a throwaway script, exposed it. **Lesson for future vendor integrations: a "connected" flag that's set independent of real data flow is a false-positive risk — prefer deriving liveness from `subscribed_count > 0` or an actual message counter, not a timer that always fires.**
+11. **Two `underlying_symbol` spellings for the same NIFTY 50 index** ("NIFTY" — Upstox's own raw per-contract field, 1790 legs/18 expiries across the full instrument master — vs "Nifty 50" — this codebase's watchlist display label, 436 legs/2 expiries, written by `poll_chain_once`/`store_chain_snapshot`) are both live in `instruments`/`option_quotes` right now. Not yet root-caused or fixed — noticed during the NSE pass above but doesn't block P1's exit criterion (each spelling's legs are internally consistent, no data corruption, just a possible duplicate-identity/double-counting risk for anything that groups by `underlying_symbol` later, e.g. P2/P3 feature aggregation). Worth resolving before P2's feature registry groups by underlying.
 
 ---
 
-## 7. Next up — finish live verification, then start P2
+## 7. Next up — process supervision, then start P2
 
-**NSE/Upstox still needs a live pass** during market hours (9:15–15:30 IST,
-next window from this session's 2026-08-04 22:30 IST): `kairodex ingest run
---market nse`, watch `kairodex status`, and diff a few real WS messages
-against `kairodex/data/upstox/feed.py`'s field mapping — the vendor's own
-`.proto` should mean the shape is right, but *values* (are greeks/depth
-actually populated the way `MarketFullFeed` implies) are still unconfirmed.
-The LSE field-name mistake in §6 #2 is exactly the class of bug to look
-for. Fix and log any surprises the same way #2 was handled.
+**NSE/Upstox live-verified 2026-08-05** during market hours (started ~11:56
+IST): `kairodex ingest run --market nse` connected, `sync-instruments`
+(35,057 instruments) and `sync-watchlist` (20 nse_stock + 2 nse_index, 0
+missed) both clean. Found and fixed a real bug along the way — Upstox WS
+silently drops the entire subscription once the key list is too large (§1,
+§6 #10) — the watchlist's true universe (~7,400 keys) blew way past it with
+no error, so all quotes during that window were actually coming from the
+T1 REST poll, not WS. Bisected live, capped at 2000 keys
+(`MAX_WS_SUBSCRIBE_KEYS`), redeployed, re-verified: `subscribed_count`
+climbing past 1000+ real instruments, **0.00% gap rate**, real per-tick
+timestamps (hundreds of distinct `ts` per underlying per minute, not the
+REST poll's flat 60s cadence). Field-value spot check against
+`kairodex/data/upstox/feed.py`'s mapping (§6 #2's class of bug): `ltp`,
+`bid`/`ask`/sizes, `volume`, `oi`, `delta`/`gamma`/`theta`/`vega` all
+populate correctly and match plausible real values (e.g. delta→1.0 on deep
+ITM legs); `rho` is `NULL` on every single NSE row observed (thousands) —
+consistent with the code's existing "0.0 treated as absent" design (see
+`_to_decimal` in feed.py), reads as Upstox just not sending rho, not a
+parsing bug. One open item, not yet root-caused: two different
+`underlying_symbol` spellings for the Nifty 50 index in the DB (§6 #11) —
+worth resolving before P2 groups features by underlying.
 
 **US_INDEX is resolved and fully live-verified** (ADR 0007) — SPY/QQQ/DIA/IWM
 all streaming correctly-tagged quotes on the VM, including the SPY/QQQ
 expiry-discovery fix (§6 #9). Nothing further needed here.
 
-**Exit criterion** (ARCHITECTURE.md §19, unchanged): 5 consecutive trading sessions recorded, < 0.5% gap rate on T1, clean restart mid-session with no data loss. `kairodex status`'s gap-rate line is the number to watch — now STALE-driven only (see §1), so it should actually mean something. US/LSE measured **0.02%** on the last verification pass, well inside target; NSE/Upstox is the remaining unknown.
+**Exit criterion** (ARCHITECTURE.md §19, unchanged): 5 consecutive trading sessions recorded, < 0.5% gap rate on T1, clean restart mid-session with no data loss. `kairodex status`'s gap-rate line is the number to watch — now STALE-driven only (see §1), so it should actually mean something. Both markets now individually verified inside target (US/LSE 0.02%, NSE/Upstox 0.00% post-fix) — what's left to actually *measure* the exit criterion is process supervision (§4a's last bullet — still an open operational choice, `ingest run`/`jobs` have only run in bounded test windows) so 5 consecutive sessions can be recorded unattended.
 
 Once NSE is verified, P2 (Pricing & features) is next: Black-76 + Bjerksund, IV solve, forward derivation, feature registry.
