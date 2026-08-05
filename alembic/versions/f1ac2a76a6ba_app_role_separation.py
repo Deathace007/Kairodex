@@ -37,7 +37,7 @@ def upgrade() -> None:
     password = get_settings().app_db_password
     if not password:
         raise RuntimeError(
-            "KAIRODEX_APP_DB_PASSWORD must be set in .env before running this "
+            "APP_DB_PASSWORD must be set in .env before running this "
             "migration — see .env.example."
         )
 
