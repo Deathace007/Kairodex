@@ -1,15 +1,13 @@
 # Kairodex — Development Progress
 
 **Last updated:** 2026-08-05
-**Current phase:** P1 (The Recorder) — **both markets now live-verified.**
-US/LSE: migrations applied, T0/T1 sync, `ingest run` confirmed writing real
-option_quotes, **0.02% gap rate** (target <0.5%). US_INDEX (ADR 0007:
-SPY/QQQ/DIA/IWM) fully live-verified. NSE/Upstox: live-verified
-2026-08-05 during market hours — real bug found and fixed (WS silently
-drops the whole subscription above ~2000-3000 keys, no error surfaced;
-see §1). Post-fix: `subscribed_count` climbing past 1000+ real
-instruments, **0.00% gap rate**, real per-tick timestamps confirmed.
-**Next phase:** decide process supervision (§7), then P2 (Pricing & features).
+**Current phase:** P1 (The Recorder) is done pending the unattended
+5-session check (§7) — both markets live-verified, process supervision
+(systemd) deployed. **P2 (Pricing & features) has started**: the pricing
+module's core (`kairodex/pricing/`) is built and tested — Black-76,
+American options, IV solve, forward derivation. See §8. Feature registry
++ launch features + point-in-time store are the rest of P2, not started.
+**Next phase:** feature registry (§8), building on the pricing module.
 
 > Read this file first, every session. Update it whenever a phase
 > completes, a decision changes, or a command/location changes. Deeper
@@ -214,3 +212,26 @@ expiry-discovery fix (§6 #9). Nothing further needed here.
 **Exit criterion** (ARCHITECTURE.md §19, unchanged): 5 consecutive trading sessions recorded, < 0.5% gap rate on T1, clean restart mid-session with no data loss. `kairodex status`'s gap-rate line is the number to watch — now STALE-driven only (see §1), so it should actually mean something. Both markets now individually verified inside target (US/LSE 0.02%, NSE/Upstox 0.00% post-fix), and process supervision is now live (§4a) — the 5-session clock is running unattended as of 2026-08-05 12:31 IST. Nobody has watched it complete yet; check `systemctl status kairodex-ingest-{nse,us}` / `kairodex status` on a future session and confirm 5 sessions have actually elapsed clean before calling P1 formally done.
 
 P2 (Pricing & features) starts now in parallel — see §8. It doesn't depend on the exit criterion (pricing math is pure functions, DB-free to build and test); P1 just needs to keep quietly running underneath.
+
+---
+
+## 8. P2 — Pricing & features (started 2026-08-05)
+
+**Built and tested — `kairodex/pricing/` (87 tests total passing, all DB-free):**
+
+- **`black76.py`** — European price + analytic Greeks, off a forward (not spot) per ARCHITECTURE.md §8. Validated exactly against `py_vollib.black` (added as a **dev-only** dependency — `py-vollib`, pulled in `scipy`/`pandas` transitively; test-time validation only, never imported by runtime code) across ITM/ATM/OTM × short/long-dated × calls/puts. Every price and all 5 Greeks match to `1e-6`.
+- **`forward.py`** — put-call parity forward derivation (`from_put_call_parity`) and a cost-of-carry helper for the American side (`implied_cost_of_carry`). Round-trip tested: prices generated from a known forward via black76 recover that exact forward back through parity.
+- **`iv_solve.py`** — Brent's method (hand-implemented, standard Brent-Dekker; stdlib has no root-finder and scipy wasn't worth adding as a runtime dependency for one function), model-agnostic (`sigma -> price` closure, works for both black76 and bjerksund). Simplified Brenner-Subrahmanyam initial guess rather than the full Jäckel "Let's Be Rational" rational approximation — Brent doesn't need a good guess to be correct, only Newton does; upgrade if iteration count ever matters. Fails closed (`None`) on an unbracketed target or an unevaluable bracket endpoint, never a silently wrong number, matching ARCHITECTURE.md §8's `NO_IV` design. Round-trip tested (generate price at known σ, solve back, recover σ) rather than against external reference values.
+- **`greeks.py`** — central finite-difference Greeks for pricers without a closed form (the American path). Validated by running black76's own price function through it and confirming it recovers black76's analytic Greeks.
+- **`bjerksund.py`** — **deviates from the spec.** ARCHITECTURE.md §8 names Bjerksund-Stensland (2002) closed-form for the American path; this ships a Cox-Ross-Rubinstein binomial tree instead. Reason: BS2002's exercise-boundary calculation needs a bivariate normal CDF (Genz/Drezner-Wesolowsky quadrature, ~15 magic constants) that's real risk to reproduce wrong from memory on a money-path formula with nothing on hand to check it against. ARCHITECTURE.md's own stated accuracy ceiling for BS2002 is "upgrade to CRR binomial if deep-ITM accuracy matters" — this ships that upgrade path as the baseline instead (a few ms/quote slower, every line checkable by hand). Validated against genuine no-arbitrage properties (American ≥ European ≥ intrinsic, American call = European call when no dividend, monotonicity in spot, convergence as step count increases) rather than reference values. **Found and fixed a real bug via this testing**: the CRR risk-neutral probability goes outside `[0, 1]` (invalid tree) at low vol relative to the time-step size — an unguarded case would silently return a nonsense price (caught live: `3e+105` for a 1bp-vol call). Now raises `ValueError`; `iv_solve.solve` catches that at the bracket endpoints and returns `None` instead of crashing.
+- **`greeks_model`/`greeks_inputs`** on `option_quotes` (already in the schema since P1, unused until now) are the intended write targets once this gets wired into a live computation path — **not done yet**, see below.
+
+**Deliberately not done this session** (ponytail: no scaffolding for a consumer that doesn't exist) — the rest of ARCHITECTURE.md's P2 scope:
+
+- **Feature registry** (`@register` decorator, `Tier`/`Fidelity`/`backtestable` metadata, `FeatureContext`) — needs a concrete first consumer to get the `FeatureContext` shape right rather than guessed. Natural next step.
+- **~15 launch features** — blocked on the registry existing.
+- **`feature_vectors` point-in-time store** (migration) — blocked on the registry existing; premature to add an unused table.
+- **Wiring pricing into the live recorder** — nothing currently calls `black76`/`bjerksund` from `kairodex/data/recorder.py` to populate `option_quotes.iv`/`delta`/etc. Vendor Greeks keep flowing into those same columns from P1 as before (see ADR-pending note below) until this is wired up. ARCHITECTURE.md §8 frames pricing as serving "the live engine (contract selection, monitoring, risk)" — i.e. on-demand from P3's engine, not necessarily a per-tick ingest-time write; revisit whether it needs to run earlier than P3 once the feature registry needs stored IV/Greeks history.
+- **P2's own exit criterion** ("our Greeks match vendor Greeks within tolerance") isn't measured yet — needs real option_quotes rows (P1 has plenty now) run through this module and compared to the vendor `delta`/`gamma`/etc. already stored. Cheap to do once useful — no urgency before the registry needs it.
+
+**Known gap surfaced, not yet fixed:** `option_quotes.delta/gamma/theta/vega/rho` currently hold **vendor** Greeks (written straight from `Tick` in `kairodex/data/ingest.py`'s `option_quote_row`) — the same columns this module's output is meant to eventually own as the source of truth, per SPEC_REVIEW.md's explicit call ("vendor Greeks retained as a cross-check field, never as the source of truth"). `vendor_iv` already exists as a separately-named column; `delta`/`gamma`/`theta`/`vega`/`rho` don't have a `vendor_`-prefixed twin yet. A migration renaming those five to `vendor_delta` etc. (freeing the unprefixed names for this module's output) is the likely shape of that fix — not done here since it touches the live P1 write path on a running recorder; do it deliberately, not as a drive-by.
