@@ -24,10 +24,13 @@ def upgrade() -> None:
         sa.Column('id', sa.BigInteger(), autoincrement=True, nullable=False),
         sa.Column(
             'segment',
-            # create_type=False: segment_enum already exists (created by
-            # 354672f0f639) — without this, SQLAlchemy tries to CREATE TYPE
-            # again and fails (caught live on the VM: DuplicateObjectError).
-            sa.Enum(
+            # segment_enum already exists (created by 354672f0f639).
+            # create_type=False on the generic sa.Enum did NOT stop this
+            # from re-issuing CREATE TYPE (caught live on the VM a second
+            # time): sa.Enum gets adapted into a dialect-specific impl at
+            # DDL-compile time, and that adaptation doesn't reliably carry
+            # create_type through — postgresql.ENUM directly does.
+            postgresql.ENUM(
                 'nse_stock', 'nse_index', 'us_stock', 'us_index',
                 name='segment_enum', create_type=False,
             ),
