@@ -3,13 +3,18 @@
 **Last updated:** 2026-08-05
 **Current phase:** P1 (The Recorder) is done pending the unattended
 5-session check (§7) — both markets live-verified, process supervision
-(systemd) deployed. **P2 (Pricing & features) is functionally complete**:
+(systemd) deployed. P2 (Pricing & features) is functionally complete:
 pricing module (`kairodex/pricing/`) and feature registry
 (`kairodex/features/`, 18 launch features + `feature_vectors` point-in-time
 store) both built, tested, and live-verified end to end against real
-recorded NIFTY data on the VM. See §8 — three real bugs found and fixed
-during that live pass, none of them things local testing could have caught.
-**Next phase:** P3 (Engine & paper execution) — see §8's remaining gaps first.
+recorded NIFTY data on the VM — reverified clean in a later session (§8
+footer). **P3 (Engine & paper execution) has started**: least-privilege
+DB role + append-only, hash-chained trade event log (Principle 2) built
+and live-verified on the VM, including genuinely attempting to break it
+two different ways. See §9. The rest of P3 (clock/orchestrator, strategy
+framework, risk engine, execution simulator) is substantial and not
+started — see §9's own scoping note.
+**Next phase:** continue P3 — see §9's "not started" list.
 
 > Read this file first, every session. Update it whenever a phase
 > completes, a decision changes, or a command/location changes. Deeper
@@ -250,4 +255,34 @@ P2 (Pricing & features) starts now in parallel — see §8. It doesn't depend on
 - **Wiring `compute_and_store` into the live recorder** — nothing calls it from `kairodex/data/recorder.py` yet. ARCHITECTURE.md §8 frames pricing (and by extension features) as serving "the live engine... on demand" — i.e. P3's job, not a P1 ingest-time write. Revisit if the registry ever needs continuously-updated stored history before P3 exists.
 - **P2's stated exit criteria aren't formally measured**: "our Greeks match vendor Greeks within tolerance" needs pricing wired to real option_quotes rows (cheap once useful, no consumer yet); "a feature computed live is bit-identical to the same feature computed in replay" **cannot be measured at all yet** — there is no replay clock until P3's `ReplayClock` exists. `FeatureContext` was designed so this holds by construction (pure function of its input data, no hidden clock/IO reads) but that's an architectural argument, not a passing test — don't call it verified until P3 can actually run both paths and diff them.
 
-**Known gap surfaced, not yet fixed:** `option_quotes.delta/gamma/theta/vega/rho` currently hold **vendor** Greeks (written straight from `Tick` in `kairodex/data/ingest.py`'s `option_quote_row`) — the same columns this module's output is meant to eventually own as the source of truth, per SPEC_REVIEW.md's explicit call ("vendor Greeks retained as a cross-check field, never as the source of truth"). `vendor_iv` already exists as a separately-named column; `delta`/`gamma`/`theta`/`vega`/`rho` don't have a `vendor_`-prefixed twin yet. A migration renaming those five to `vendor_delta` etc. (freeing the unprefixed names for this module's output) is the likely shape of that fix — not done here since it touches the live P1 write path on a running recorder; do it deliberately, not as a drive-by.
+**Reverified in a later session (2026-08-05):** clean local (`ruff`/`mypy`/124 tests) and VM (identical, migration at head) checks, plus a fresh independent live run — different `as_of`, different bar count (777 vs. 837, real market time passing between runs) — reproducing the same result: pricing sane (round-tripped IV solve exact), full `loader → registry → store → read-back` pipeline exact match, two distinct `as_of` rows now correctly persisted. Nothing regressed.
+
+---
+
+## 9. P3 — Engine & paper execution (started 2026-08-05)
+
+**Scoped deliberately narrow.** ARCHITECTURE.md's own estimate for all of P3 (clock abstraction, orchestrator, strategy framework, risk engine, execution simulator, one reference strategy per segment) is ~3 weeks — too much for one slice, and this codebase's own established rule (stated in `store/models.py`'s docstring, followed again in P2's scoping) is to land schema and code with the phase that actually consumes it, not ahead of a real caller. This session builds exactly what's needed to make **Principle 1 in force where it already can be** (`core/clock.py`'s `LiveClock` — built in P0, nothing to add: `ReplayClock` is explicitly P4's, per that file's own docstring) and **Principle 2 real** ("the event log is the truth") — nothing else.
+
+**Built, tested, and live-verified on the VM:**
+
+- **Migration `app_role_separation`**: creates `kairodex_app`, a real non-superuser role the app runtime connects as. This mattered immediately: the *only* existing DB role, `kairodex`, is a superuser (`\du` confirmed it live) — `REVOKE` is a complete no-op against a superuser, so the next migration's append-only guarantee would have been pure theater without this existing first. `store/base.py`'s `get_engine()` now prefers `Settings.app_database_url` over `database_url`, falling back cleanly when unset (nothing breaks locally/in CI without it configured). `ALTER DEFAULT PRIVILEGES` covers every table, present and future, with one deliberate exception carved out by the next migration.
+- **Migration `trading_tables`** (ARCHITECTURE.md §5.4, the minimum needed for `trade_events`' own FKs to resolve): `strategies`, `strategy_promotions`, `signals`, `trades`, `trade_events`, plus the `paper_trades` view. Two deliberate deviations from the doc's literal SQL, documented in `Signal`/`Trade`'s docstrings in `store/models.py`: `signals.feature_vector_id` and `trades.run_id` are soft references (no FK) — `feature_vectors` has no single-column unique key to reference (the same Timescale hypertable constraint from P2 §8), and `backtest_runs` doesn't exist yet (P4). **Deferred, not built**: `orders`, `fills`, `position_marks`, `equity_snapshots`, `risk_state` — these belong to the execution simulator and risk engine, neither of which exists yet to write them.
+- **`kairodex/engine/event_log.py`**: SHA-256 hash chain **per trade** (not global — concurrent trades never contend on one chain). `verify_events` (pure, DB-free) is split from `append_event`/`verify_chain` (DB-touching) — same pattern as `kairodex.features`' `compute/*.py` vs. `loader.py` split. 11 tests cover every tampering shape that matters: edited payload, deleted event, reordered events, a forged event with a self-consistent hash that still breaks the *next* link, a chain not rooted at genesis — not just the happy path.
+
+**Live verification went further than "does the migration apply"** — the actual security property was tested directly, twice:
+
+1. Connected to Postgres **as `kairodex_app`** and attempted `UPDATE`/`DELETE` on real `trade_events` rows (created via the real `append_event` path, not synthetic SQL): both attempts returned `permission denied for table trade_events`. The rows were confirmed byte-for-byte unchanged afterward.
+2. Then, **as the admin `kairodex` role** (which `REVOKE` cannot touch — Postgres superusers bypass every grant check), directly edited a real event's payload — simulating "someone with DB admin access, not going through the app, tampers with history." `event_log.verify_chain` on that trade correctly returned `False`. This is the defense-in-depth claim in the module's own docstring, not just asserted — actually exercised.
+
+Both migration bugs along the way were caught live and fixed the same session: the enum-recreation bug from P2 §8 recurred on the two new enum types (`side_enum`/`strategy_status`) for the identical root cause, and a naming mismatch (`APP_DB_PASSWORD` vs. a wrongly-prefixed `KAIRODEX_APP_DB_PASSWORD`) failed the migration closed rather than silently creating a role with an empty password.
+
+**Deployed for real**, not just verified in isolation: all three systemd-supervised recorder processes (`kairodex-ingest-nse`, `kairodex-ingest-us`, `kairodex-jobs`) were restarted to pick up `kairodex_app`, one at a time, each confirmed healthy afterward (`kairodex status`, and a direct count of fresh `option_quotes` rows) before moving to the next. P1's recorder now runs least-privilege too, not just P3's new tables.
+
+**Not started** — the rest of P3, roughly in dependency order:
+
+- `MarketContext` — the shared object `Strategy.evaluate`/`.manage` read (ARCHITECTURE.md §10); ties `Clock`, feature values, and chain data together. Natural next step once there's a concrete detector to shape it around.
+- `Detector`/`Evidence`/`ConfluenceScorer` and the strategy `Protocol` itself (§10) — needs at least one reference detector per segment to avoid guessing the interface wrong, same reasoning P2 used to defer the feature registry until pricing existed.
+- Risk gate chain (§11) — 11 ordered gates, sizing, per-segment risk config (`config/segments/*.yaml` doesn't exist yet either).
+- Execution simulator (§12) — fill model, cost models per segment, `SimulatedBroker`/`ShadowLogger`. This is also where `orders`/`fills`/`position_marks` actually get consumers.
+- Orchestrator + live loop (`kairodex/engine/`) tying all of the above together, driven by `LiveClock`.
+- One reference strategy per segment, and the P3 exit criterion itself: full lifecycle in shadow mode for 5 sessions, PnL identity and risk-ceiling property tests passing. None of this is measurable until the orchestrator exists.
