@@ -8,13 +8,16 @@ pricing module (`kairodex/pricing/`) and feature registry
 (`kairodex/features/`, 18 launch features + `feature_vectors` point-in-time
 store) both built, tested, and live-verified end to end against real
 recorded NIFTY data on the VM — reverified clean in a later session (§8
-footer). **P3 (Engine & paper execution) has started**: least-privilege
+footer). **P3 (Engine & paper execution) is in progress**: least-privilege
 DB role + append-only, hash-chained trade event log (Principle 2) built
 and live-verified on the VM, including genuinely attempting to break it
-two different ways. See §9. The rest of P3 (clock/orchestrator, strategy
-framework, risk engine, execution simulator) is substantial and not
-started — see §9's own scoping note.
-**Next phase:** continue P3 — see §9's "not started" list.
+two different ways (§9). `MarketContext`, `ConfluenceScorer`, four
+detectors (one per confluence family), and a reference strategy built,
+tested, and live-verified against real NIFTY data end to end from the
+DB through to a real BUY signal (§9a). Risk engine, execution simulator,
+position monitor, and orchestrator are substantial and not started —
+see §9b.
+**Next phase:** continue P3 — see §9b's dependency-ordered list.
 
 > Read this file first, every session. Update it whenever a phase
 > completes, a decision changes, or a command/location changes. Deeper
@@ -278,11 +281,23 @@ Both migration bugs along the way were caught live and fixed the same session: t
 
 **Deployed for real**, not just verified in isolation: all three systemd-supervised recorder processes (`kairodex-ingest-nse`, `kairodex-ingest-us`, `kairodex-jobs`) were restarted to pick up `kairodex_app`, one at a time, each confirmed healthy afterward (`kairodex status`, and a direct count of fresh `option_quotes` rows) before moving to the next. P1's recorder now runs least-privilege too, not just P3's new tables.
 
-**Not started** — the rest of P3, roughly in dependency order:
+### 9a. Strategy framework — `kairodex/strategy/` (28 tests, live-verified)
 
-- `MarketContext` — the shared object `Strategy.evaluate`/`.manage` read (ARCHITECTURE.md §10); ties `Clock`, feature values, and chain data together. Natural next step once there's a concrete detector to shape it around.
-- `Detector`/`Evidence`/`ConfluenceScorer` and the strategy `Protocol` itself (§10) — needs at least one reference detector per segment to avoid guessing the interface wrong, same reasoning P2 used to defer the feature registry until pricing existed.
+`MarketContext` (thin wrapper: P2's `FeatureContext` + its computed feature values — detectors never call the registry themselves), `Evidence`/`DetectorFamily` (the four from §10: structure/flow/volatility/relative_strength — exactly these, no fifth), and `ConfluenceScorer` implementing "requiring >= N independent detector families to agree... single-family agreement can never fire, whatever the score" **literally**: one weighted vote per family (not per detector — two detectors agreeing within the same family is correlation, not confluence), a side only wins by strictly outnumbering the other's agreeing families, confidence is the weighted mean of the agreeing evidence's magnitude.
+
+**Four detectors, deliberately one per family** — a strategy built from only 1-2 families could never exercise the single-family-never-fires property meaningfully: `trend_structure` (from `trend_state_strength`), `oi_price_flow` (from `oi_change` + price direction, the standard NSE long-buildup/short-buildup/short-covering/long-unwinding convention), `iv_skew_sentiment` (from `iv_skew`), `relative_strength` (from `relative_strength_vs_index`). Each is a `tanh`-bounded translation of an already-computed P2 feature; scaling constants are documented first-pass estimates (ponytail-flagged in each detector's own docstring), not calibrated against real historical data — that's P4's job. `ReferenceStrategy` bundles all four behind the `Strategy` protocol's `evaluate()` — `manage()`/`Position`/`ExitDecision` deliberately not implemented, that's the position monitor's territory (§11/§12), not built yet.
+
+**Found and fixed a real logic bug via its own hand-verified tests**: the flow detector's conviction multiplier compared OI's sign to price's sign, which doesn't match the standard convention documented in the same file's own docstring table — both "buildup" rows (long buildup *and* short buildup) are OI increasing, regardless of price direction. The bug graded a real short-buildup case (price down, OI up — textbook bearish, full conviction) as merely half-conviction. Fixed to check OI direction alone.
+
+**Live-verified twice against real NIFTY data**, chained directly onto P2's already-verified `loader`/`registry` pipeline:
+
+1. With only `underlying_bars`/`chain` populated (the loader's unconditional output): 2 of 4 detectors correctly fired (the other 2 correctly abstained — their inputs, `oi_change`/`relative_strength_vs_index`, need `prior_chain`/`index_bars`, which the loader deliberately leaves to the caller). The two that fired disagreed in direction and were both weak; the scorer correctly produced no signal.
+2. With `prior_as_of` and a (smoke-test-only, self-referential) `index_bars` supplied: all 4 detectors fired, producing a real result — `direction=BUY, confidence=0.075`. The low confidence is itself a correct outcome: the underlying evidence really was weak (scores of +0.028 and +0.122), and a third family (volatility) actively disagreed; the scorer didn't inflate a marginal case into false conviction, and a neutral (`0.000`) relative-strength reading was correctly excluded from *both* sides rather than forced into one.
+
+### 9b. Not started — the rest of P3, roughly in dependency order
+
 - Risk gate chain (§11) — 11 ordered gates, sizing, per-segment risk config (`config/segments/*.yaml` doesn't exist yet either).
 - Execution simulator (§12) — fill model, cost models per segment, `SimulatedBroker`/`ShadowLogger`. This is also where `orders`/`fills`/`position_marks` actually get consumers.
+- Position monitor / exit rules — `Position`, `ExitDecision`, and `Strategy.manage()`.
 - Orchestrator + live loop (`kairodex/engine/`) tying all of the above together, driven by `LiveClock`.
-- One reference strategy per segment, and the P3 exit criterion itself: full lifecycle in shadow mode for 5 sessions, PnL identity and risk-ceiling property tests passing. None of this is measurable until the orchestrator exists.
+- Per-segment reference strategies (this session's `ReferenceStrategy` is one strategy, not tuned or backtested — it exists to prove the pipeline wiring), and the P3 exit criterion itself: full lifecycle in shadow mode for 5 sessions, PnL identity and risk-ceiling property tests passing. None of this is measurable until the orchestrator exists.
