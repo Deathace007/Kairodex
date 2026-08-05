@@ -94,3 +94,19 @@ def test_zero_atr_returns_none():
 def test_negative_atr_returns_none():
     bars = [_bar(1, 100, 101, 99, 100.5)]
     assert resolve_forward_outcome(Side.BUY, Decimal(100), Decimal(-1), bars) is None
+
+
+def test_zero_max_holding_bars_returns_none():
+    """Would otherwise leave `bars` empty and crash the TIME-exit
+    branch's `bars[-1]`."""
+    bars = [_bar(1, 100, 101, 99, 100.5)]
+    result = resolve_forward_outcome(Side.BUY, Decimal(100), Decimal(2), bars, max_holding_bars=0)
+    assert result is None
+
+
+def test_negative_max_holding_bars_returns_none():
+    """Would otherwise silently slice from the *end* of forward_bars
+    (Python's list[:-n]) instead of truncating the lookahead window."""
+    bars = [_bar(1, 100, 101, 99, 100.5), _bar(2, 100.5, 102, 100, 101)]
+    result = resolve_forward_outcome(Side.BUY, Decimal(100), Decimal(2), bars, max_holding_bars=-1)
+    assert result is None

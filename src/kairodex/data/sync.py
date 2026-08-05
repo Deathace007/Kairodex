@@ -69,7 +69,7 @@ async def sync_watchlist(
             logger.warning("watchlist symbol not found in instruments: %s (%s)", symbol, exchange)
             continue
 
-        # An already-open membership (valid_to still infinity, from ANY
+        # An already-open membership (valid_to >= today, from ANY
         # valid_from, not just today) means this symbol is already an
         # active member — leave it alone. Checking only `valid_from ==
         # today` (the original bug, caught live) meant re-running
@@ -80,11 +80,19 @@ async def sync_watchlist(
         # `watchlist_instruments` (this includes the already-deployed
         # live engine, not just backtesting) evaluated/could double-enter
         # that underlying on every single tick.
+        #
+        # `>= today`, not `== date.max` — matches watchlist_instruments'
+        # own read-path condition exactly (recorder.py). Nothing sets a
+        # non-infinity valid_to today (no "scheduled removal" feature
+        # exists yet), so the two conditions happen to coincide right
+        # now, but `== date.max` would silently reintroduce this exact
+        # duplicate-membership bug the day a finite valid_to is ever
+        # written by anything else.
         already_active = await session.scalar(
             select(WatchlistMembership).where(
                 WatchlistMembership.segment == segment,
                 WatchlistMembership.instrument_id == instrument.instrument_id,
-                WatchlistMembership.valid_to == datetime.date.max,
+                WatchlistMembership.valid_to >= today,
             )
         )
         if already_active is None:

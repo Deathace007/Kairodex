@@ -34,9 +34,14 @@ def resolve_forward_outcome(
     max_holding_bars: int = DEFAULT_MAX_HOLDING_BARS,
 ) -> ForwardOutcome | None:
     """`None` when there's nothing to resolve against (no forward bars,
-    or ATR isn't a usable risk unit yet) — the caller should skip
-    persisting a signal it can't score, not synthesize a fake one."""
-    if not forward_bars or atr_at_entry <= 0:
+    ATR isn't a usable risk unit yet, or `max_holding_bars` isn't a real
+    window) — the caller should skip persisting a signal it can't score,
+    not synthesize a fake one. `max_holding_bars <= 0` is unreachable via
+    any caller in this codebase today, but guarded anyway: a negative
+    value would otherwise silently slice from the *end* of `forward_bars`
+    (Python's `list[:-n]`), and zero would leave `bars` empty, crashing
+    the `TIME`-exit branch's `bars[-1]` below."""
+    if not forward_bars or atr_at_entry <= 0 or max_holding_bars <= 0:
         return None
 
     sign = Decimal(1) if direction is Side.BUY else Decimal(-1)

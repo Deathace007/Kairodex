@@ -60,13 +60,23 @@ def walk_forward_splits(
 
     folds = []
     for i in range(1, n_folds):  # fold 0 has no prior data to train on
+        is_last = i == n_folds - 1
         test_start = start + fold_span * i
-        test_end = end if i == n_folds - 1 else start + fold_span * (i + 1)
+        test_end = end if is_last else start + fold_span * (i + 1)
         purge_cutoff = test_start - embargo
         train = [
             s for s in ordered if s.ts < test_start and _resolution_end(s, bar_days) <= purge_cutoff
         ]
-        test = [s for s in ordered if test_start <= s.ts <= test_end]
+        # Upper bound exclusive except on the true last fold — otherwise a
+        # signal landing exactly on a shared boundary between fold i's
+        # test_end and fold i+1's test_start (the same instant, since
+        # folds are contiguous) would double-count into both folds' test
+        # sets.
+        test = (
+            [s for s in ordered if test_start <= s.ts <= test_end]
+            if is_last
+            else [s for s in ordered if test_start <= s.ts < test_end]
+        )
         if train and test:
             folds.append(
                 WalkForwardFold(train=train, test=test, test_start=test_start, test_end=test_end)

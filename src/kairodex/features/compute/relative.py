@@ -21,7 +21,19 @@ from kairodex.features.types import FeatureContext, Fidelity, Tier
 )
 def relative_strength_vs_index(ctx: FeatureContext) -> float | None:
     """Underlying's cumulative return over the window minus the index's —
-    positive means outperforming the benchmark, not just "going up"."""
+    positive means outperforming the benchmark, not just "going up".
+
+    Requires equal-length bars, same guard `index_correlation` already
+    has — without it, `underlying_bars[0]`/`index_bars[0]` (or `[-1]`)
+    aren't guaranteed to be the same instant (a data gap on one side, or
+    a different holiday calendar between the underlying's exchange and
+    its benchmark, could silently compare mismatched date ranges). This
+    was reachable but effectively dead before P4's `index_bars` wiring —
+    every caller left it `[]`, so the function always returned `None`;
+    now that it's live, a real misalignment here would silently corrupt
+    a real feature value rather than just never firing."""
+    if len(ctx.underlying_bars) != len(ctx.index_bars):
+        return None
     if len(ctx.underlying_bars) < 2 or len(ctx.index_bars) < 2:
         return None
     underlying_return = _cumulative_return(

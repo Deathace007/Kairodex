@@ -46,6 +46,14 @@ def test_relative_strength_none_with_too_few_bars():
     assert relative_strength_vs_index(_ctx([100], [100])) is None
 
 
+def test_relative_strength_none_when_lengths_differ():
+    """Same guard as index_correlation's own — mismatched lengths mean
+    underlying_bars[0]/index_bars[0] aren't guaranteed to be the same
+    instant, so this must refuse rather than silently comparing
+    misaligned windows."""
+    assert relative_strength_vs_index(_ctx([100, 105, 110], [100, 102])) is None
+
+
 def test_index_correlation_perfect_positive():
     """Underlying's *log* return is exactly 3x the index's every period
     (close_i = close_{i-1} * (index_i/index_{i-1})**3) -> perfectly
