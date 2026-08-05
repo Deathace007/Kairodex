@@ -51,6 +51,16 @@ WS_FLUSH_INTERVAL = datetime.timedelta(seconds=3)
 WS_FLUSH_SIZE = 200
 BACKFILL_LOOKBACK_DAYS = 5  # how far back to search for the last recorded bar on a cold start
 
+# Upstox's WS "full" mode (full_d5 — depth + greeks together, what QUOTE/FULL
+# map to in feed.py) silently accepts an oversized `instrumentKeys` subscribe
+# list and then never sends a single message — no error, no rejection frame,
+# just a connection that looks "connected" forever and streams nothing.
+# Live-verified 2026-08-05: 2000 keys streamed real ticks within seconds,
+# 3000 produced zero ticks in 25s. Capped here rather than documented as a
+# limit callers must respect, since the live watchlist's full future-expiry
+# universe (~7,400 keys for 22 NSE underlyings) blows past it by 3-4x.
+MAX_WS_SUBSCRIBE_KEYS = 2000
+
 
 def _provider_key(instrument: Instrument, provider: str) -> str | None:
     """`provider_ids` is JSONB (`dict[str, object]`) since it can hold
@@ -186,7 +196,12 @@ async def _resolve_ws_keys(
     — real vendor asymmetry, not a choice. The Upstox leg universe comes from
     `instruments` (kept current by the T1 poll's upserts), so a brand-new
     strike streams from the next reconnect, not instantly — the T1 poll
-    still records it every cycle regardless, so nothing is lost."""
+    still records it every cycle regardless, so nothing is lost.
+
+    Capped at MAX_WS_SUBSCRIBE_KEYS, nearest-expiry legs first — Upstox's
+    real subscription ceiling, found live (see that constant's comment).
+    Legs beyond the cap still get recorded by the T1 REST poll, just not at
+    WS tick cadence."""
     if provider == "lse":
         return [k for u in underlyings if (k := _provider_key(u, provider)) is not None]
 
@@ -194,15 +209,28 @@ async def _resolve_ws_keys(
     if not symbols:
         return []
     rows = await session.scalars(
-        select(Instrument).where(
+        select(Instrument)
+        .where(
             Instrument.exchange == underlyings[0].exchange,
             Instrument.underlying_symbol.in_(symbols),
             Instrument.kind == InstrumentKind.OPTION,
             Instrument.expiry.is_not(None),
             Instrument.expiry >= datetime.date.today(),
         )
+        .order_by(Instrument.expiry)
     )
-    return [k for r in rows if (k := _provider_key(r, provider)) is not None]
+    keys = [k for r in rows if (k := _provider_key(r, provider)) is not None]
+    if len(keys) > MAX_WS_SUBSCRIBE_KEYS:
+        logger.warning(
+            "%s: %d WS-eligible legs exceeds the %d-key subscription cap, "
+            "keeping nearest-expiry %d",
+            provider,
+            len(keys),
+            MAX_WS_SUBSCRIBE_KEYS,
+            MAX_WS_SUBSCRIBE_KEYS,
+        )
+        keys = keys[:MAX_WS_SUBSCRIBE_KEYS]
+    return keys
 
 
 async def _resolve_instrument_id(
