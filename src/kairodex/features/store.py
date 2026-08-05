@@ -40,10 +40,16 @@ async def write_feature_vector(
     )
     stmt = stmt.on_conflict_do_update(
         index_elements=["segment", "instrument_id", "as_of", "registry_version"],
+        # Subscript access, not `.excluded.values` — caught live: a column
+        # literally named "values" collides with `excluded`'s own Python
+        # `.values()` method under attribute access, silently returning a
+        # bound method instead of the column reference (SQLAlchemy then
+        # tried to JSON-serialize *that* as a literal parameter and
+        # failed). `excluded["values"]` isn't ambiguous the same way.
         set_={
-            "event_ts": stmt.excluded.event_ts,
-            "values": stmt.excluded.values,
-            "quality": stmt.excluded.quality,
+            "event_ts": stmt.excluded["event_ts"],
+            "values": stmt.excluded["values"],
+            "quality": stmt.excluded["quality"],
         },
     )
     await session.execute(stmt)
