@@ -1,6 +1,8 @@
 import datetime
 from decimal import Decimal
 
+import pytest
+
 from kairodex.core.enums import Side
 from kairodex.execution.costs import compute_nse_costs
 from kairodex.execution.simulator import ShadowLogger, SimulatedBroker
@@ -33,6 +35,10 @@ async def test_full_fill_no_cost_model():
     assert result.price == Decimal("101.2")  # same hand-computed fill as test_fills.py
     assert result.costs is None
     assert not result.expired
+    # spread_bps=400, slippage_bps=120 — same hand-computed values as test_fills.py's
+    # test_buy_fill_hand_computed; must survive the ExecutionResult wrapping.
+    assert result.spread_bps == pytest.approx(400.0)
+    assert result.slippage_bps == pytest.approx(120.0)
 
 
 async def test_with_cost_model_computes_costs():

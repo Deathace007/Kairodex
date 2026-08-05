@@ -38,6 +38,8 @@ class ExecutionResult:
     rejected: bool
     reject_reason: str | None
     expired: bool  # partial-fill attempts exhausted with qty still remaining
+    spread_bps: float | None = None
+    slippage_bps: float | None = None
 
 
 class ExecutionPort(Protocol):
@@ -83,7 +85,10 @@ class SimulatedBroker:
         outcome = compute_fill(order.side, order.qty, quote, now, **self._fill_kwargs)  # type: ignore[arg-type]
         if outcome.rejected:
             expired = attempt >= self._max_attempts
-            return ExecutionResult(0, order.qty, None, None, True, outcome.reject_reason, expired)
+            return ExecutionResult(
+                0, order.qty, None, None, True, outcome.reject_reason, expired,
+                spread_bps=outcome.spread_bps, slippage_bps=outcome.slippage_bps,
+            )
 
         costs = None
         if self._cost_model is not None and outcome.price is not None:
@@ -93,7 +98,8 @@ class SimulatedBroker:
         remaining = order.qty - outcome.filled_qty
         expired = remaining > 0 and attempt >= self._max_attempts
         return ExecutionResult(
-            outcome.filled_qty, remaining, outcome.price, costs, False, None, expired
+            outcome.filled_qty, remaining, outcome.price, costs, False, None, expired,
+            spread_bps=outcome.spread_bps, slippage_bps=outcome.slippage_bps,
         )
 
 

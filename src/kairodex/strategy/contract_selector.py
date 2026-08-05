@@ -35,6 +35,13 @@ class ContractCandidate:
     bid: Decimal
     ask: Decimal
     delta: Decimal | None = None
+    # Only needed downstream (building a QuoteSnapshot for the execution
+    # simulator once this candidate is selected) — optional so selection
+    # logic/tests never had to care about them.
+    bid_sz: int | None = None
+    ask_sz: int | None = None
+    oi: int | None = None
+    quote_ts: datetime.datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
