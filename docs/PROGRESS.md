@@ -19,7 +19,32 @@ exposure caps, put delta-targeting backwards, and three of six exit
 checks being unreachable). **Not yet measured**: P3's own exit criterion
 (full lifecycle in shadow mode for 5 sessions) needs real calendar time
 to elapse — the clock started at deployment, see §9d.
-**Next phase:** P4 (Backtest & validation) — starting now.
+
+**P4 (Backtest & validation) is functionally complete**: ReplayClock,
+Track A backtest runner over real historical underlying OHLCV (fetched
+live from Upstox candles v3 for the whole NSE watchlist, 643 real daily
+bars/instrument, 2024-2026), directional metrics (hit rate, MFE/MAE
+ratio, expectancy in ATR units + bootstrap CI, signal lead time, MFE
+capture ratio, quarterly/regime consistency), a Black-76 synthetic-option
+overlay (ESTIMATE-labeled, never a gate), purged/embargoed walk-forward
+splits, deflated Sharpe, a held-out-period guard, and the full promotion
+state machine + both gate sets (Track A DB-free, Track B against real
+trades/fills/equity_snapshots). Live-verified end to end: a real
+`kairodex backtest run` against the whole nse_stock watchlist (7,525
+resolved signals over ~2.5 years) correctly failed 5 of 7 Track A gates
+— the expected, correct outcome for `ReferenceStrategy`, which is
+explicitly "not tuned... exists to prove the pipeline wiring, not to
+trade well." See §10 for the full account, including **two more
+live-affecting bugs found and fixed this pass** (`Fill.spread_bps`/
+`slippage_bps` never written despite the columns existing, and a
+`sync_watchlist` bug that had every nse_stock/nse_index underlying
+double-registered in the ALREADY-DEPLOYED live engine's watchlist since
+2026-08-04) — and the golden replay test's honest status: the mechanism
+is live-verified against 12 real recorded signals (byte-identical
+replay), but no real trade has been TAKEN yet to replay a full
+open-to-close lifecycle against, so that specific case remains
+unexercised until one occurs.
+**Next phase:** P5 (Analytics & export).
 
 > Read this file first, every session. Update it whenever a phase
 > completes, a decision changes, or a command/location changes. Deeper
@@ -351,3 +376,73 @@ Per the explicit instruction to "verify everything in detail and use sub agents 
 All 6 fixes are in `kairodex/risk/sizing.py`, `kairodex/risk/accounting.py` (new), `kairodex/strategy/contract_selector.py`, and `kairodex/engine/orchestrator.py`/`live_loop.py`. `accounting.py` follows the established DB-touching `loader.py` pattern (no local unit test, same as `risk/loader.py`/`features/loader.py` — verified live on the VM instead, per `CLAUDE.md`'s local-is-DB-free-only rule). 4 new local unit tests added (sizing premium/exposure caps + `INVALID_PREMIUM`, put delta-targeting regression); 275 tests passing, ruff/mypy clean.
 
 - **`Strategy.manage()` still isn't wired into the orchestrator** — `run_exit_tick` calls `evaluate_exits` directly rather than through `strategy.manage()`, unaffected by this pass since the reference strategy's exits don't need feature context. Revisit once a strategy actually wants feature-aware exits.
+
+---
+
+## 10. P4 — Backtest & validation (2026-08-05)
+
+Same session as P3, continuing per the user's explicit instruction to complete P4 in full, with the same "constant review" discipline. Scope, per ARCHITECTURE.md §13: Track A only — directional accuracy on underlying OHLCV, no option-chain backtesting (ADR/SPEC_REVIEW A3's decision, "option economics validated later in live shadow mode instead," which P3 already does).
+
+### 10a. DB-free core — `kairodex/backtest/` (59 tests)
+
+`clock.py`: `ReplayClock`, the same `Clock` Protocol (`.now()`) as `LiveClock` — Principle 1's "one engine, two clocks" was already true of `kairodex.engine.orchestrator` before this session (its functions take `now` as a plain parameter, never call `datetime.now()` internally), so this is a small, literal piece, not a redesign.
+
+`resolve.py`: pure forward-outcome resolution — walks a signal's direction/entry/ATR against the underlying's own subsequent bars to a synthetic stop/target/time exit, in ATR units (the doc's own expectancy unit). Ambiguous same-bar stop+target hits resolve to the stop (conservative — daily bars can't know which happened first intrabar).
+
+`metrics.py`: the full directional metrics table — hit rate, break-even hit rate (from the strategy's own realized win/loss profile via `return_atr`, not a fixed R assumption), MFE/MAE ratio (aggregate `sum/sum`, not mean-of-ratios), expectancy in ATR units + bootstrap 95% CI, signal lead time (SPEC_REVIEW C10, "how much of the move came after the signal"), MFE capture ratio, quarterly/regime consistency.
+
+`synthetic_options.py`: Black-76 overlay along the backtested path at a flat IV assumption, ATM at entry (no chain to delta-target against — a documented simplification, not a precision claim), `ESTIMATE`-labeled, deliberately never read by `promotion.py`'s gates.
+
+`validation.py`: purged/embargoed walk-forward splits (a signal is purged from train if its OWN forward-resolution window reaches within the embargo of test_start, not just its `ts` — real purging, not just a date cut), walk-forward efficiency (mean OOS/IS expectancy ratio), deflated Sharpe (Bailey & López de Prado 2014, the Gaussian non-skew/kurtosis-adjusted variant — a documented simplification, upgrade once there's enough trade history to trust a skew/kurtosis estimate), the held-out-final-period config guard.
+
+`promotion.py`: the `DRAFT -> BACKTESTED -> VALIDATED -> SHADOW -> PAPER_SMALL -> PAPER_FULL` state machine (`RETIRED` reachable from the last three) + Track A gate checking (every threshold from ARCHITECTURE.md §10's own table, DB-free) + Track B gate checking (the one DB-touching function here, against real `trades`/`fills`/`equity_snapshots` — sample size, profit factor, max drawdown, slippage realism vs. the fill model's own assumed ratio, directional agreement with Track A within 1 SE).
+
+### 10b. DB-touching runner — `kairodex/backtest/runner.py`, `history.py`, `backtest_runs`
+
+`history.py`: backfills `underlying_bars` via each vendor's existing `MarketDataProvider.bars()` (Upstox candles v3 / LSE vault — both already built in P0/P1 for restart-recovery gap-fill, no new vendor code needed).
+
+`runner.py`: `run_backtest` steps a segment's whole underlying bar history bar-by-bar, building a `FeatureContext` with `chain=[]` at each step (Track A has no option chain), runs the **same** `Strategy`/`ConfluenceScorer` the live engine uses, resolves any signal via `resolve.py` against the underlying's own subsequent bars. Loads its whole bar range up front (one query, not one per bar) — a backtest steps through thousands of bars where the live engine steps through one tick per cycle.
+
+`BacktestRun` (new table + migration `295470f137eb`): one row per run, an aggregate `metrics` JSONB summary (ARCHITECTURE.md §5.4's own schema) — not a row per signal, since `signals` carries no `run_id` to distinguish backtest from live and reusing it would conflate the two. `trades.run_id` is now a real FK to `backtest_runs` (was a documented soft reference since the table didn't exist yet).
+
+CLI: `kairodex backtest fetch-history --market {nse,us} --start ... --end ...` and `kairodex backtest run --segment ... --from ... --to ...` (pools the whole segment's watchlist into one strategy-level Track A result, prints every gate's pass/fail, writes a `backtest_runs` row).
+
+### 10c. Live verification — real vendor history, a real backtest run, and the golden replay guarantee
+
+`fetch-history` against real Upstox candles v3, 2024-01-01 to 2026-08-05: **643 real daily bars** for all 20 nse_stock symbols plus Nifty 50 and BANKNIFTY — no errors, no gaps worth noting.
+
+`backtest run --segment nse_stock --from 2024-01-01 --to 2026-06-01` against that real data: **7,525 resolved signals** across 20 underlyings (after fixing the watchlist bug below — see the corrected run). Track A gate results, exactly as expected for `ReferenceStrategy` ("not tuned or backtested; exists to prove the pipeline wiring"):
+
+```
+PASS sample_size:            7525 resolved signals (need >= 200)
+PASS directional_hit_rate:   hit_rate=0.3741, break_even=0.3719  (barely clears — no real edge, as expected)
+FAIL expectancy:              0.0055 ATR, CI (-0.024, 0.037) — doesn't exclude zero
+FAIL mfe_mae_ratio:           1.11 (need >= 1.5)
+FAIL signal_lead_time:        0.50 (need >= 0.6)
+FAIL consistency:             5/10 quarters positive, 1 regime positive (need 3/4+ and >= 2)
+PASS deflated_sharpe:         0.0042 at 1 trial (need > 0)
+FAIL walk_forward_efficiency: -2.23 (need >= 0.5)
+overall: not ready
+```
+
+This is the *correct* outcome — a strategy assembled to exercise the pipeline, not to trade well, correctly fails 5 of 7 gates. The mechanism discriminating real signal quality (not rubber-stamping) is itself the thing being proven here.
+
+**Two more live-affecting bugs found and fixed during this verification pass:**
+
+1. **`Fill.spread_bps`/`slippage_bps` columns existed but were never written.** `ExecutionResult` already carries them correctly (P3's subagent-review fix), but neither `_record_fill` (entry) nor the exit-side `Fill(...)` construction in `orchestrator.py` ever forwarded them — every `Fill` row ever written had these columns permanently `NULL`, which would have silently broken Track B's slippage-realism gate (built this session) the moment real shadow trades existed. Fixed: both call sites now pass `execution.spread_bps`/`execution.slippage_bps` through.
+2. **`sync_watchlist` created duplicate active memberships — a real, currently-live bug, not just a backtest artifact.** Caught because `backtest run`'s per-underlying signal counts were exactly double what they should have been (15,050 instead of 7,525). Root cause: `sync_watchlist`'s idempotency check only looked for a `WatchlistMembership` row with `valid_from == today`; this deployment had `sync-watchlist` run on both 2026-08-04 and 2026-08-05, and each run correctly found "no row for today" and inserted a *new* row — but never closed the earlier row's `valid_to` (still `infinity`), so both read as "currently valid" together. **`watchlist_instruments()` is what `live_loop.run_segment` iterates every tick** — this means the already-deployed live engine had been double-evaluating (and could have double-entered) every `nse_stock`/`nse_index` underlying on every tick since the second sync. Fixed `sync_watchlist` to check for *any* currently-open membership (`valid_to = infinity`, any `valid_from`), not specifically today's; cleaned up the 22 already-corrupted rows directly on the VM (kept the earliest `valid_from` per duplicated pair, deleted the rest) — verified via `psql`, 0 duplicates remain across all 4 segments. Verified the fix live: re-ran `sync-watchlist` after deploying it, confirmed no new duplicates; re-ran the backtest, got the correct halved (7,525) signal count.
+
+**Track B** (`evaluate_track_b`) live-verified against real (currently near-empty) shadow data: correctly reports `FAIL sample_size` (0 shadow trades), `FAIL profit_factor` (no closed trades), `PASS max_drawdown` (0.0, legitimately true with nothing open yet), `FAIL slippage_realism`/`directional_agreement` (nothing to assess) — no crash, graceful degradation exactly as designed.
+
+**Golden replay test — honest status, not faked.** ARCHITECTURE.md §13/§18 calls for `tests/replay/` holding a recorded live session, asserting replay reproduces its trades exactly. The mechanism this protects (Principle 1: the same orchestrator, driven by a different clock/data source, must produce identical decisions) is **live-verified against real recorded production data**: 12 real `signals` rows from today's actual live-engine run (spanning both real reject stages that have occurred — `session_window`/`OUTSIDE_SESSION_WINDOW` and `contract_selection`/`NO_CANDIDATES_IN_EXPIRY_WINDOW`) were re-run through `run_entry_tick` with their original `now` timestamp against the same DB, and **all 12 reproduced byte-identical decisions** (same `reject_stage`/`reject_reason`/taken-or-not). What's genuinely not yet possible, and not faked: **zero trades have been TAKEN yet** (0 rows in `trades`, confirmed via `psql` — 2,697 real signals so far, all `REJECTED`), so the specific case the doc's own wording emphasizes — "reproduces its trades exactly" — has no real trade to replay against. A committed `tests/replay/test_*.py` pytest file was deliberately not added: it would need a real DB connection to be meaningful (this repo has no testcontainers/DB-fixture infrastructure, and `testpaths = ["tests"]` means anything placed under `tests/replay/` would be collected and run locally by default, which would either hang or fail against CLAUDE.md's DB-free local rule). This is the same real, undeniable data dependency flagged before P4 started; check back once the live/shadow engines have actually closed a trade.
+
+### 10d. Local test suite state
+
+`kairodex/backtest/` (59 tests) + the `sync_watchlist`/`Fill` fixes (no new local tests — both are DB-touching, same untested-loader/orchestrator precedent). Full suite: 334 tests passing, ruff/mypy clean, locally and on the VM.
+
+### 10e. What's left / known gaps (deliberate, not overlooked)
+
+- **The golden replay test's "reproduces trades exactly" case** — needs a real TAKEN trade to exist first (see §10c). Not fabricatable honestly; revisit once one closes.
+- **`ReferenceStrategy` itself has no real edge** (5/7 Track A gates failed, correctly) — expected; it exists to prove pipeline wiring, not to trade. A real strategy build-out is P7 scope.
+- **Track B's `evaluate_track_b` has no shadow trade data to score yet** — same root cause as the above; the mechanism is verified, the real numbers aren't populated yet.
+- **`optimization_runs` (the doc's named source for deflated Sharpe's "honest trial count") doesn't exist as a table** — `n_trials` is approximated here as `count(backtest_runs) for this strategy_id + 1`, a defensible proxy (every backtest run against a strategy is itself a trial), but not literally the doc's named table. Revisit if hyperparameter-sweep-style optimization runs are ever built (Optuna is explicitly out of the live path per this repo's own import-linter contract).
