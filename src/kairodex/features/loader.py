@@ -19,13 +19,27 @@ from collections import defaultdict
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from kairodex.core.enums import InstrumentKind, Segment
+from kairodex.core.enums import InstrumentKind, Market, Segment
 from kairodex.data.types import Bar, ChainSnapshot, Tick, Timeframe
 from kairodex.features.types import FeatureContext
 from kairodex.store.models import Instrument, OptionQuote, UnderlyingBar
 
 _DEFAULT_BARS_LOOKBACK_DAYS = 5
 _DEFAULT_MAX_EXPIRIES = 2  # matches T1 REST poll's own scope (recorder.py's poll_chain_once)
+
+# relative_strength_vs_index's benchmark, per segment — ARCHITECTURE.md
+# doesn't name one explicitly ("which index is the benchmark for this
+# underlying" is called out in this module's own docstring as a real
+# decision left to the caller); NIFTY 50 for both NSE segments, SPY (the
+# broad-market proxy, already tracked as one of the four US_INDEX
+# constituents per ADR 0007) for both US segments. First-pass, documented,
+# freely revisitable.
+_BENCHMARK_SYMBOL: dict[Segment, str] = {
+    Segment.NSE_STOCK: "Nifty 50",
+    Segment.NSE_INDEX: "Nifty 50",
+    Segment.US_STOCK: "SPY",
+    Segment.US_INDEX: "SPY",
+}
 
 
 async def load_underlying_bars(
@@ -50,6 +64,36 @@ async def load_underlying_bars(
         Bar(ts=r.ts, open=r.open, high=r.high, low=r.low, close=r.close, volume=r.volume)
         for r in rows
     ]
+
+
+async def load_index_bars(
+    session: AsyncSession,
+    segment: Segment,
+    as_of: datetime.datetime,
+    *,
+    lookback_days: int = _DEFAULT_BARS_LOOKBACK_DAYS,
+    timeframe: Timeframe = Timeframe.ONE_MIN,
+) -> list[Bar]:
+    """Bars for `segment`'s benchmark (`_BENCHMARK_SYMBOL`) — the other
+    half `relative_strength_vs_index` needs and nothing was ever supplying
+    (verified live: neither `orchestrator.run_entry_tick` nor any backtest
+    code populated `FeatureContext.index_bars`, which defaults to `[]`,
+    which makes `relative_strength_detector` return `None` on every single
+    call — one of only two detector families that can ever fire without
+    an option chain, permanently dead). Returns `[]`, not an error, if the
+    benchmark instrument isn't in `instruments` yet — a missing benchmark
+    degrades `relative_strength_vs_index` to `None`, same as any other
+    missing feature input, rather than crashing the caller."""
+    symbol = _BENCHMARK_SYMBOL[segment]
+    exchange = "NSE" if segment.market is Market.NSE else "US"
+    benchmark = await session.scalar(
+        select(Instrument).where(Instrument.exchange == exchange, Instrument.symbol == symbol)
+    )
+    if benchmark is None:
+        return []
+    return await load_underlying_bars(
+        session, benchmark.instrument_id, as_of, lookback_days=lookback_days, timeframe=timeframe
+    )
 
 
 async def load_chain(

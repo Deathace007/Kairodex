@@ -21,6 +21,7 @@ verification catches, not what a hand-computed unit test would.
 
 from __future__ import annotations
 
+import dataclasses
 import datetime
 from dataclasses import dataclass
 from decimal import Decimal
@@ -116,6 +117,14 @@ async def run_entry_tick(
     feature_ctx = await feature_loader.build_context(
         session, segment=segment, underlying=underlying, as_of=now, prior_as_of=prior_as_of
     )
+    # build_context deliberately leaves index_bars for the caller (its own
+    # docstring) — nothing was ever supplying it, which made
+    # relative_strength_detector permanently dead (see load_index_bars's
+    # docstring). Missing benchmark data degrades to [] (unchanged), not
+    # an error.
+    index_bars = await feature_loader.load_index_bars(session, segment, now)
+    if index_bars:
+        feature_ctx = dataclasses.replace(feature_ctx, index_bars=index_bars)
     values, _quality = feature_registry.compute_all(feature_ctx)
     market_ctx = MarketContext(feature_ctx=feature_ctx, features=values)
 
