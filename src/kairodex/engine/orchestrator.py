@@ -341,11 +341,21 @@ async def _record_fill(
     session.add(order)
     await session.flush()
 
+    # spread_bps/slippage_bps: execution already computes these (fills.py
+    # -> ExecutionResult) — forwarded here so Fill rows aren't permanently
+    # NULL on those columns (P4's Track B "slippage realism" gate reads
+    # them, and the export bundle will too).
     fill = Fill(
         order_id=order.order_id,
         ts=now,
         qty=execution.filled_qty,
         price=execution.price,
+        spread_bps=(
+            Decimal(str(execution.spread_bps)) if execution.spread_bps is not None else None
+        ),
+        slippage_bps=(
+            Decimal(str(execution.slippage_bps)) if execution.slippage_bps is not None else None
+        ),
     )
     session.add(fill)
 
@@ -493,7 +503,18 @@ async def run_exit_tick(
     )
     session.add(order)
     await session.flush()
-    fill = Fill(order_id=order.order_id, ts=now, qty=execution.filled_qty, price=execution.price)
+    fill = Fill(
+        order_id=order.order_id,
+        ts=now,
+        qty=execution.filled_qty,
+        price=execution.price,
+        spread_bps=(
+            Decimal(str(execution.spread_bps)) if execution.spread_bps is not None else None
+        ),
+        slippage_bps=(
+            Decimal(str(execution.slippage_bps)) if execution.slippage_bps is not None else None
+        ),
+    )
     session.add(fill)
 
     qty_before_exit = trade.qty_lots  # captured before any mutation below
