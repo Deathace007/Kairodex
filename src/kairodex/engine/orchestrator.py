@@ -33,7 +33,7 @@ from kairodex.core.enums import Segment, Side
 from kairodex.data.types import Tick
 from kairodex.engine import event_log
 from kairodex.engine.monitor import Position, evaluate_exits
-from kairodex.execution.simulator import ExecutionResult, SimulatedBroker
+from kairodex.execution.simulator import ExecutionPort, ExecutionResult
 from kairodex.execution.types import OrderRequest, QuoteSnapshot
 from kairodex.features import loader as feature_loader
 from kairodex.features import registry as feature_registry
@@ -99,7 +99,7 @@ async def run_entry_tick(
     strategy_row_id: int,
     config: SegmentRiskConfig,
     account: AccountState,
-    broker: SimulatedBroker,
+    broker: ExecutionPort,
     now: datetime.datetime,
     prior_as_of: datetime.datetime | None = None,
 ) -> TickOutcome | None:
@@ -338,7 +338,7 @@ async def run_exit_tick(
     session: AsyncSession,
     *,
     trade: Trade,
-    broker: SimulatedBroker,
+    broker: ExecutionPort,
     now: datetime.datetime,
     blackout_active: bool = False,
 ) -> ExitOutcome:

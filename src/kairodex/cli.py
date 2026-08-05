@@ -159,6 +159,28 @@ def run_cmd(market: Market = typer.Option(..., help="nse or us")) -> None:
     asyncio.run(run_market(market))
 
 
+@app.command("engine")
+def engine_cmd(
+    segment: Segment = typer.Option(..., help="nse_stock, nse_index, us_stock, or us_index"),
+    live: bool = typer.Option(
+        False,
+        help=(
+            "Real paper capital (SimulatedBroker) instead of shadow mode "
+            "(ShadowLogger, zero capital, the default). Never real broker "
+            "capital — see ARCHITECTURE.md §11, 'live trading is absent code.'"
+        ),
+    ),
+) -> None:
+    """The engine process (ARCHITECTURE.md §3): `engine --segment
+    {nse_stock,nse_index,us_stock,us_index}`, one per segment. Requires
+    `ingest sync-instruments`/`sync-watchlist` to have populated that
+    segment's watchlist first, and `ingest run` to be feeding it live
+    quotes."""
+    from kairodex.engine.live_loop import run_segment
+
+    asyncio.run(run_segment(segment, shadow=not live))
+
+
 @app.command("status")
 def status_cmd() -> None:
     """Minimal status page (ARCHITECTURE.md §19 P1 exit criterion): per-market

@@ -2,12 +2,16 @@
 bundling this session's four detectors — one per confluence family, enough
 to prove the framework fires (and correctly refuses to fire) end to end.
 
-`manage(self, pos: Position, ctx: MarketContext) -> ExitDecision | None`
-from the spec's full Protocol is deliberately not implemented here —
-`Position`/`ExitDecision` belong to the position monitor (§11/§12), not
-built this session (see docs/PROGRESS.md §9's "not started" list). A
-`Strategy` here is entry-side only: `evaluate` plus enough metadata for
-an orchestrator to know what it needs.
+`manage`'s implementation here just delegates to
+`kairodex.engine.monitor.evaluate_exits` — that function only needs a
+`Position`, not feature context, so `ctx` goes unused by this particular
+strategy. `kairodex.engine.orchestrator.run_exit_tick` currently calls
+`evaluate_exits` directly rather than through `strategy.manage()` (one
+fewer `FeatureContext` build per open position per tick, since this
+reference strategy's exit logic doesn't need one) — wiring `manage()`
+into the orchestrator properly is the natural next step once a strategy
+actually wants feature-aware exits (e.g. tightening a trailing stop on
+an IV regime shift).
 """
 
 from __future__ import annotations
@@ -16,6 +20,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Protocol
 
+from kairodex.engine.monitor import ExitDecision as MonitorExitDecision
+from kairodex.engine.monitor import Position, evaluate_exits
 from kairodex.strategy.detectors.flow import oi_price_flow_detector
 from kairodex.strategy.detectors.relative_strength import relative_strength_detector
 from kairodex.strategy.detectors.structure import trend_structure_detector
@@ -26,9 +32,14 @@ Detector = Callable[[MarketContext], Evidence | None]
 
 
 class Strategy(Protocol):
-    id: str
+    # Read-only property, not a plain attribute: a plain `id: str` in a
+    # Protocol demands write access too, which a frozen dataclass field
+    # (ReferenceStrategy.id) structurally can't offer.
+    @property
+    def id(self) -> str: ...
 
     def evaluate(self, ctx: MarketContext) -> list[Evidence]: ...
+    def manage(self, pos: Position, ctx: MarketContext) -> MonitorExitDecision | None: ...
 
 
 _REFERENCE_DETECTORS: tuple[Detector, ...] = (
@@ -62,3 +73,9 @@ class ReferenceStrategy:
             if result is not None:
                 evidence.append(result)
         return evidence
+
+    def manage(self, pos: Position, ctx: MarketContext) -> MonitorExitDecision | None:
+        """`ctx` is unused — see the module docstring. Delegates entirely
+        to `evaluate_exits`'s default thresholds (stop-loss, trailing
+        stop, profit target, R-multiple partials, time/event exit)."""
+        return evaluate_exits(pos, ctx.feature_ctx.as_of)

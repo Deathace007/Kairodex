@@ -21,10 +21,11 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Protocol
 
+from kairodex.core.enums import Side
 from kairodex.execution.fills import compute_fill
 from kairodex.execution.types import CostBreakdown, OrderRequest, QuoteSnapshot
 
-CostModelFn = Callable[[object, Decimal, int], CostBreakdown]  # (side, premium, qty) -> costs
+CostModelFn = Callable[[Side, Decimal, int], CostBreakdown]  # (side, premium, qty) -> costs
 
 _DEFAULT_MAX_ATTEMPTS = 3
 
