@@ -21,7 +21,12 @@ depends_on: Union[str, Sequence[str], None] = None
 def upgrade() -> None:
     op.create_table(
         'feature_vectors',
-        sa.Column('id', sa.BigInteger(), autoincrement=True, nullable=False),
+        # Identity(), not just autoincrement=True: caught live — since `id`
+        # isn't the (sole) primary key here, plain autoincrement doesn't
+        # get a sequence attached the way a single-column integer PK
+        # would, leaving `id` with no default and every insert omitting
+        # it violating NOT NULL.
+        sa.Column('id', sa.BigInteger(), sa.Identity(), nullable=False),
         sa.Column(
             'segment',
             # segment_enum already exists (created by 354672f0f639).

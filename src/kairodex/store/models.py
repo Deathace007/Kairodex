@@ -21,6 +21,7 @@ from sqlalchemy import (
     CheckConstraint,
     Date,
     ForeignKey,
+    Identity,
     Numeric,
     SmallInteger,
     String,
@@ -273,11 +274,17 @@ class FeatureVector(Base):
     FK (§5.4, P3) needs to reference a row, it'll need to carry `as_of`
     alongside `id` and FK on the composite — the standard Timescale
     pattern for this, not solved here since nothing consumes it yet.
+
+    `id` needs `Identity()`, not just `autoincrement=True` — caught live:
+    since `id` isn't the (sole) primary key here, plain `autoincrement`
+    doesn't get SQLAlchemy/Postgres to attach a sequence the way a
+    single-column integer PK would; without `Identity()` the column has
+    no default at all and every insert omitting `id` violates NOT NULL.
     """
 
     __tablename__ = "feature_vectors"
 
-    id: Mapped[int] = mapped_column(BigInteger, autoincrement=True, nullable=False)
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), nullable=False)
     segment: Mapped[Segment] = mapped_column(_segment_enum, primary_key=True)
     instrument_id: Mapped[int] = mapped_column(
         ForeignKey("instruments.instrument_id"), primary_key=True
