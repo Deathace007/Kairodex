@@ -2,22 +2,19 @@
 
 **Last updated:** 2026-08-05
 **Current phase:** P1 (The Recorder) is done pending the unattended
-5-session check (§7) — both markets live-verified, process supervision
-(systemd) deployed. P2 (Pricing & features) is functionally complete:
-pricing module (`kairodex/pricing/`) and feature registry
-(`kairodex/features/`, 18 launch features + `feature_vectors` point-in-time
-store) both built, tested, and live-verified end to end against real
-recorded NIFTY data on the VM — reverified clean in a later session (§8
-footer). **P3 (Engine & paper execution) is in progress**: least-privilege
-DB role + append-only, hash-chained trade event log (Principle 2) built
-and live-verified on the VM, including genuinely attempting to break it
-two different ways (§9). `MarketContext`, `ConfluenceScorer`, four
-detectors (one per confluence family), and a reference strategy built,
-tested, and live-verified against real NIFTY data end to end from the
-DB through to a real BUY signal (§9a). Risk engine, execution simulator,
-position monitor, and orchestrator are substantial and not started —
-see §9b.
-**Next phase:** continue P3 — see §9b's dependency-ordered list.
+5-session check (§7). P2 (Pricing & features) is functionally complete
+(§8). **P3 (Engine & paper execution) is functionally complete**: every
+piece ARCHITECTURE.md §3's engine box names — risk gate chain, execution
+simulator, position monitor, contract selector, orchestrator — is built,
+tested, and deployed as 4 systemd-supervised shadow-mode engine
+processes (one per segment) on the VM, live-verified end to end against
+real NIFTY chain data through to an actual simulated fill with real
+pricing and costs. See §9 for the full account, including a critical
+bug (every signal would have been rejected, forever) caught by that live
+pass and fixed before deployment. **Not yet measured**: P3's own exit
+criterion (full lifecycle in shadow mode for 5 sessions) needs real
+calendar time to elapse — the clock started at deployment, see §9d.
+**Next phase:** P4 (Backtest & validation), once the P3 review pass (§9d) is clean.
 
 > Read this file first, every session. Update it whenever a phase
 > completes, a decision changes, or a command/location changes. Deeper
@@ -294,10 +291,45 @@ Both migration bugs along the way were caught live and fixed the same session: t
 1. With only `underlying_bars`/`chain` populated (the loader's unconditional output): 2 of 4 detectors correctly fired (the other 2 correctly abstained — their inputs, `oi_change`/`relative_strength_vs_index`, need `prior_chain`/`index_bars`, which the loader deliberately leaves to the caller). The two that fired disagreed in direction and were both weak; the scorer correctly produced no signal.
 2. With `prior_as_of` and a (smoke-test-only, self-referential) `index_bars` supplied: all 4 detectors fired, producing a real result — `direction=BUY, confidence=0.075`. The low confidence is itself a correct outcome: the underlying evidence really was weak (scores of +0.028 and +0.122), and a third family (volatility) actively disagreed; the scorer didn't inflate a marginal case into false conviction, and a neutral (`0.000`) relative-strength reading was correctly excluded from *both* sides rather than forced into one.
 
-### 9b. Not started — the rest of P3, roughly in dependency order
+### 9b. Risk engine — `kairodex/risk/` + `config/segments/*.yaml` (54 tests)
 
-- Risk gate chain (§11) — 11 ordered gates, sizing, per-segment risk config (`config/segments/*.yaml` doesn't exist yet either).
-- Execution simulator (§12) — fill model, cost models per segment, `SimulatedBroker`/`ShadowLogger`. This is also where `orders`/`fills`/`position_marks` actually get consumers.
-- Position monitor / exit rules — `Position`, `ExitDecision`, and `Strategy.manage()`.
-- Orchestrator + live loop (`kairodex/engine/`) tying all of the above together, driven by `LiveClock`.
-- Per-segment reference strategies (this session's `ReferenceStrategy` is one strategy, not tuned or backtested — it exists to prove the pipeline wiring), and the P3 exit criterion itself: full lifecycle in shadow mode for 5 sessions, PnL identity and risk-ceiling property tests passing. None of this is measurable until the orchestrator exists.
+`config/segments/*.yaml`, one per segment: `capital`/`base_risk_pct`/`hard_ceiling_pct`/`max_premium_pct` are exactly ARCHITECTURE.md §11's own table (asserted against it directly in `tests/unit/test_segment_config.py`). Daily/weekly loss limits, max drawdown, exposure cap, liquidity floor, and re-entry cooldown aren't given exact numbers in the doc ("config, not hardcoded" is the instruction, not a value) — round, documented, freely-adjustable first-pass defaults.
+
+`sizing.py` implements the doc's formula exactly (`risk_budget = equity * base_risk_pct * risk_multiplier(...)`, `lots = floor(risk_budget / (stop_distance * lot_size))`); `risk_multiplier`'s curve shape (scale up on profit, down on drawdown, damped by consecutive-loss streak) is this session's own design since the doc explicitly delegates it ("a config-driven curve," no numbers given).
+
+`gates.py`: the 11 gates in the doc's literal order, each independently testable, the chain stopping at the first denial. Anti-revenge (no re-entry within N minutes of a loss) folded into `correlation_cluster_gate` since the doc's numbered order doesn't name it separately. `event_blackout_gate`/`session_window_gate` are honest placeholders — no earnings/macro calendar or populated `trading_calendar` exists yet.
+
+**Caught a real dead-code bug via the gate chain's own tests**: `exposure_gate` running before `capital_available_gate` mathematically guarantees `premium <= uncommitted capital` by the time the latter runs (since `exposure_cap_pct <= 1` always) — its own separate uncommitted-capital check was permanently unreachable. Removed rather than left as false defense-in-depth.
+
+`loader.py` (the one DB-touching file, same split pattern as everywhere else) builds a real `AccountState` — including a pragmatic fallback for `session_open` (checks `trading_calendar` first, falls back to an approximate hardcoded NSE/US session window since no vendor holiday sync exists yet) so live verification during actual market hours is possible at all before that real integration is built.
+
+### 9c. Execution simulator, position monitor, contract selector, orchestrator
+
+**`kairodex/execution/`** (38 tests): `fills.py` implements ARCHITECTURE.md §12's fill model as a pure function — stale quote / incomplete chain / crossed book rejected before pricing anything, then spread-too-wide / size-vs-OI rejected on policy, only then a fill price (`mid ± k*half_spread`) and possibly-partial quantity. `costs.py`: NSE and US cost models seeded from published rates, repeating the doc's own caveat verbatim ("verify against a real contract note before trusting backtest P&L"). `simulator.py`: `SimulatedBroker` + `ShadowLogger`, the exactly-two `ExecutionPort` implementations §11 calls for — deliberately stateless (attempt-count tracking lives in the DB, not a long-lived Python object, this codebase's usual principle). Caught and fixed a real interface bug (`compute_nse_costs`/`compute_us_costs` had different signatures despite needing to be interchangeable through one `cost_model` slot) and reverted a real testability regression before shipping (a module-level `PAPER_ONLY` assertion would have made `DATABASE_URL` a transitive import-time requirement for a pure function — removed; the same guarantee already exists via `Settings.kairodex_paper_only`'s own field validator).
+
+**`kairodex/engine/monitor.py`** (23 tests): `Position`/`ExitDecision` (missing from the original strategy-framework session since they didn't exist yet) plus every exit rule from §11's controls list — stop-loss, trailing stop (ratchets up without exiting until price actually falls through the trailed level), profit target, partial exits at R-multiples (lowest untaken target first, each fraction computed against the *current* remaining size), time-based exit (theta guard), event-based exit. `evaluate_exits` runs all six in priority order: risk protection before mandatory exits before opportunistic ones.
+
+**`kairodex/strategy/contract_selector.py`** (9 tests): turns a directional signal into one actual option leg — option type from direction, filtered to an expiry window, filtered by the affordability constraint (§11: "the contract selector treats it as a constraint rather than a preference"), delta-targeted among what's left, with a spot-distance fallback when a leg has no vendor delta.
+
+**`kairodex/engine/orchestrator.py`**: pure glue — `run_entry_tick` (features → `ReferenceStrategy.evaluate` → `ConfluenceScorer` → contract selection → risk gate chain → sizing → execution → DB writes) and `run_exit_tick` (latest mark → reconstruct `Position` from the trade row → `evaluate_exits` → stop ratchet / partial or full exit / no action, always writing a `position_marks` row). Contract selection deliberately runs *before* the risk gate chain, not after — documented in the module docstring why (liquidity/capital-available gates need a specific candidate's data to evaluate at all; the component diagram's box order is schematic, not a literal constraint).
+
+Three bugs caught and fixed through careful review before any live test: `select_contract`'s affordability filter was being called with `lot_size=1` while the real trade used the actual per-market lot size (would have silently passed genuinely-unaffordable contracts); a candidate's expiry was being patched onto a frozen dataclass via `object.__setattr__` after construction (replaced with passing it into the constructor); `ExecutionResult` was dropping `spread_bps`/`slippage_bps` that `FillOutcome` already computed (Fill rows would have had those columns permanently `NULL` — extended it, with a regression test). Two more caught by mypy while wiring the live loop: `run_entry_tick`/`run_exit_tick` were typed to accept the concrete `SimulatedBroker` class instead of the `ExecutionPort` protocol (would have made passing `ShadowLogger` — the actual shadow-mode default — a type error); `Strategy.id` as a plain Protocol attribute demanded write access that `ReferenceStrategy`'s frozen dataclass field can't structurally offer (fixed with a read-only `@property`).
+
+**`kairodex/engine/live_loop.py`** + `kairodex engine --segment X` CLI command: the process ARCHITECTURE.md §3 names, shadow mode by default (`ShadowLogger`, zero capital — matches P3's own exit criterion), one `strategies` row ensured per segment, looping the watchlist through `run_entry_tick` then every open trade through `run_exit_tick` every 60s.
+
+**Live-verified on the VM, after market hours (both NSE and US closed at test time)** — this mattered: it meant testing the fail-safe paths, not just the happy path, and caught the single most important bug of this session:
+
+- `account.session_open` correctly evaluated `False` (real NSE hours had passed) — the session gate's fallback logic works.
+- With `session_open` overridden for testing (the *only* thing genuinely blocked by the clock), a full `run_entry_tick` pass against real NIFTY data flowed through cleanly, confluence legitimately not firing that tick (consistent with §9a's earlier finding that most moments don't produce strong evidence) — correct behavior, not a bug.
+- Testing contract selection through execution directly against real chain data (226 real candidates) surfaced a **critical bug**: `TradeProposal.chain_complete` was wired to `front.complete`, a `ChainSnapshot` property requiring `expected_count` — which `kairodex.features.loader.load_chain` never sets, because that field is P1's "did one atomic REST fetch return everything" concept, and `load_chain` instead reconstructs a snapshot leg-by-leg from each instrument's own latest quote, where "complete" isn't a meaningful idea the same way. `front.complete` was therefore unconditionally `False` for **every chain this pipeline has ever built**, which the liquidity gate correctly rejected as `INCOMPLETE_CHAIN` every single time — **no signal could ever have reached execution, in any market condition, ever**, until this was caught. Fixed to `chain_complete=True` unconditionally at that call site (genuine incompleteness already surfaces as `select_contract` simply failing to find a candidate), verified live immediately after the fix.
+- With the fix live, the gate chain correctly passed, sizing computed correctly (5 lots for a near-ATM call at ₹90.10, 602 lots for a deep-OTM put at ₹0.775 — mathematically consistent given the sizing formula, and a real emergent behavior worth watching: cheap far-OTM premium sizes very large under a percentage-of-premium stop, not flagged as a bug but worth revisiting once real P&L data exists), and — using a timestamp near the quote's own (since real quotes were genuinely stale after-hours by the time of testing) — a **complete simulated fill**: 5 contracts at ₹90.16, real cost breakdown (brokerage/regulatory fees/taxes), spread_bps=22.2, slippage_bps=6.7. The SELL/put side correctly rejected with `SPREAD_TOO_WIDE` (a real, appropriately-protective rejection — a 0.775-premium contract's spread is naturally huge in relative terms).
+
+**Deployed as 4 systemd-supervised shadow-mode services** (`kairodex-engine-{nse_stock,nse_index,us_stock,us_index}`), enabled at boot, `Restart=always`, started one at a time (`nse_index` first, watched for several minutes before starting the rest). All 4 confirmed `active (running)`, no errors in their logs, `strategies` rows confirmed created in the DB. The full stack is now 7 systemd units: 2 ingest, 1 jobs, 4 engine.
+
+### 9d. What's left before P3 can be called fully done
+
+- **The exit criterion itself isn't measured yet.** "Full lifecycle runs in shadow mode for 5 sessions; PnL identity and risk-ceiling property tests pass" needs real calendar time (the clock started at deployment, 2026-08-05) and, ideally, a couple of real trades actually completing (open → monitored → closed) to exercise the full lifecycle, not just signals being evaluated. Check back after several real trading sessions have elapsed on both markets.
+- **A subagent-driven review pass**, requested explicitly this session, is the next immediate step — covering the full P3 diff (risk engine, execution simulator, position monitor, contract selector, orchestrator, live loop) before treating it as done.
+- **`instrument_specs`' real lot sizes aren't wired in** — `orchestrator.py` uses a fixed 25 (NSE) / 100 (US) default per market, not the real per-underlying SCD-2 lot size P0 already stores. Flagged inline with a `ponytail:` comment at its one call site.
+- **`Strategy.manage()` exists but isn't wired into the orchestrator** — `run_exit_tick` calls `evaluate_exits` directly rather than through `strategy.manage()`, since this reference strategy's exits don't need feature context and building one per open position per tick would be pure overhead right now. Revisit once a strategy actually wants feature-aware exits.
+- **Real per-underlying correlation clustering** doesn't exist — `correlation_cluster_gate` uses same-underlying-only as a first-pass proxy (documented in its own docstring).
