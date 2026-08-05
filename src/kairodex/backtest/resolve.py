@@ -18,9 +18,9 @@ from kairodex.backtest.types import ForwardOutcome
 from kairodex.core.enums import Side
 from kairodex.data.types import Bar
 
-_DEFAULT_STOP_ATR_MULT = 1.0
-_DEFAULT_TARGET_ATR_MULT = 2.0  # 2:1 reward:risk, matching monitor.py's own R-multiple convention
-_DEFAULT_MAX_HOLDING_BARS = 10
+DEFAULT_STOP_ATR_MULT = 1.0
+DEFAULT_TARGET_ATR_MULT = 2.0  # 2:1 reward:risk, matching monitor.py's own R-multiple convention
+DEFAULT_MAX_HOLDING_BARS = 10
 
 
 def resolve_forward_outcome(
@@ -29,9 +29,9 @@ def resolve_forward_outcome(
     atr_at_entry: Decimal,
     forward_bars: list[Bar],
     *,
-    stop_atr_mult: float = _DEFAULT_STOP_ATR_MULT,
-    target_atr_mult: float = _DEFAULT_TARGET_ATR_MULT,
-    max_holding_bars: int = _DEFAULT_MAX_HOLDING_BARS,
+    stop_atr_mult: float = DEFAULT_STOP_ATR_MULT,
+    target_atr_mult: float = DEFAULT_TARGET_ATR_MULT,
+    max_holding_bars: int = DEFAULT_MAX_HOLDING_BARS,
 ) -> ForwardOutcome | None:
     """`None` when there's nothing to resolve against (no forward bars,
     or ATR isn't a usable risk unit yet) — the caller should skip

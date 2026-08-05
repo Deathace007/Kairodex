@@ -368,16 +368,19 @@ class Signal(Base):
 
 class Trade(Base):
     """§5.4, the "crown jewels" table — one row per position lifecycle,
-    denormalized enough to answer most questions without a join.
-    `run_id` is a soft reference (no FK): `backtest_runs` doesn't exist
-    yet (P4) — NULL here means "live paper book" per
-    `CREATE VIEW paper_trades AS SELECT * FROM trades WHERE run_id IS
-    NULL" (ARCHITECTURE.md §5.4), created as a real view below."""
+    denormalized enough to answer most questions without a join. `run_id`
+    now references `backtest_runs` (P4) — NULL here means "live paper
+    book" per `CREATE VIEW paper_trades AS SELECT * FROM trades WHERE
+    run_id IS NULL" (ARCHITECTURE.md §5.4), created as a real view below.
+    Every `Trade` row this codebase writes today still has `run_id IS
+    NULL` (P3's live/shadow engine, `kairodex.engine.orchestrator`) — a
+    non-NULL `run_id` is for a future replay-through-the-live-orchestrator
+    path (the golden replay test's own trades), not yet built."""
 
     __tablename__ = "trades"
 
     trade_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    run_id: Mapped[int | None] = mapped_column(BigInteger)
+    run_id: Mapped[int | None] = mapped_column(ForeignKey("backtest_runs.run_id"))
     segment: Mapped[Segment] = mapped_column(_segment_enum, nullable=False)
     strategy_id: Mapped[int] = mapped_column(ForeignKey("strategies.strategy_id"), nullable=False)
     signal_id: Mapped[int] = mapped_column(ForeignKey("signals.signal_id"), nullable=False)
@@ -498,9 +501,8 @@ class EquitySnapshot(Base):
     NULL convention deliberately: `run_id` is part of THIS table's primary
     key (needed so a live snapshot and a backtest-run snapshot for the
     same segment/instant don't collide), and Postgres forbids a nullable
-    column in a primary key at all. `backtest_runs` (P4) doesn't exist
-    yet, so its real IDs (bigserial, starting at 1) can never collide
-    with the 0 sentinel."""
+    column in a primary key at all. `backtest_runs.run_id` is a real
+    bigserial starting at 1, so it can never collide with the 0 sentinel."""
 
     __tablename__ = "equity_snapshots"
 
@@ -532,3 +534,26 @@ class RiskState(Base):
     breaker_reason: Mapped[str | None] = mapped_column(String)
     blocked_until: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
     risk_multiplier: Mapped[Decimal] = mapped_column(Numeric(6, 4), nullable=False, default=1)
+
+
+class BacktestRun(Base):
+    """§5.4/§13 — one row per Track A backtest run; `trades.run_id`
+    references this table's PK (`trades.run_id IS NULL` means live paper
+    book instead, per `paper_trades`'s own view definition). `metrics`
+    holds the full `backtest.metrics.DirectionalMetrics` + Track A gate
+    results as JSON — one aggregate summary per run, not a row per
+    signal (`kairodex.backtest.runner`'s own docstring explains why:
+    `signals` carries no `run_id` to distinguish backtest from live)."""
+
+    __tablename__ = "backtest_runs"
+
+    run_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    segment: Mapped[Segment] = mapped_column(_segment_enum, nullable=False)
+    strategy_id: Mapped[int] = mapped_column(ForeignKey("strategies.strategy_id"), nullable=False)
+    from_ts: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    to_ts: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    config: Mapped[dict[str, object] | None] = mapped_column(JSONB)
+    metrics: Mapped[dict[str, object] | None] = mapped_column(JSONB)
+    trial_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    deflated_sharpe: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))

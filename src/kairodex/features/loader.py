@@ -42,6 +42,15 @@ _BENCHMARK_SYMBOL: dict[Segment, str] = {
 }
 
 
+def benchmark_symbol(segment: Segment) -> str:
+    """`segment`'s benchmark index symbol — see `_BENCHMARK_SYMBOL`. The
+    public accessor, so `kairodex.backtest.runner` (which needs the same
+    benchmark choice `load_index_bars` uses, but resolves the instrument
+    itself for a whole date range rather than one `as_of`) doesn't have to
+    reach into a private module-level dict."""
+    return _BENCHMARK_SYMBOL[segment]
+
+
 async def load_underlying_bars(
     session: AsyncSession,
     instrument_id: int,

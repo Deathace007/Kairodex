@@ -181,6 +181,163 @@ def engine_cmd(
     asyncio.run(run_segment(segment, shadow=not live))
 
 
+backtest_app = typer.Typer(help="P4: Track A backtesting over underlying OHLCV")
+app.add_typer(backtest_app, name="backtest")
+
+
+@backtest_app.command("fetch-history")
+def fetch_history_cmd(
+    market: Market = typer.Option(..., help="nse or us"),
+    start: str = typer.Option(..., help="YYYY-MM-DD"),
+    end: str = typer.Option(..., help="YYYY-MM-DD"),
+) -> None:
+    """Backfill daily underlying OHLCV (ARCHITECTURE.md §13's data
+    source: Upstox candles v3 / LSE vault) for every instrument in
+    `market`'s watchlist plus its segments' benchmark indices — run once
+    before `backtest run`."""
+    start_date = datetime.date.fromisoformat(start)
+    end_date = datetime.date.fromisoformat(end)
+    asyncio.run(_fetch_history(market, start_date, end_date))
+
+
+async def _fetch_history(market: Market, start: datetime.date, end: datetime.date) -> None:
+    from sqlalchemy import select
+
+    from kairodex.backtest.history import backfill_underlying_history
+    from kairodex.data.recorder import watchlist_instruments
+    from kairodex.features.loader import benchmark_symbol
+    from kairodex.store.models import Instrument
+
+    sessionmaker = get_sessionmaker()
+    client, provider = make_client(market)
+    exchange = "NSE" if market is Market.NSE else "US"
+    try:
+        async with sessionmaker() as session:
+            instruments: dict[int, Instrument] = {}
+            for segment in Segment:
+                if segment.market is not market:
+                    continue
+                for inst in await watchlist_instruments(session, segment):
+                    instruments[inst.instrument_id] = inst
+                bench = await session.scalar(
+                    select(Instrument).where(
+                        Instrument.exchange == exchange,
+                        Instrument.symbol == benchmark_symbol(segment),
+                    )
+                )
+                if bench is not None:
+                    instruments[bench.instrument_id] = bench
+
+            for inst in instruments.values():
+                count = await backfill_underlying_history(
+                    session, client, provider, inst, start=start, end=end
+                )
+                typer.echo(f"{inst.symbol}: {count} bars")
+    finally:
+        await client.aclose()
+
+
+@backtest_app.command("run")
+def backtest_run_cmd(
+    segment: Segment = typer.Option(..., help="nse_stock, nse_index, us_stock, or us_index"),
+    frm: str = typer.Option(..., "--from", help="YYYY-MM-DD"),
+    to: str = typer.Option(..., "--to", help="YYYY-MM-DD"),
+) -> None:
+    """Track A backtest (ARCHITECTURE.md §13) over `segment`'s whole
+    watchlist, pooled into one strategy-level result and scored against
+    the promotion gate table. Requires `fetch-history` to have populated
+    `underlying_bars` for the range first. Enforces the held-out final
+    period guard before running anything, and writes one `backtest_runs`
+    row per invocation."""
+    asyncio.run(
+        _backtest_run(segment, datetime.date.fromisoformat(frm), datetime.date.fromisoformat(to))
+    )
+
+
+async def _backtest_run(segment: Segment, frm: datetime.date, to: datetime.date) -> None:
+    import dataclasses
+    from decimal import Decimal
+
+    from sqlalchemy import func, select
+
+    from kairodex.backtest import metrics as backtest_metrics
+    from kairodex.backtest.promotion import evaluate_track_a, summarize
+    from kairodex.backtest.runner import run_backtest
+    from kairodex.backtest.validation import (
+        assert_not_touching_holdout,
+        deflated_sharpe,
+        walk_forward_splits,
+    )
+    from kairodex.core.clock import LiveClock
+    from kairodex.data.recorder import watchlist_instruments
+    from kairodex.store.models import BacktestRun
+    from kairodex.store.models import Strategy as StrategyRow
+    from kairodex.strategy.protocol import ReferenceStrategy
+    from kairodex.strategy.scorer import ConfluenceScorer
+
+    start_dt = datetime.datetime.combine(frm, datetime.time.min, tzinfo=datetime.UTC)
+    end_dt = datetime.datetime.combine(to, datetime.time.min, tzinfo=datetime.UTC)
+    now = LiveClock().now()
+    assert_not_touching_holdout(end_dt, now=now)  # raises before touching the DB at all
+
+    sessionmaker = get_sessionmaker()
+    strategy = ReferenceStrategy()
+    scorer = ConfluenceScorer()
+    async with sessionmaker() as session:
+        row = await session.scalar(
+            select(StrategyRow).where(
+                StrategyRow.segment == segment, StrategyRow.name == strategy.id
+            )
+        )
+        if row is None:
+            typer.echo(
+                "no strategies row for this segment/strategy yet — "
+                "run `kairodex engine --segment ...` at least once first (it creates one)."
+            )
+            raise typer.Exit(1)
+
+        underlyings = await watchlist_instruments(session, segment)
+        all_signals = []
+        for u in underlyings:
+            sigs = await run_backtest(
+                session, segment=segment, underlying=u, strategy=strategy, scorer=scorer,
+                start=start_dt, end=end_dt,
+            )
+            all_signals.extend(sigs)
+            typer.echo(f"{u.symbol}: {len(sigs)} resolved signals")
+
+        embargo = datetime.timedelta(days=10)
+        folds = walk_forward_splits(all_signals, n_folds=4, embargo=embargo)
+        prior_runs = await session.scalar(
+            select(func.count())
+            .select_from(BacktestRun)
+            .where(BacktestRun.strategy_id == row.strategy_id)
+        )
+        n_trials = (prior_runs or 0) + 1
+        result = evaluate_track_a(all_signals, folds, n_trials=n_trials)
+        m = backtest_metrics.compute_metrics(all_signals)
+        returns = [s.outcome.return_atr for s in all_signals if s.outcome is not None]
+        dsr = deflated_sharpe(returns, n_trials=n_trials)
+
+        typer.echo(summarize(result.checks))
+        typer.echo(f"\noverall: {'VALIDATED-READY' if result.passed else 'not ready'}")
+
+        run = BacktestRun(
+            created_at=now,
+            segment=segment,
+            strategy_id=row.strategy_id,
+            from_ts=start_dt,
+            to_ts=end_dt,
+            config={"n_folds": 4, "embargo_days": 10},
+            metrics=dataclasses.asdict(m),
+            trial_count=n_trials,
+            deflated_sharpe=Decimal(str(dsr)) if dsr is not None else None,
+        )
+        session.add(run)
+        await session.commit()
+        typer.echo(f"backtest_runs row {run.run_id} written")
+
+
 @app.command("status")
 def status_cmd() -> None:
     """Minimal status page (ARCHITECTURE.md §19 P1 exit criterion): per-market
