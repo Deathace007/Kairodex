@@ -56,6 +56,25 @@ def test_sell_direction_only_considers_puts():
     assert result.selected.option_type == "P"
 
 
+def test_picks_closest_delta_to_target_among_affordable_puts():
+    """target_delta=0.40 (default) -> signed target for puts is -0.40 (puts
+    carry negative delta by this codebase's convention). Candidates: P1
+    (delta -0.15, dist |-0.15 - -0.40| = 0.25), P2 (delta -0.40, dist 0.0),
+    P3 (delta -0.60, dist 0.20). P2 has the smallest distance -> selected.
+    Regression test: comparing signed put delta against the bare positive
+    target_delta (the pre-fix bug) would instead pick P1 (dist
+    |-0.15 - 0.40| = 0.55, smallest among 0.55/0.80/1.00) — the weakest
+    put, exactly backwards."""
+    puts = [
+        _c(21, 100, "P", _NEAR_EXPIRY, 8, 10, "-0.15"),
+        _c(22, 105, "P", _NEAR_EXPIRY, 8, 10, "-0.40"),
+        _c(23, 110, "P", _NEAR_EXPIRY, 8, 10, "-0.60"),
+    ]
+    result = _select(puts, Side.SELL)
+    assert result.selected is not None
+    assert result.selected.instrument_id == 22
+
+
 def test_no_candidates_in_expiry_window():
     only_far_calls = [c for c in _candidates() if c.option_type == "C" and c.expiry == _FAR_EXPIRY]
     result = _select(only_far_calls, Side.BUY)

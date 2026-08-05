@@ -3,18 +3,23 @@
 **Last updated:** 2026-08-05
 **Current phase:** P1 (The Recorder) is done pending the unattended
 5-session check (§7). P2 (Pricing & features) is functionally complete
-(§8). **P3 (Engine & paper execution) is functionally complete**: every
-piece ARCHITECTURE.md §3's engine box names — risk gate chain, execution
-simulator, position monitor, contract selector, orchestrator — is built,
-tested, and deployed as 4 systemd-supervised shadow-mode engine
-processes (one per segment) on the VM, live-verified end to end against
-real NIFTY chain data through to an actual simulated fill with real
-pricing and costs. See §9 for the full account, including a critical
-bug (every signal would have been rejected, forever) caught by that live
-pass and fixed before deployment. **Not yet measured**: P3's own exit
-criterion (full lifecycle in shadow mode for 5 sessions) needs real
-calendar time to elapse — the clock started at deployment, see §9d.
-**Next phase:** P4 (Backtest & validation), once the P3 review pass (§9d) is clean.
+(§8). **P3 (Engine & paper execution) is functionally complete and
+subagent-reviewed**: every piece ARCHITECTURE.md §3's engine box names —
+risk gate chain, execution simulator, position monitor, contract
+selector, orchestrator — is built, tested, deployed as 4
+systemd-supervised shadow-mode engine processes (one per segment) on the
+VM, live-verified end to end against real NIFTY chain data through to an
+actual simulated fill with real pricing and costs, AND independently
+reviewed by a subagent that found and (in this session) fixed 6 more real
+bugs on top of the ones caught live — see §9c for the live-verification
+bugs and §9e for the review-pass bugs (exit fills that could self-cap
+toward zero forever, partial exits dropping their own P&L, equity/risk
+state never being written at all, sizing able to exceed the premium/
+exposure caps, put delta-targeting backwards, and three of six exit
+checks being unreachable). **Not yet measured**: P3's own exit criterion
+(full lifecycle in shadow mode for 5 sessions) needs real calendar time
+to elapse — the clock started at deployment, see §9d.
+**Next phase:** P4 (Backtest & validation) — starting now.
 
 > Read this file first, every session. Update it whenever a phase
 > completes, a decision changes, or a command/location changes. Deeper
@@ -329,7 +334,20 @@ Three bugs caught and fixed through careful review before any live test: `select
 ### 9d. What's left before P3 can be called fully done
 
 - **The exit criterion itself isn't measured yet.** "Full lifecycle runs in shadow mode for 5 sessions; PnL identity and risk-ceiling property tests pass" needs real calendar time (the clock started at deployment, 2026-08-05) and, ideally, a couple of real trades actually completing (open → monitored → closed) to exercise the full lifecycle, not just signals being evaluated. Check back after several real trading sessions have elapsed on both markets.
-- **A subagent-driven review pass**, requested explicitly this session, is the next immediate step — covering the full P3 diff (risk engine, execution simulator, position monitor, contract selector, orchestrator, live loop) before treating it as done.
 - **`instrument_specs`' real lot sizes aren't wired in** — `orchestrator.py` uses a fixed 25 (NSE) / 100 (US) default per market, not the real per-underlying SCD-2 lot size P0 already stores. Flagged inline with a `ponytail:` comment at its one call site.
-- **`Strategy.manage()` exists but isn't wired into the orchestrator** — `run_exit_tick` calls `evaluate_exits` directly rather than through `strategy.manage()`, since this reference strategy's exits don't need feature context and building one per open position per tick would be pure overhead right now. Revisit once a strategy actually wants feature-aware exits.
 - **Real per-underlying correlation clustering** doesn't exist — `correlation_cluster_gate` uses same-underlying-only as a first-pass proxy (documented in its own docstring).
+
+### 9e. Subagent review pass — 6 real bugs found and fixed (275 tests)
+
+Per the explicit instruction to "verify everything in detail and use sub agents so you dont miss anything" before calling P3 done, a subagent reviewed the full P3 diff (`6995543^..HEAD`) independently — re-derived the risk/sizing/fill math by hand, traced `orchestrator.py`'s wiring field-by-field, cross-checked every "bug found and fixed" claim in §9b/§9c against the actual current code (all confirmed real). It found 6 genuine defects, all fixed here, most severe first:
+
+1. **Exit fills could self-cap toward zero, forever.** `run_exit_tick`'s exit-side `QuoteSnapshot` fabricated `bid_sz=ask_sz=trade.qty_lots` (the position's own remaining size) instead of using the real quoted depth — fed straight into `compute_fill`'s `partial_fill_alpha` cap (max fillable = 25% of book size), so every exit tick could fill at most 25% of *whatever remained*, asymptotically shrinking toward (and eventually hitting) zero fillable quantity — a stop-loss could get permanently stuck open. Also `quote_ts=now` silently disabled the `STALE_QUOTE` check on every exit. Fixed: `_latest_mark` renamed `_latest_quote`, returns the full `OptionQuote` row; the exit `QuoteSnapshot` now uses its real `bid`/`ask`/`bid_sz`/`ask_sz`/`ts`, exactly like the entry side already did.
+2. **Partial exits dropped their own P&L.** `gross_pnl`/`net_pnl` were only ever computed on the leg that happened to fully close a trade, against the *entire original* `premium_paid` — every earlier partial exit's proceeds were silently discarded, and `avg_exit` recorded only the last leg's price, not a qty-weighted average. Fixed: each leg now realizes P&L against its own proportional share of the entry cost basis (`avg_entry * filled_qty * lot_size`) and entry fees (proven by induction that `trade.fees * filled_qty / qty_before_exit` gives the correct per-leg share at every step since `trade.fees` is itself decremented the same way each time), accumulated into running `gross_pnl`/`net_pnl` totals; `avg_exit` is now a true qty-weighted average across all legs, tracked via `cum_exit_qty`/`cum_exit_value` in `risk_params` until the position fully closes.
+3. **`equity_snapshots`/`risk_state` were never written.** `risk.loader.build_account_state` reads both tables (with defaults when empty), but nothing ever inserted into either — `equity`/`high_water_mark` stayed pinned at the hardcoded 50000 default forever, and `daily_pnl`/`weekly_pnl`/`consecutive_losses`/`breaker_status` stayed at zero/ARMED forever. That made `daily_loss_gate`, `weekly_loss_gate`, `drawdown_throttle_gate`, `breaker_gate`, and `risk_multiplier`'s own profit/loss scaling structurally inert — accepted risk, not enforced risk. Fixed: new `kairodex/risk/accounting.py` (`update_equity_and_risk_state`), recomputed from `trades`/`position_marks` each call (cash = capital + cumulative realized P&L, unrealized = sum of latest marks on open positions, daily/weekly P&L = closed-today/closed-this-ISO-week, consecutive losses = trailing-loss streak), including a minimal auto-trip breaker (parks `breaker_status="TRIPPED"` on a daily/weekly/drawdown breach, un-trips automatically once the breaching figure itself resets — deliberately stateless, no separate manual-reset flow for a paper system). Wired into `live_loop.run_segment`, called once per tick cycle after entries/exits.
+4. **Sizing could commit more premium than the caps allow.** `risk.gates.exposure_gate`/`capital_available_gate` only ever checked *one lot's* premium, before `sizing.size_position` decided the real (possibly much larger) lot count — since `stop_distance` is a fraction of premium (30%, `_DEFAULT_STOP_LOSS_PCT`), risk-budget sizing alone could size up a lot count whose *total* premium is several multiples of what the pre-sizing gate checked, verified numerically to exceed `max_premium_pct` for the US segments at `risk_multiplier` > 1.0. Fixed: `size_position` now takes `premium_per_lot`/`total_exposure` and caps the lot count against `max_premium_pct` and `exposure_cap_pct` directly, using the real premium this trade would commit — not just what one lot's pre-check happened to pass.
+5. **Put delta-targeting was backwards.** `contract_selector.select_contract`'s delta-distance ranking compared a put's signed delta (negative, by this codebase's own convention — see `features.compute.iv._iv_near_delta`'s `-target_delta` call for puts) directly against the bare positive `target_delta`, which made the *weakest* (near-zero-delta) put always look "closest" to target — silently selecting the worst put on every bearish signal. Fixed: sign the target to match `option_type` (`-target_delta` for puts). The only pre-existing put test had a single candidate and couldn't have caught this; added `test_picks_closest_delta_to_target_among_affordable_puts` with three puts at different deltas as a regression test.
+6. **Profit-target/R-multiple-partial/time exits were unreachable.** `run_exit_tick`'s `Position(...)` construction never populated `profit_target`/`r_multiple_targets`/`max_holding_secs` (all defaulted to `None`/`()`/`None`), so three of `evaluate_exits`'s six checks — fully implemented and unit-tested in `monitor.py` — could never fire in the live engine; only stop-loss/trailing-stop/event-exit were ever reachable. `partial_exits_taken` was being *written* to `risk_params` on each partial exit but never *read back*, meaning a re-triggered R-multiple check would have had no memory of what was already taken. Fixed: entry-time defaults (`_DEFAULT_PROFIT_TARGET_PCT=1.0`, `_DEFAULT_R_MULTIPLE_TARGETS=(1.0, 2.0)`, `_DEFAULT_MAX_HOLDING_SECS=3 days`) are now written into `risk_params` at fill time (`_record_fill`) and read back into every `Position` `run_exit_tick` builds, including `partial_exits_taken`.
+
+All 6 fixes are in `kairodex/risk/sizing.py`, `kairodex/risk/accounting.py` (new), `kairodex/strategy/contract_selector.py`, and `kairodex/engine/orchestrator.py`/`live_loop.py`. `accounting.py` follows the established DB-touching `loader.py` pattern (no local unit test, same as `risk/loader.py`/`features/loader.py` — verified live on the VM instead, per `CLAUDE.md`'s local-is-DB-free-only rule). 4 new local unit tests added (sizing premium/exposure caps + `INVALID_PREMIUM`, put delta-targeting regression); 275 tests passing, ruff/mypy clean.
+
+- **`Strategy.manage()` still isn't wired into the orchestrator** — `run_exit_tick` calls `evaluate_exits` directly rather than through `strategy.manage()`, unaffected by this pass since the reference strategy's exits don't need feature context. Revisit once a strategy actually wants feature-aware exits.

@@ -22,6 +22,7 @@ from kairodex.data.recorder import watchlist_instruments
 from kairodex.engine.orchestrator import run_entry_tick, run_exit_tick
 from kairodex.execution.costs import compute_nse_costs, compute_us_costs
 from kairodex.execution.simulator import ExecutionPort, ShadowLogger, SimulatedBroker
+from kairodex.risk.accounting import update_equity_and_risk_state
 from kairodex.risk.loader import build_account_state
 from kairodex.store.base import get_sessionmaker
 from kairodex.store.models import Strategy as StrategyRow
@@ -125,5 +126,10 @@ async def run_segment(segment: Segment, *, shadow: bool = True) -> None:
                         logger.info("trade %d closed: %s", trade.trade_id, exit_outcome.action)
                 except Exception:
                     logger.exception("exit tick failed for trade %d", trade.trade_id)
+
+            try:
+                await update_equity_and_risk_state(session, segment, now)
+            except Exception:
+                logger.exception("%s: equity/risk-state update failed", segment.value)
 
         await asyncio.sleep(EVAL_INTERVAL.total_seconds())

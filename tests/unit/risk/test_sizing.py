@@ -69,6 +69,10 @@ def test_size_position_normal_case_hand_computed(segment):
         config=config,
         stop_distance=stop_distance,
         lot_size=lot_size,
+        # Deliberately tiny — isolates this test to the risk-budget formula
+        # alone, so the premium/exposure caps (tested separately below)
+        # never become the binding constraint here.
+        premium_per_lot=Decimal("0.01"),
     )
     expected_budget = equity * Decimal(str(config.base_risk_pct))
     expected_lots = int(expected_budget // (stop_distance * lot_size))
@@ -90,6 +94,7 @@ def test_size_position_rejects_below_min_size():
     result = size_position(
         equity=Decimal(10000), high_water_mark=Decimal(10000), consecutive_losses=0,
         config=config, stop_distance=Decimal(200), lot_size=10,
+        premium_per_lot=Decimal("0.01"),
     )
     assert result.rejected
     assert result.reject_reason == "NO_TRADE_MIN_SIZE"
@@ -109,6 +114,7 @@ def test_size_position_rejects_size_exceeding_ceiling():
     result = size_position(
         equity=Decimal(10000), high_water_mark=Decimal(10000), consecutive_losses=0,
         config=config, stop_distance=Decimal(60), lot_size=10,
+        premium_per_lot=Decimal("0.01"),
     )
     assert result.rejected
     assert result.reject_reason == "SIZE_EXCEEDS_CEILING"
@@ -119,6 +125,60 @@ def test_size_position_rejects_invalid_stop_distance():
     result = size_position(
         equity=Decimal(50000), high_water_mark=Decimal(50000), consecutive_losses=0,
         config=config, stop_distance=Decimal(0), lot_size=25,
+        premium_per_lot=Decimal("1.0"),
     )
     assert result.rejected
     assert result.reject_reason == "INVALID_STOP_DISTANCE"
+
+
+def test_size_position_rejects_invalid_premium():
+    config = get_segment_config(Segment.NSE_STOCK)
+    result = size_position(
+        equity=Decimal(50000), high_water_mark=Decimal(50000), consecutive_losses=0,
+        config=config, stop_distance=Decimal(2), lot_size=25,
+        premium_per_lot=Decimal(0),
+    )
+    assert result.rejected
+    assert result.reject_reason == "INVALID_PREMIUM"
+
+
+def test_size_position_capped_by_max_premium_pct():
+    """budget = 10000*0.10 = 1000; risk-budget lots = floor(1000/(10*10)) =
+    10. But premium_per_lot=50 -> premium/lot = 50*10 = 500, and
+    max_premium_pct=0.05 -> premium cap = 0.05*10000 = 500 ->
+    max_premium_lots = floor(500/500) = 1. The real, previously-uncapped
+    bug: risk-budget sizing alone would have committed 10x the intended
+    premium ceiling."""
+    config = SegmentRiskConfig(
+        capital=10000, currency="USD", base_risk_pct=0.10, hard_ceiling_pct=0.5,
+        max_premium_pct=0.05, max_concurrent=5, daily_loss_limit_pct=0.1,
+        weekly_loss_limit_pct=0.2, max_drawdown_pct=0.3, exposure_cap_pct=0.30,
+        min_liquidity_score=0.3, reentry_cooldown_minutes=30,
+    )
+    result = size_position(
+        equity=Decimal(10000), high_water_mark=Decimal(10000), consecutive_losses=0,
+        config=config, stop_distance=Decimal(10), lot_size=10,
+        premium_per_lot=Decimal(50),
+    )
+    assert not result.rejected
+    assert result.lots == 1
+
+
+def test_size_position_capped_by_exposure():
+    """Same risk-budget (10 lots) and premium cap (100 lots, not binding)
+    as above, but total_exposure=2900 against exposure_cap_pct=0.30 ->
+    exposure_room = 0.30*10000 - 2900 = 100; premium/lot = 5*10 = 50 ->
+    max_exposure_lots = floor(100/50) = 2."""
+    config = SegmentRiskConfig(
+        capital=10000, currency="USD", base_risk_pct=0.10, hard_ceiling_pct=0.5,
+        max_premium_pct=0.5, max_concurrent=5, daily_loss_limit_pct=0.1,
+        weekly_loss_limit_pct=0.2, max_drawdown_pct=0.3, exposure_cap_pct=0.30,
+        min_liquidity_score=0.3, reentry_cooldown_minutes=30,
+    )
+    result = size_position(
+        equity=Decimal(10000), high_water_mark=Decimal(10000), consecutive_losses=0,
+        config=config, stop_distance=Decimal(10), lot_size=10,
+        premium_per_lot=Decimal(5), total_exposure=Decimal(2900),
+    )
+    assert not result.rejected
+    assert result.lots == 2

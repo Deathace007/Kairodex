@@ -87,9 +87,17 @@ def select_contract(
     if not affordable:
         return SelectionResult(None, "NO_AFFORDABLE_CONTRACT")
 
+    # Puts carry negative delta by this codebase's own convention (see
+    # kairodex.features.compute.iv._iv_near_delta's `-target_delta` call for
+    # puts) — comparing a put's signed delta against a bare positive
+    # `target_delta` always made the *weakest* (near-zero-delta) put look
+    # closest to target, silently breaking delta-targeting for every
+    # bearish trade. Sign the target to match `option_type` instead.
+    signed_target_delta = target_delta if option_type == "C" else -target_delta
+
     def distance(c: ContractCandidate) -> float:
         if c.delta is not None:
-            return abs(float(c.delta) - target_delta)
+            return abs(float(c.delta) - signed_target_delta)
         # No vendor delta on this leg — fall back to normalized distance
         # from spot as a moneyness proxy.
         return abs(float(c.strike - spot)) / float(spot) if spot > 0 else float("inf")

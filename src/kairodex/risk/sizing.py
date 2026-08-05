@@ -63,12 +63,36 @@ def size_position(
     config: SegmentRiskConfig,
     stop_distance: Decimal,
     lot_size: int,
+    premium_per_lot: Decimal,
+    total_exposure: Decimal = Decimal(0),
 ) -> SizingResult:
     if stop_distance <= 0:
         return SizingResult(0, Decimal(0), 1.0, True, "INVALID_STOP_DISTANCE")
+    if premium_per_lot <= 0:
+        return SizingResult(0, Decimal(0), 1.0, True, "INVALID_PREMIUM")
     mult = risk_multiplier(equity, high_water_mark, consecutive_losses)
     risk_budget = equity * Decimal(str(config.base_risk_pct)) * Decimal(str(mult))
     lots = math.floor(risk_budget / (stop_distance * lot_size))
+
+    # Risk-budget sizing alone doesn't bound total premium committed: since
+    # stop_distance is normally some fraction of premium (see
+    # orchestrator._DEFAULT_STOP_LOSS_PCT), risk_budget/(stop_distance*
+    # lot_size) can size up a lot count whose total premium is a multiple
+    # of the risk budget — routinely exceeding max_premium_pct once
+    # risk_multiplier scales above 1.0. kairodex.risk.gates only ever
+    # checked ONE lot's premium against these same caps, before this
+    # function decided the real lot count — cap the lot count here too,
+    # against what this trade would actually commit.
+    premium_cost_per_lot = premium_per_lot * lot_size
+    max_premium_lots = math.floor(
+        Decimal(str(config.max_premium_pct)) * equity / premium_cost_per_lot
+    )
+    exposure_room = Decimal(str(config.exposure_cap_pct)) * equity - total_exposure
+    max_exposure_lots = (
+        math.floor(exposure_room / premium_cost_per_lot) if exposure_room > 0 else 0
+    )
+    lots = min(lots, max_premium_lots, max_exposure_lots)
+
     if lots < 1:
         return SizingResult(0, risk_budget, mult, True, "NO_TRADE_MIN_SIZE")
     one_lot_risk = stop_distance * lot_size

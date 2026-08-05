@@ -50,6 +50,11 @@ _DEFAULT_STOP_LOSS_PCT = 0.30  # ponytail: first-pass — a 30%-of-premium
 # stop is a common simple options-buying convention; recalibrate once
 # backtesting can measure it against real outcomes, per position sizing.
 _DEFAULT_MAX_QUOTE_AGE_MS = 2000
+_DEFAULT_PROFIT_TARGET_PCT = 1.0  # ponytail: exit at 2x entry premium
+# (100% gain) — first-pass, same status as the stop-loss/target-delta
+# constants above: a common options-buying convention, not backtested yet.
+_DEFAULT_R_MULTIPLE_TARGETS = (1.0, 2.0)  # ponytail: partial exits at 1R/2R
+_DEFAULT_MAX_HOLDING_SECS = 3 * 24 * 3600  # ponytail: 3-day theta guard
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,6 +216,8 @@ async def run_entry_tick(
         config=config,
         stop_distance=stop_distance,
         lot_size=lot_size,
+        premium_per_lot=selection.mid_price,
+        total_exposure=account.total_exposure,
     )
     if sizing.rejected:
         signal.reject_stage, signal.reject_reason = "sizing", sizing.reject_reason
@@ -283,6 +290,7 @@ async def _record_fill(
 ) -> int:
     assert execution.price is not None
     premium_paid = execution.price * execution.filled_qty * lot_size
+    profit_target = execution.price * Decimal(str(1 + _DEFAULT_PROFIT_TARGET_PCT))
     trade = Trade(
         segment=segment,
         strategy_id=strategy_row_id,
@@ -298,6 +306,15 @@ async def _record_fill(
         risk_params={
             "stop_price": str(execution.price - stop_distance),
             "initial_stop_price": str(execution.price - stop_distance),
+            # Exit targets (monitor.py's Position fields) — set once at
+            # entry and carried in this JSON blob since Trade has no
+            # dedicated columns for them. run_exit_tick reads these back;
+            # previously nothing wrote them, so profit-target, R-multiple
+            # partial, and time-based exits were unreachable in the live
+            # engine even though monitor.py fully implements and tests them.
+            "profit_target": str(profit_target),
+            "r_multiple_targets": list(_DEFAULT_R_MULTIPLE_TARGETS),
+            "max_holding_secs": _DEFAULT_MAX_HOLDING_SECS,
         },
     )
     session.add(trade)
@@ -356,14 +373,34 @@ async def run_exit_tick(
     quoted mark, run through `kairodex.engine.monitor.evaluate_exits`,
     acted on if it fires. Always writes a `position_marks` row regardless
     of outcome, which is what makes MFE/MAE exact (ARCHITECTURE.md §12)."""
-    mark = await _latest_mark(session, trade.instrument_id)
-    if mark is None:
+    latest_quote = await _latest_quote(session, trade.instrument_id)
+    if latest_quote is None:
         return ExitOutcome(trade.trade_id, "NO_QUOTE", closed=False)
+    mark = latest_quote.ltp
+    assert mark is not None  # _latest_quote filters on ltp.is_not(None)
 
     risk_params = trade.risk_params or {}
     stop_price = Decimal(str(risk_params.get("stop_price", mark)))
     initial_stop_price = Decimal(str(risk_params.get("initial_stop_price", mark)))
     hwm_price = max(Decimal(str(risk_params.get("hwm_price", mark))), mark)
+    profit_target_raw = risk_params.get("profit_target")
+    profit_target = Decimal(str(profit_target_raw)) if profit_target_raw is not None else None
+    r_multiple_targets_raw = risk_params.get("r_multiple_targets")
+    r_multiple_targets: tuple[float, ...] = (
+        tuple(float(x) for x in r_multiple_targets_raw)
+        if isinstance(r_multiple_targets_raw, list)
+        else _DEFAULT_R_MULTIPLE_TARGETS
+    )
+    max_holding_secs_raw = risk_params.get("max_holding_secs", _DEFAULT_MAX_HOLDING_SECS)
+    max_holding_secs: int | None = (
+        int(max_holding_secs_raw) if isinstance(max_holding_secs_raw, int | float) else None
+    )
+    partial_exits_taken_raw = risk_params.get("partial_exits_taken", [])
+    partial_exits_taken = (
+        frozenset(partial_exits_taken_raw)
+        if isinstance(partial_exits_taken_raw, list)
+        else frozenset()
+    )
 
     position = Position(
         trade_id=trade.trade_id,
@@ -379,6 +416,10 @@ async def run_exit_tick(
         initial_stop_price=initial_stop_price,
         current_mark=mark,
         high_water_mark_price=hwm_price,
+        profit_target=profit_target,
+        r_multiple_targets=r_multiple_targets,
+        partial_exits_taken=partial_exits_taken,
+        max_holding_secs=max_holding_secs,
     )
 
     unrealized = (mark - trade.avg_entry) * trade.qty_lots * trade.lot_size
@@ -407,8 +448,23 @@ async def run_exit_tick(
         await session.commit()
         return ExitOutcome(trade.trade_id, "STOP_RATCHET", closed=False)
 
+    # Real bid/ask/bid_sz/ask_sz/ts from the same quote row `mark` came
+    # from — NOT a synthetic zero-spread quote sized off our own
+    # `trade.qty_lots`. That self-referential sizing fed straight into
+    # compute_fill's `partial_fill_alpha` cap (max fillable = 25% of
+    # `bid_sz`/`ask_sz`), so every exit tick could fill at most 25% of
+    # *whatever remained* — the position could shrink forever without
+    # ever reaching zero once floor(0.25 * qty_lots) hit 0, permanently
+    # stuck open past its own stop-loss. `quote_ts=now` also silently
+    # disabled the STALE_QUOTE check on every exit; using the real
+    # timestamp restores it.
     quote = QuoteSnapshot(
-        bid=mark, ask=mark, bid_sz=trade.qty_lots, ask_sz=trade.qty_lots, quote_ts=now
+        bid=latest_quote.bid or mark,
+        ask=latest_quote.ask or mark,
+        bid_sz=latest_quote.bid_sz or 0,
+        ask_sz=latest_quote.ask_sz or 0,
+        quote_ts=latest_quote.ts,
+        oi=latest_quote.oi,
     )
     order_request = OrderRequest(
         trade_id=trade.trade_id,
@@ -420,6 +476,7 @@ async def run_exit_tick(
     if execution.rejected or execution.filled_qty <= 0:
         await session.commit()  # keep the position_mark write even if the exit couldn't fill
         return ExitOutcome(trade.trade_id, f"{decision.reason}_FILL_FAILED", closed=False)
+    assert execution.price is not None  # guaranteed once not rejected and filled_qty > 0
 
     order = Order(
         trade_id=trade.trade_id, ts=now, instrument_id=trade.instrument_id, side=Side.SELL,
@@ -430,21 +487,57 @@ async def run_exit_tick(
     fill = Fill(order_id=order.order_id, ts=now, qty=execution.filled_qty, price=execution.price)
     session.add(fill)
 
-    remaining_qty = trade.qty_lots - execution.filled_qty
+    qty_before_exit = trade.qty_lots  # captured before any mutation below
+    remaining_qty = qty_before_exit - execution.filled_qty
     fully_closed = remaining_qty <= 0
-    exit_value = execution.price * execution.filled_qty * trade.lot_size  # type: ignore[operator]
+    exit_value = execution.price * execution.filled_qty * trade.lot_size
     exit_fees = execution.costs.total if execution.costs is not None else Decimal(0)
+
+    # Realize *this leg's* P&L against its proportional share of the entry
+    # cost basis, and shrink premium_paid/fees to the remaining open
+    # quantity's share — running totals, so a sequence of partial exits
+    # sums to the same total P&L a single full exit would. (Previously
+    # gross_pnl/net_pnl were only ever set on the final leg, computed
+    # against the *entire original* premium_paid — every earlier partial
+    # leg's proceeds were silently dropped, and a position that partially
+    # profited before stopping out could show a large phantom loss.)
+    # trade.fees is itself already a "remaining" figure by this same
+    # invariant (each leg reduces it by its own share), so `trade.fees *
+    # filled_qty / qty_before_exit` is this leg's correct entry-fee share
+    # by induction, not just for the first leg.
+    entry_fees_this_leg = (trade.fees or Decimal(0)) * execution.filled_qty / qty_before_exit
+    cost_basis_this_leg = trade.avg_entry * execution.filled_qty * trade.lot_size
+    leg_gross_pnl = exit_value - cost_basis_this_leg
+    leg_net_pnl = leg_gross_pnl - entry_fees_this_leg - exit_fees
+    trade.gross_pnl = (trade.gross_pnl or Decimal(0)) + leg_gross_pnl
+    trade.net_pnl = (trade.net_pnl or Decimal(0)) + leg_net_pnl
+    trade.premium_paid = trade.premium_paid - cost_basis_this_leg
+    trade.fees = (trade.fees or Decimal(0)) - entry_fees_this_leg
+
+    # avg_exit is the qty-weighted average price across every leg, not
+    # just the leg that happened to close the position — accumulated in
+    # risk_params (no dedicated column for "running exit proceeds") and
+    # resolved into the trades.avg_exit column only once fully closed.
+    cum_exit_qty_raw = risk_params.get("cum_exit_qty", 0)
+    cum_exit_qty_prior = int(cum_exit_qty_raw) if isinstance(cum_exit_qty_raw, int | float) else 0
+    cum_exit_qty = cum_exit_qty_prior + execution.filled_qty
+    cum_exit_value = Decimal(str(risk_params.get("cum_exit_value", "0"))) + exit_value
 
     if fully_closed:
         trade.closed_at = now
-        trade.avg_exit = execution.price
+        trade.avg_exit = cum_exit_value / cum_exit_qty
         trade.exit_reason = decision.reason
-        trade.gross_pnl = exit_value - trade.premium_paid
-        trade.net_pnl = trade.gross_pnl - (trade.fees or Decimal(0)) - exit_fees
         trade.holding_secs = int((now - trade.opened_at).total_seconds())
+        trade.qty_lots = 0
+        trade.risk_params = {**risk_params, "hwm_price": str(hwm_price)}
     else:
         trade.qty_lots = remaining_qty
-        new_risk_params: dict[str, object] = {**risk_params, "hwm_price": str(hwm_price)}
+        new_risk_params: dict[str, object] = {
+            **risk_params,
+            "hwm_price": str(hwm_price),
+            "cum_exit_qty": cum_exit_qty,
+            "cum_exit_value": str(cum_exit_value),
+        }
         if decision.reason.startswith("PARTIAL_EXIT_R"):
             target = float(decision.reason.removeprefix("PARTIAL_EXIT_R"))
             already_taken = risk_params.get("partial_exits_taken", [])
@@ -470,11 +563,11 @@ async def run_exit_tick(
     )
 
 
-async def _latest_mark(session: AsyncSession, instrument_id: int) -> Decimal | None:
-    row = await session.scalar(
+async def _latest_quote(session: AsyncSession, instrument_id: int) -> OptionQuote | None:
+    row: OptionQuote | None = await session.scalar(
         select(OptionQuote)
         .where(OptionQuote.instrument_id == instrument_id, OptionQuote.ltp.is_not(None))
         .order_by(OptionQuote.ts.desc())
         .limit(1)
     )
-    return row.ltp if row is not None else None
+    return row
