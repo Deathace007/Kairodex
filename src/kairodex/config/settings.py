@@ -23,6 +23,16 @@ class Settings(BaseSettings):
     kairodex_paper_only: bool = True
 
     database_url: str
+    # Least-privilege connection for app runtime (recorder/engine/api/jobs) —
+    # ARCHITECTURE.md Principle 2's "REVOKE UPDATE, DELETE ON trade_events"
+    # only means anything if the app doesn't connect as the same superuser
+    # role migrations use. Optional so nothing breaks before the role
+    # migration has run (local dev, tests) — falls back to database_url.
+    app_database_url: str | None = None
+    # Only consumed by the app_role_separation migration itself, to create
+    # the kairodex_app role — not used anywhere at app runtime (the app
+    # authenticates via the password already embedded in app_database_url).
+    app_db_password: str | None = None
     redis_url: str = "redis://localhost:6379/0"
 
     # Analytics Token: long-lived (1yr), read-only, no daily OAuth dance.

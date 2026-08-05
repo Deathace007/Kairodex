@@ -19,7 +19,12 @@ class Base(DeclarativeBase):
 
 @lru_cache
 def get_engine() -> AsyncEngine:
-    return create_async_engine(get_settings().database_url, pool_pre_ping=True)
+    # App runtime uses the least-privilege role if configured (see Settings.
+    # app_database_url) — migrations (alembic/env.py) stay on database_url,
+    # the admin role, always.
+    settings = get_settings()
+    url = settings.app_database_url or settings.database_url
+    return create_async_engine(url, pool_pre_ping=True)
 
 
 @lru_cache
