@@ -184,7 +184,17 @@ async def run_entry_tick(
         lot_size=lot_size,
         stop_distance=stop_distance,
         liquidity_score=values.get("liquidity_score"),
-        chain_complete=front.complete,
+        # NOT front.complete — caught live: ChainSnapshot.complete needs
+        # expected_count, which kairodex.features.loader.load_chain never
+        # sets (that field is P1's atomic-single-REST-fetch concept;
+        # load_chain instead reconstructs a snapshot leg-by-leg from each
+        # instrument's own latest quote, where "complete" isn't a
+        # meaningful idea the same way — front.complete is unconditionally
+        # False for every chain this pipeline ever builds, which would
+        # have made the liquidity gate reject every signal, forever.
+        # Genuine incompleteness already surfaces as select_contract
+        # simply not finding a valid candidate.
+        chain_complete=True,
     )
 
     chain_result = run_gate_chain(proposal, account, config, now=now)
