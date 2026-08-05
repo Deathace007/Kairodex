@@ -24,7 +24,13 @@ def upgrade() -> None:
         sa.Column('id', sa.BigInteger(), autoincrement=True, nullable=False),
         sa.Column(
             'segment',
-            sa.Enum('nse_stock', 'nse_index', 'us_stock', 'us_index', name='segment_enum'),
+            # create_type=False: segment_enum already exists (created by
+            # 354672f0f639) — without this, SQLAlchemy tries to CREATE TYPE
+            # again and fails (caught live on the VM: DuplicateObjectError).
+            sa.Enum(
+                'nse_stock', 'nse_index', 'us_stock', 'us_index',
+                name='segment_enum', create_type=False,
+            ),
             nullable=False,
         ),
         sa.Column('instrument_id', sa.BigInteger(), nullable=False),
