@@ -16,10 +16,11 @@ def _trade(
     trend_state: float | None = 0.02,
     expiry: datetime.date | None = None,
     net_pnl: Decimal = Decimal(10),
+    segment: Segment = Segment.NSE_STOCK,
 ) -> TradeRecord:
     return TradeRecord(
         trade_id=1,
-        segment=Segment.NSE_STOCK,
+        segment=segment,
         strategy_id=1,
         underlying_symbol="RELIANCE",
         instrument_symbol="RELIANCE26AUGCE",
@@ -69,12 +70,34 @@ def test_session_bucket_skips_trade_outside_window():
     assert result == {}
 
 
+def test_us_session_bucket_uses_real_dst_offset_not_a_fixed_utc_window():
+    # 2026-01-15 is EST (UTC-5): real session is 14:30-21:00 UTC (9:30-16:00
+    # ET). A fixed 13:30-20:00 UTC window (EDT-only) would have put this
+    # trade — 20:30 UTC = 15:30 ET, the real closing half-hour — *past* its
+    # own close (frac > 1), silently dropping it from the breakdown
+    # entirely instead of correctly bucketing it "close".
+    winter_close = datetime.datetime(2026, 1, 15, 20, 30, tzinfo=datetime.UTC)
+    result = breakdowns.breakdown(
+        [_trade(opened_at=winter_close, segment=Segment.US_STOCK)], "session"
+    )
+    assert result["close"].n_trades == 1
+
+
+def test_us_session_bucket_open_third_in_edt_summer():
+    # 2026-08-03 is EDT (UTC-4): real session is 13:30-20:00 UTC.
+    summer_open = datetime.datetime(2026, 8, 3, 13, 45, tzinfo=datetime.UTC)
+    result = breakdowns.breakdown(
+        [_trade(opened_at=summer_open, segment=Segment.US_STOCK)], "session"
+    )
+    assert result["open"].n_trades == 1
+
+
 def test_expiry_bucket_days_to_expiry():
     opened = datetime.datetime(2026, 8, 3, 10, 0, tzinfo=datetime.UTC)
     near = _trade(opened_at=opened, expiry=datetime.date(2026, 8, 4))
     far = _trade(opened_at=opened, expiry=datetime.date(2026, 9, 15))
     result = breakdowns.breakdown([near, far], "expiry")
-    assert set(result) == {"0-2d", "30d+"}
+    assert set(result) == {"0-2d", "31d+"}
 
 
 def test_moneyness_bucket_call_itm_vs_put_itm():

@@ -34,3 +34,8 @@ def test_performance_export_round_trips_through_json():
     raw = json.loads(perf.model_dump_json())
     assert raw["overall"]["n_trades"] == 1
     assert raw["breakdowns"]["weekday"]["Monday"]["net_pnl"] == "9"  # Decimal -> string
+
+    # the actual round trip: JSON back into a model, and it must equal
+    # the original object exactly (not just "some fields look right").
+    restored = em.PerformanceExport.model_validate_json(perf.model_dump_json())
+    assert restored == perf

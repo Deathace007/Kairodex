@@ -19,7 +19,14 @@ def _closed(trades: list[TradeRecord]) -> list[TradeRecord]:
 
 
 def win_rate(trades: list[TradeRecord]) -> float | None:
-    closed = _closed(trades)
+    """Denominator is closed trades *with a recorded `net_pnl`* — same
+    population `expectancy`/`avg_win`/`avg_loss` use. A closed trade with
+    no `net_pnl` can't happen through `run_exit_tick` (it always sets it),
+    but counting it as a non-win in this denominator while every sibling
+    metric silently drops it would make `win_rate` alone inconsistent
+    with the rest of `PerformanceSummary` for any row written another
+    way (a manual DB edit, a future code path)."""
+    closed = [t for t in _closed(trades) if t.net_pnl is not None]
     if not closed:
         return None
     wins = sum(1 for t in closed if t.net_pnl is not None and t.net_pnl > 0)
@@ -37,11 +44,17 @@ def profit_factor(trades: list[TradeRecord]) -> float | None:
     return float(gains / abs(losses))
 
 
+_MONEY = Decimal("0.0001")  # numeric(18,4) — ARCHITECTURE.md §5's own money precision
+
+
 def expectancy(trades: list[TradeRecord]) -> Decimal | None:
     closed = [t for t in _closed(trades) if t.net_pnl is not None]
     if not closed:
         return None
-    return sum((t.net_pnl for t in closed if t.net_pnl is not None), Decimal(0)) / len(closed)
+    total = sum((t.net_pnl for t in closed if t.net_pnl is not None), Decimal(0))
+    # quantize, don't leave Decimal's default ~28-digit division noise
+    # (e.g. 100/3 -> "33.33333333333333333333333333") in performance.json.
+    return (total / len(closed)).quantize(_MONEY)
 
 
 def avg_r_multiple(trades: list[TradeRecord]) -> float | None:
@@ -69,7 +82,7 @@ def avg_holding_secs(trades: list[TradeRecord]) -> float | None:
     values = [t.holding_secs for t in _closed(trades) if t.holding_secs is not None]
     if not values:
         return None
-    return statistics.mean(values)
+    return float(statistics.mean(values))  # statistics.mean(list[int]) can return an int
 
 
 def summarize(trades: list[TradeRecord]) -> PerformanceSummary:

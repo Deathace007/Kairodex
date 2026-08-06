@@ -540,30 +540,43 @@ async def run_exit_tick(
     exit_fees = execution.costs.total if execution.costs is not None else Decimal(0)
 
     # Realize *this leg's* P&L against its proportional share of the entry
-    # cost basis, and shrink premium_paid/fees to the remaining open
-    # quantity's share — running totals, so a sequence of partial exits
-    # sums to the same total P&L a single full exit would. (Previously
-    # gross_pnl/net_pnl were only ever set on the final leg, computed
-    # against the *entire original* premium_paid — every earlier partial
-    # leg's proceeds were silently dropped, and a position that partially
+    # cost basis — running totals, so a sequence of partial exits sums to
+    # the same total P&L a single full exit would. (Previously gross_pnl/
+    # net_pnl were only ever set on the final leg, computed against the
+    # *entire original* premium_paid — every earlier partial leg's
+    # proceeds were silently dropped, and a position that partially
     # profited before stopping out could show a large phantom loss.)
-    # trade.fees is itself already a "remaining" figure by this same
-    # invariant (each leg reduces it by its own share), so `trade.fees *
-    # filled_qty / qty_before_exit` is this leg's correct entry-fee share
-    # by induction, not just for the first leg.
-    entry_fees_this_leg = (trade.fees or Decimal(0)) * execution.filled_qty / qty_before_exit
+    #
+    # `remaining_entry_fees` (risk_params, not `trade.fees`) tracks the
+    # not-yet-allocated share of entry fees, shrinking by each leg's own
+    # share the same way `premium_paid` does — the P5 subagent review
+    # caught that this used to live in `trade.fees` itself, which made
+    # `trade.fees` read as "remaining," not "total": a fully-closed trade
+    # always ended up with `fees == 0` regardless of what was actually
+    # paid, silently zeroing P5's `total_fees` for every closed trade.
+    # `trade.fees` is now a pure running total (entry fee, seeded at
+    # `_record_fill`, plus every exit's own fee) that only ever grows.
+    remaining_entry_fees_raw = risk_params.get("remaining_entry_fees", str(trade.fees or 0))
+    remaining_entry_fees = Decimal(str(remaining_entry_fees_raw))
+    entry_fees_this_leg = remaining_entry_fees * execution.filled_qty / qty_before_exit
     cost_basis_this_leg = trade.avg_entry * execution.filled_qty * trade.lot_size
     leg_gross_pnl = exit_value - cost_basis_this_leg
     leg_net_pnl = leg_gross_pnl - entry_fees_this_leg - exit_fees
     trade.gross_pnl = (trade.gross_pnl or Decimal(0)) + leg_gross_pnl
     trade.net_pnl = (trade.net_pnl or Decimal(0)) + leg_net_pnl
     trade.premium_paid = trade.premium_paid - cost_basis_this_leg
-    trade.fees = (trade.fees or Decimal(0)) - entry_fees_this_leg
+    trade.fees = (trade.fees or Decimal(0)) + exit_fees
+    remaining_entry_fees -= entry_fees_this_leg
 
     # avg_exit is the qty-weighted average price across every leg, not
     # just the leg that happened to close the position — accumulated in
     # risk_params (no dedicated column for "running exit proceeds") and
     # resolved into the trades.avg_exit column only once fully closed.
+    # `cum_exit_value` is in money (price * qty * lot_size); dividing by
+    # `cum_exit_qty * trade.lot_size` (not `cum_exit_qty` alone, which is
+    # lots only — the P5 subagent review's other finding: this used to
+    # leave `avg_exit` scaled up by `lot_size`, silently corrupting every
+    # downstream R-multiple) recovers the true per-unit weighted price.
     cum_exit_qty_raw = risk_params.get("cum_exit_qty", 0)
     cum_exit_qty_prior = int(cum_exit_qty_raw) if isinstance(cum_exit_qty_raw, int | float) else 0
     cum_exit_qty = cum_exit_qty_prior + execution.filled_qty
@@ -571,11 +584,15 @@ async def run_exit_tick(
 
     if fully_closed:
         trade.closed_at = now
-        trade.avg_exit = cum_exit_value / cum_exit_qty
+        trade.avg_exit = cum_exit_value / (cum_exit_qty * trade.lot_size)
         trade.exit_reason = decision.reason
         trade.holding_secs = int((now - trade.opened_at).total_seconds())
         trade.qty_lots = 0
-        trade.risk_params = {**risk_params, "hwm_price": str(hwm_price)}
+        trade.risk_params = {
+            **risk_params,
+            "hwm_price": str(hwm_price),
+            "remaining_entry_fees": str(remaining_entry_fees),
+        }
         # Mirrors context_entry — just the underlying price at close, from
         # the same quote row `mark` already came from (no extra query).
         # Full regime context isn't rebuilt here since no breakdown
@@ -594,6 +611,7 @@ async def run_exit_tick(
             "hwm_price": str(hwm_price),
             "cum_exit_qty": cum_exit_qty,
             "cum_exit_value": str(cum_exit_value),
+            "remaining_entry_fees": str(remaining_entry_fees),
         }
         if decision.reason.startswith("PARTIAL_EXIT_R"):
             target = float(decision.reason.removeprefix("PARTIAL_EXIT_R"))

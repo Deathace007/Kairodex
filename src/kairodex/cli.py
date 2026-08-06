@@ -342,7 +342,7 @@ async def _backtest_run(segment: Segment, frm: datetime.date, to: datetime.date)
 def export_cmd(
     segment: Segment = typer.Option(..., help="nse_stock, nse_index, us_stock, or us_index"),
     frm: str = typer.Option(..., "--from", help="YYYY-MM-DD"),
-    to: str = typer.Option(..., "--to", help="YYYY-MM-DD"),
+    to: str = typer.Option(..., "--to", help="YYYY-MM-DD, inclusive"),
     out: str = typer.Option("data/exports", help="Parent directory for the bundle folder"),
 ) -> None:
     """P5: build a self-describing export bundle (ARCHITECTURE.md §14) for
@@ -359,8 +359,15 @@ async def _export(segment: Segment, frm: datetime.date, to: datetime.date, out: 
 
     from kairodex.export.bundle import build_bundle
 
+    # `to` is the CLI's inclusive last day, but every loader filters with a
+    # strict `< to_dt` — so the bound passed down is midnight of the day
+    # *after* `to`. Without the `+1 day`, `--to <today>` would silently
+    # drop everything that happened today (a P5 subagent review caught
+    # this dropping all 3 real trades open on the VM at review time).
     frm_dt = datetime.datetime.combine(frm, datetime.time.min, tzinfo=datetime.UTC)
-    to_dt = datetime.datetime.combine(to, datetime.time.min, tzinfo=datetime.UTC)
+    to_dt = datetime.datetime.combine(to, datetime.time.min, tzinfo=datetime.UTC) + (
+        datetime.timedelta(days=1)
+    )
     out_dir = Path(out) / f"bundle_{segment.value}_{frm.isoformat()}_{to.isoformat()}"
 
     sessionmaker = get_sessionmaker()
@@ -404,7 +411,7 @@ app.add_typer(analytics_app, name="analytics")
 def analytics_report_cmd(
     segment: Segment = typer.Option(..., help="nse_stock, nse_index, us_stock, or us_index"),
     frm: str = typer.Option(None, "--from", help="YYYY-MM-DD, defaults to 30 days ago"),
-    to: str = typer.Option(None, "--to", help="YYYY-MM-DD, defaults to now"),
+    to: str = typer.Option(None, "--to", help="YYYY-MM-DD inclusive, defaults to now"),
 ) -> None:
     """Text performance summary for one segment — the CLI-first live
     verification path for P5, same role `kairodex status`/`backtest run`
@@ -416,8 +423,13 @@ async def _analytics_report(segment: Segment, frm: str | None, to: str | None) -
     from kairodex.analytics import breakdowns, performance
     from kairodex.analytics import loader as analytics_loader
 
+    # An explicit `--to` is the CLI's inclusive last day; every loader
+    # filters with a strict `< to_dt`, so bump to midnight of the day
+    # after. No `--to` at all means "up to right now," which is already
+    # inclusive of today by construction.
     to_dt = (
         datetime.datetime.fromisoformat(to).replace(tzinfo=datetime.UTC)
+        + datetime.timedelta(days=1)
         if to
         else datetime.datetime.now(datetime.UTC)
     )

@@ -33,14 +33,21 @@ from kairodex.analytics import breakdowns, performance, rollups
 from kairodex.analytics import loader as analytics_loader
 from kairodex.analytics.types import EquityPoint, PerformanceSummary, TradeRecord
 from kairodex.core.enums import Segment
-from kairodex.data.quality import QualityFlag
 from kairodex.export import digest as digest_mod
 from kairodex.export import models as em
 from kairodex.features.registry import all_specs
-from kairodex.store.models import ChainSnapshot, OptionQuote, Strategy, TradeEvent
+from kairodex.status import gap_rate
+from kairodex.store.models import (
+    ChainSnapshot,
+    Instrument,
+    OptionQuote,
+    Strategy,
+    TradeEvent,
+    WatchlistMembership,
+)
+from kairodex.store.models import Signal as SignalRow
 
 _BREAKDOWN_DIMS = ("weekday", "session", "expiry", "moneyness", "vol_regime", "regime")
-_GAP_FLAGS = QualityFlag.STALE | QualityFlag.SEQUENCE_GAP
 
 
 def _sha256_file(path: Path) -> str:
@@ -107,41 +114,45 @@ async def _trade_events(session: AsyncSession, trade_ids: list[int]) -> list[em.
 async def _data_quality(
     session: AsyncSession, segment: Segment, frm: datetime.datetime, to: datetime.datetime
 ) -> em.DataQualityExport:
+    """Every count here is scoped to `segment`, not the whole DB — the P5
+    subagent review caught that the first version of this function
+    counted every market's chain snapshots and quote rows regardless of
+    which segment was actually being exported, so an `nse_stock` and a
+    `us_stock` bundle for the same window reported identical numbers.
+
+    Option-leg `instruments.segment` is real (set by
+    `kairodex.data.ingest.store_chain_snapshot`) — a straight join scopes
+    `option_quotes` correctly. `chain_snapshots.underlying_id` points at
+    the *underlying*, whose own `segment` is always NULL by design (see
+    `Instrument`'s docstring), so that one is scoped instead via "was this
+    underlying ever a member of `segment`'s watchlist" — an approximation
+    (not point-in-time-exact the way `watchlist_membership` itself is),
+    documented in the bundle's own `README.md`.
+    """
     provider = "upstox" if segment.market.value == "nse" else "lse"
+    gap = await gap_rate(session, provider, frm, until=to)
 
-    async def _rate(prov: str) -> float | None:
-        total = await session.scalar(
-            select(func.count()).select_from(OptionQuote).where(
-                OptionQuote.source == prov, OptionQuote.tier == 1,
-                OptionQuote.ts >= frm, OptionQuote.ts < to,
-            )
-        )
-        if not total:
-            return None
-        flagged = await session.scalar(
-            select(func.count()).select_from(OptionQuote).where(
-                OptionQuote.source == prov, OptionQuote.tier == 1,
-                OptionQuote.ts >= frm, OptionQuote.ts < to,
-                OptionQuote.quality.op("&")(int(_GAP_FLAGS)) != 0,
-            )
-        )
-        return (flagged or 0) / total
-
-    gap = await _rate(provider)
-
+    segment_underlying_ids = select(WatchlistMembership.instrument_id).where(
+        WatchlistMembership.segment == segment
+    )
     chain_total = await session.scalar(
         select(func.count()).select_from(ChainSnapshot).where(
-            ChainSnapshot.ts >= frm, ChainSnapshot.ts < to
+            ChainSnapshot.underlying_id.in_(segment_underlying_ids),
+            ChainSnapshot.ts >= frm, ChainSnapshot.ts < to,
         )
     )
     chain_incomplete = await session.scalar(
         select(func.count()).select_from(ChainSnapshot).where(
-            ChainSnapshot.ts >= frm, ChainSnapshot.ts < to, ChainSnapshot.complete.is_(False)
+            ChainSnapshot.underlying_id.in_(segment_underlying_ids),
+            ChainSnapshot.ts >= frm, ChainSnapshot.ts < to, ChainSnapshot.complete.is_(False),
         )
     )
     missing_greeks = await session.scalar(
-        select(func.count()).select_from(OptionQuote).where(
-            OptionQuote.ts >= frm, OptionQuote.ts < to, OptionQuote.iv.is_(None)
+        select(func.count()).select_from(OptionQuote)
+        .join(Instrument, Instrument.instrument_id == OptionQuote.instrument_id)
+        .where(
+            Instrument.segment == segment,
+            OptionQuote.ts >= frm, OptionQuote.ts < to, OptionQuote.iv.is_(None),
         )
     )
     return em.DataQualityExport(
@@ -195,14 +206,32 @@ async def build_bundle(
     bundle's own directory (`kairodex export`'s CLI names it
     `bundle_<segment>_<window>/`), not its parent."""
     out_dir.mkdir(parents=True, exist_ok=True)
+    # Drop any manifest left over from a prior run into this same
+    # directory *before* writing anything new — a crash partway through
+    # (DB error, SIGINT) then leaves no manifest at all rather than a
+    # stale one whose hashes/row-counts no longer match the files next to
+    # it. `kairodex export`'s bundle directory name is deterministic
+    # (`bundle_<segment>_<from>_<to>`), so re-running into the same
+    # directory is the normal case, not an edge case.
+    (out_dir / "manifest.json").unlink(missing_ok=True)
     generated_at = datetime.datetime.now(datetime.UTC)
 
     trades = await analytics_loader.load_trades(session, segment, frm=frm, to=to)
     trade_events = await _trade_events(session, [t.trade_id for t in trades])
     rejected = await analytics_loader.load_rejected_signals(session, segment, frm=frm, to=to)
     equity_points = await analytics_loader.load_equity_curve(session, segment, frm=frm, to=to)
+    # "active in the window" (ARCHITECTURE.md §14) — strategies that
+    # actually generated a signal in [frm, to), not every strategy row
+    # this segment has ever had.
+    active_strategy_ids = select(SignalRow.strategy_id).where(
+        SignalRow.segment == segment, SignalRow.ts >= frm, SignalRow.ts < to
+    ).distinct()
     strategies = list(
-        await session.scalars(select(Strategy).where(Strategy.segment == segment))
+        await session.scalars(
+            select(Strategy).where(
+                Strategy.segment == segment, Strategy.strategy_id.in_(active_strategy_ids)
+            )
+        )
     )
     data_quality = await _data_quality(session, segment, frm, to)
 
@@ -339,11 +368,30 @@ summarizes.
   the bundle; a PROXY or ESTIMATE feature is not ground truth.
 - `data_quality.json` — feed gap rate, incomplete chain snapshots, and
   quotes missing our own (vs. vendor) Greeks, all scoped to this exact
-  window.
+  window and to this segment (chain-snapshot scoping is via "was this
+  underlying ever a member of the segment's watchlist," not
+  point-in-time-exact — see the caveat below).
 - `digest.md` — the human/LLM-readable summary.
 
 ## Known caveats
 
+- `data_quality.json`'s `chain_snapshots_incomplete` count is close to (or
+  equal to) `chain_snapshots_total` by current design, not a live feed
+  problem: `ChainSnapshot.complete` is `expected_count is not None and
+  contract_count >= expected_count` (`kairodex.data.types`), and no
+  vendor client populates `expected_count` anywhere in this codebase yet
+  — `complete` has been `False` for every chain snapshot ever recorded
+  since P0/P1. Nothing downstream currently depends on this column being
+  meaningful (the live engine's own liquidity gate uses
+  `select_contract` finding a real candidate as its completeness signal
+  instead — see `kairodex.engine.orchestrator`'s docstring). Revisit
+  `expected_count` if this column ever needs to mean something.
+- `chain_snapshots_total`/`chain_snapshots_incomplete` scope to a segment
+  via "was this chain's underlying ever a `watchlist_membership` row for
+  this segment" — not point-in-time-exact (a symbol that moved segments,
+  or was added/removed from the watchlist, is scoped by its full
+  membership history, not by what was true exactly at each snapshot's own
+  timestamp).
 - `context_entry`/`r_multiple`/`mfe`/`mae` on a trade reflect what the
   live engine actually observed at the time (feature values, position
   marks) — not recomputed after the fact.
@@ -352,7 +400,31 @@ summarizes.
   by partial exits changing quantity over the position's life, but `None`
   for any trade opened before this field existed (no `initial_stop_price`
   recorded).
-- `session`/`regime`/`vol_regime` breakdown buckets use approximate,
-  DST-naive session windows and simple threshold rules — see
+- `context_entry.underlying_px` (the 1-minute underlying bar close the
+  engine actually acted on when selecting the contract) and
+  `context_exit.underlying_px` (the vendor's spot as of the exit's own
+  option quote) come from different sources — both individually correct
+  for what they each describe, but their difference is not a clean
+  "underlying moved by X" figure.
+- `trades.jsonl` is scoped by `opened_at`; `equity.csv` is scoped by
+  snapshot `ts`. A trade opened before the window and closed inside it
+  contributes its P&L to the equity curve but never appears in
+  `trades.jsonl` at all — the two files are not always reconcilable
+  trade-for-trade over a short window.
+- `performance.json`'s `equity_rollup_daily.max_drawdown_pct` is each
+  day's worst *observed* drawdown against the account's all-time
+  high-water mark, not a drawdown computed fresh from that day alone; its
+  `return_pct` is first-snapshot-of-day to last-snapshot-of-day, so
+  overnight gaps between days aren't included and daily returns won't
+  chain-multiply to `equity_curve.total_return_pct` exactly.
+- `equity.csv` is every raw `equity_snapshots` row in the window (matches
+  what the engine actually wrote), not literally the "daily equity"
+  ARCHITECTURE.md §14 describes — the daily rollup is in
+  `performance.json`'s `equity_rollup_daily` instead, deliberately kept
+  distinct from the raw series rather than replacing it.
+- `session`/`regime`/`vol_regime` breakdown buckets use simple threshold
+  rules and approximate session windows (NSE: fixed IST offset, no DST to
+  account for; US: real Eastern local time via `zoneinfo`, DST-aware, but
+  still no holiday/half-day calendar) — see
   `kairodex.analytics.breakdowns`' own docstrings for the exact rule.
 """

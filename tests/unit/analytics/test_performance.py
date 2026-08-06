@@ -62,11 +62,40 @@ def test_profit_factor_none_with_no_losses():
     assert performance.profit_factor([_trade(net_pnl=Decimal(100))]) is None
 
 
-def test_r_multiple_price_ratio_unaffected_by_size():
+def test_r_multiple_is_a_pure_price_ratio():
     # entry 100, stop 90 (risk=10), exit 110 -> R = (110-100)/10 = 1.0
     t = _trade(net_pnl=Decimal(1), avg_entry=Decimal(100), avg_exit=Decimal(110),
                initial_stop_price=Decimal(90))
     assert t.r_multiple == 1.0
+
+
+def test_r_multiple_same_ratio_at_a_different_price_scale():
+    # TradeRecord carries no quantity field at all — `r_multiple` is
+    # `(avg_exit - avg_entry) / (avg_entry - initial_stop_price)`, three
+    # price columns and nothing else, so it cannot be quantity-dependent
+    # by construction. This checks the *scale* of the prices doesn't
+    # matter either: same 2R at a 10x price level.
+    small = _trade(net_pnl=Decimal(1), avg_entry=Decimal(10), avg_exit=Decimal(30),
+                    initial_stop_price=Decimal(0))
+    large = _trade(net_pnl=Decimal(1), avg_entry=Decimal(1000), avg_exit=Decimal(3000),
+                    initial_stop_price=Decimal(0))
+    assert small.r_multiple == large.r_multiple == 2.0
+
+
+def test_r_multiple_partial_exit_sequence_matches_a_single_full_exit():
+    # The orchestrator computes avg_exit as a qty-weighted average across
+    # every leg (kairodex.engine.orchestrator.run_exit_tick) — a real bug
+    # there once made a multi-leg avg_exit come out `lot_size`x too large
+    # (caught by a P5 subagent review, fixed in the same session). This
+    # documents the invariant that fix restores: 5@110 then 5@130 must
+    # resolve to the same R as a single 10@120 exit, since (110+130)/2
+    # equals the single-price-weighted average 120.
+    sequential_avg_exit = (Decimal(110) * 5 + Decimal(130) * 5) / 10
+    a = _trade(net_pnl=Decimal(1), avg_entry=Decimal(100), avg_exit=sequential_avg_exit,
+               initial_stop_price=Decimal(90))
+    b = _trade(net_pnl=Decimal(1), avg_entry=Decimal(100), avg_exit=Decimal(120),
+               initial_stop_price=Decimal(90))
+    assert a.r_multiple == b.r_multiple == 2.0
 
 
 def test_r_multiple_none_without_initial_stop():
