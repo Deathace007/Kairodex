@@ -126,3 +126,40 @@ def test_liquidity_score_none_without_quotes():
         as_of=_T0, segment=Segment.NSE_INDEX, chain=[_snapshot([leg])], underlying_bars=[_bar(100)]
     )
     assert liquidity_score(ctx) is None
+
+
+def test_liquidity_score_stays_none_on_nse_with_no_book():
+    """The safety property that matters most: a missing NSE book must
+    never fall back to a modelled one. NSE has a real book — a feed hiccup
+    dropping bid/ask for one tick is a real "unknown," not a vendor
+    limitation to paper over. Only Market.US gets the fallback."""
+    leg = _leg("C1", "C", oi=1000, strike=Decimal(100), ltp=Decimal("10"), volume=5000)
+    ctx = FeatureContext(
+        as_of=_T0, segment=Segment.NSE_INDEX, chain=[_snapshot([leg])], underlying_bars=[_bar(100)]
+    )
+    assert liquidity_score(ctx) is None
+
+
+def test_liquidity_score_falls_back_to_modelled_book_on_us():
+    """The bug this regression-tests: contract selection could clear (once
+    _candidates_from_chain synthesized a book) while this feature stayed
+    permanently None for every US signal, because it read the raw,
+    never-populated bid/ask instead of modelling one the same way. Live
+    2026-08-06: 951 of ~1,100 recent us_stock signals died here."""
+    leg = _leg("C1", "C", oi=1000, strike=Decimal(100), ltp=Decimal("10"), volume=5000)
+    ctx = FeatureContext(
+        as_of=_T0, segment=Segment.US_STOCK, chain=[_snapshot([leg])], underlying_bars=[_bar(100)]
+    )
+    assert liquidity_score(ctx) is not None
+    assert 0.0 < liquidity_score(ctx) <= 1.0
+
+
+def test_liquidity_score_none_on_us_with_no_last_price_either():
+    """A contract that has never printed on this vendor either has no real
+    book (the earlier case) or no evidence at all (no ltp) — both are
+    genuinely unknown, not "probably fine," so both stay None."""
+    leg = _leg("C1", "C", oi=1000, strike=Decimal(100))  # no bid/ask, no ltp
+    ctx = FeatureContext(
+        as_of=_T0, segment=Segment.US_STOCK, chain=[_snapshot([leg])], underlying_bars=[_bar(100)]
+    )
+    assert liquidity_score(ctx) is None

@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+from kairodex.core.enums import Market
 from kairodex.data.types import ChainSnapshot, Tick
+from kairodex.execution.synthetic_quote import synthesize_quote
 from kairodex.features.registry import register
 from kairodex.features.types import FeatureContext, Fidelity, Tier
 
@@ -121,7 +123,22 @@ def liquidity_score(ctx: FeatureContext) -> float | None:
     feature_vectors writes are wired to target option legs directly (P3).
     Each sub-score uses a saturating x/(x+K) curve (0..1, asymptotic) so
     it self-scales without a hardcoded "good" absolute threshold; the
-    average of the four is arbitrary-but-documented, not derived."""
+    average of the four is arbitrary-but-documented, not derived.
+
+    US-only: falls back to the same modelled book `_candidates_from_chain`
+    (kairodex.engine.orchestrator) synthesizes for LSE, which publishes no
+    bid/ask at all. Missing this half was a real bug, not a stricter gate
+    working as intended: `risk.gates.liquidity_gate` reads exactly this
+    value and fails closed on `None` ("an unpriced contract isn't
+    'probably fine'"), which is the right call against a genuinely unknown
+    book — but here the book was knowable, just not where this function
+    was looking. Before this fix, contract selection could clear (once
+    candidates existed) and every single signal still died one gate later
+    on a feature that could never be anything but `None` for this vendor
+    (live 2026-08-06: 951 of ~1,100 recent us_stock signals). Gated the
+    same explicit way as candidate synthesis — `Market.US` only, never a
+    blanket "whenever bid/ask happen to be missing" — so an NSE feed
+    hiccup can't silently start scoring liquidity on fiction."""
     if not ctx.chain or ctx.spot is None:
         return None
     front = min(ctx.chain, key=lambda s: s.expiry)
@@ -129,16 +146,23 @@ def liquidity_score(ctx: FeatureContext) -> float | None:
     if not calls:
         return None
     atm = min(calls, key=lambda q: abs(float(q.strike) - ctx.spot))  # type: ignore[arg-type,operator]
-    if atm.bid is None or atm.ask is None or atm.bid <= 0:
-        return None
-    bid, ask = float(atm.bid), float(atm.ask)
+    raw_bid, raw_ask, bid_sz, ask_sz = atm.bid, atm.ask, atm.bid_sz, atm.ask_sz
+    if raw_bid is None or raw_ask is None or raw_bid <= 0:
+        if ctx.segment.market is not Market.US:
+            return None
+        modelled = synthesize_quote(atm.ltp, atm.volume)
+        if modelled is None:
+            return None
+        raw_bid, raw_ask = modelled.bid, modelled.ask
+        bid_sz, ask_sz = modelled.bid_sz, modelled.ask_sz
+    bid, ask = float(raw_bid), float(raw_ask)
     mid = (bid + ask) / 2
     if mid <= 0:
         return None
     spread_pct = (ask - bid) / mid
     spread_score = 1.0 / (1.0 + spread_pct * _LIQUIDITY_SPREAD_K)
 
-    depth = float(atm.bid_sz or 0) + float(atm.ask_sz or 0)
+    depth = float(bid_sz or 0) + float(ask_sz or 0)
     depth_score = depth / (depth + _LIQUIDITY_DEPTH_K)
     oi_val = float(atm.oi or 0)
     oi_score = oi_val / (oi_val + _LIQUIDITY_OI_K)
