@@ -978,3 +978,45 @@ confirmed still present at the pre-P6 commit too, not a regression.
   request at a time, not a load test. No load-testing infrastructure
   exists in this repo yet; revisit if/when this ever needs to serve more
   than one concurrent user.
+
+### 12f. Public read-only mirror — `app.swingpro.tech` via Surge (2026-08-06)
+
+The user's own explicit request, after P6 itself was done: a way to
+check on progress/performance from a browser without an SSH tunnel.
+Surge (surge.sh) only serves static files — no Node process — so the
+live dynamic dashboard (§12c, `force-dynamic`-equivalent per-request
+rendering) can't run there directly. Rather than exposing `kairodex-api`
+to the public internet to let a remote browser fetch live (which would
+also expose `POST /api/kill` and the other audited control endpoints —
+a real security question this repo's own posture, SPEC_REVIEW.md B5,
+already answers as "no"), the frontend gained a second build mode from
+the *same* source tree (`NEXT_OUTPUT_MODE=export`, `next.config.ts`):
+a static export, built ON THE VM (where `127.0.0.1:8000` is the real
+API), baking real data into static HTML at build time — the "how
+`kairodex-app`/`app_role_separation` finally made a REVOKE mean
+something" of frontend deployments, same idea: least exposure that still
+does the job.
+
+`generateStaticParams` came back for both dynamic routes for this mode
+only (`[segment]`: the fixed 4 values; `[tradeId]`: every real trade's
+own id, fetched from the live API at build time, with a one-route
+fallback so the build doesn't hard-fail before any trade has ever been
+taken). The live server build (`kairodex-frontend`, unchanged) still
+renders every request fresh exactly as §12d's fix established — the two
+modes share `lib/api.ts`'s single `apiGet`, which switches its own
+`cache` option by the same env var, not two copies of the fetch logic.
+
+Deployed: `frontend/deploy-surge.sh` (build + `surge ./out
+app.swingpro.tech`), run once manually (confirmed live: real HTTPS via
+Surge's own cert, the real `BANKNIFTY 58400.0 C 2026-08-25` position
+render, the trade-detail drill-down resolves) and then wired to a new
+`kairodex-surge-deploy.timer` (systemd, `OnUnitActiveSec=5min`) so the
+public snapshot keeps refreshing without a person remembering to run it.
+
+**Known, deliberate limitation of this mirror specifically** (not the
+live VM+tunnel dashboard, which is unaffected): the "live activity" WS
+panel (§12b) cannot connect from `app.swingpro.tech` — the browser has
+no path to `kairodex-api` at all from there, by design — so it renders
+its own empty state permanently on this mirror. Every other panel is
+real data, just as fresh as the last 5-minute rebuild rather than
+per-request.
