@@ -27,7 +27,7 @@ from sqlalchemy import (
     String,
     UniqueConstraint,
 )
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.types import BigInteger, Boolean, DateTime, Enum, Integer
 
@@ -557,3 +557,27 @@ class BacktestRun(Base):
     metrics: Mapped[dict[str, object] | None] = mapped_column(JSONB)
     trial_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     deflated_sharpe: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
+
+
+class ResearchNote(Base):
+    """§5.5 — the return half of ARCHITECTURE.md §14's "Claude Code loop":
+    findings from reviewing an exported bundle, imported back via
+    `kairodex research import-notes`. `segment` is nullable — a review can
+    span every segment at once (the Master dashboard's own "Research
+    Insights" panel, §16), not just one. `applied_strategy_ids` names
+    which strategies a finding actually changed; empty until a human
+    acts on it (`status` starts `'open'`)."""
+
+    __tablename__ = "research_notes"
+
+    note_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    segment: Mapped[Segment | None] = mapped_column(_segment_enum)
+    bundle_id: Mapped[str | None] = mapped_column(String)
+    source: Mapped[str] = mapped_column(String, nullable=False, default="claude-code")
+    findings: Mapped[dict[str, object] | list[object]] = mapped_column(JSONB, nullable=False)
+    actions: Mapped[dict[str, object] | list[object] | None] = mapped_column(JSONB)
+    applied_strategy_ids: Mapped[list[int]] = mapped_column(
+        ARRAY(BigInteger), nullable=False, default=list
+    )
+    status: Mapped[str] = mapped_column(String, nullable=False, default="open")

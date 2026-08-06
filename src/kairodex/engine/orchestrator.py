@@ -263,6 +263,8 @@ async def run_entry_tick(
         stop_distance=stop_distance,
         execution=execution,
         now=now,
+        spot=feature_ctx.spot,
+        values=values,
     )
     signal.decision = "TAKEN"
     await session.commit()
@@ -296,6 +298,8 @@ async def _record_fill(
     stop_distance: Decimal,
     execution: ExecutionResult,
     now: datetime.datetime,
+    spot: float | None,
+    values: dict[str, float],
 ) -> int:
     assert execution.price is not None
     premium_paid = execution.price * execution.filled_qty * lot_size
@@ -312,6 +316,18 @@ async def _record_fill(
         avg_entry=execution.price,
         premium_paid=premium_paid,
         fees=execution.costs.total if execution.costs is not None else Decimal(0),
+        # regime/profile-state/liquidity snapshot at entry (§5.4's own
+        # docstring for this column) — everything here was already
+        # computed by run_entry_tick's feature pass, so this costs no
+        # extra query. Powers P5's breakdown-by-regime/vol_regime/
+        # moneyness analytics; previously always NULL (nothing wrote it),
+        # which would have made those breakdowns structurally empty.
+        context_entry={
+            "underlying_px": spot,
+            "vol_regime": values.get("volatility_regime"),
+            "trend_state_strength": values.get("trend_state_strength"),
+            "liquidity_score": values.get("liquidity_score"),
+        },
         risk_params={
             "stop_price": str(execution.price - stop_distance),
             "initial_stop_price": str(execution.price - stop_distance),
@@ -560,6 +576,17 @@ async def run_exit_tick(
         trade.holding_secs = int((now - trade.opened_at).total_seconds())
         trade.qty_lots = 0
         trade.risk_params = {**risk_params, "hwm_price": str(hwm_price)}
+        # Mirrors context_entry — just the underlying price at close, from
+        # the same quote row `mark` already came from (no extra query).
+        # Full regime context isn't rebuilt here since no breakdown
+        # dimension needs an exit-time regime, only an entry-time one.
+        trade.context_exit = {
+            "underlying_px": (
+                float(latest_quote.underlying_px)
+                if latest_quote.underlying_px is not None
+                else None
+            )
+        }
     else:
         trade.qty_lots = remaining_qty
         new_risk_params: dict[str, object] = {

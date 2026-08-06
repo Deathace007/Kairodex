@@ -338,6 +338,118 @@ async def _backtest_run(segment: Segment, frm: datetime.date, to: datetime.date)
         typer.echo(f"backtest_runs row {run.run_id} written")
 
 
+@app.command("export")
+def export_cmd(
+    segment: Segment = typer.Option(..., help="nse_stock, nse_index, us_stock, or us_index"),
+    frm: str = typer.Option(..., "--from", help="YYYY-MM-DD"),
+    to: str = typer.Option(..., "--to", help="YYYY-MM-DD"),
+    out: str = typer.Option("data/exports", help="Parent directory for the bundle folder"),
+) -> None:
+    """P5: build a self-describing export bundle (ARCHITECTURE.md §14) for
+    one segment/window — manifest, trades, trade_events, rejected signals,
+    equity, performance + breakdowns, feature dictionary, data quality,
+    and a digest.md meant to be pasted into a fresh Claude Code session."""
+    asyncio.run(
+        _export(segment, datetime.date.fromisoformat(frm), datetime.date.fromisoformat(to), out)
+    )
+
+
+async def _export(segment: Segment, frm: datetime.date, to: datetime.date, out: str) -> None:
+    from pathlib import Path
+
+    from kairodex.export.bundle import build_bundle
+
+    frm_dt = datetime.datetime.combine(frm, datetime.time.min, tzinfo=datetime.UTC)
+    to_dt = datetime.datetime.combine(to, datetime.time.min, tzinfo=datetime.UTC)
+    out_dir = Path(out) / f"bundle_{segment.value}_{frm.isoformat()}_{to.isoformat()}"
+
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        manifest_path = await build_bundle(
+            session, segment=segment, frm=frm_dt, to=to_dt, out_dir=out_dir
+        )
+    typer.echo(f"bundle written to {out_dir} ({manifest_path.name})")
+
+
+research_app = typer.Typer(help="P5: the export/review loop's return path")
+app.add_typer(research_app, name="research")
+
+
+@research_app.command("import-notes")
+def import_notes_cmd(
+    path: str = typer.Argument(..., help="Path to a findings.json produced by a bundle review"),
+) -> None:
+    """ARCHITECTURE.md §14: "Return path: `kairodex research import-notes
+    findings.json` -> `research_notes`, linked to the strategy versions it
+    causes. The loop closes and stays auditable.\""""
+    asyncio.run(_import_notes(path))
+
+
+async def _import_notes(path: str) -> None:
+    from pathlib import Path
+
+    from kairodex.export.research_import import import_notes
+
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        note = await import_notes(session, Path(path))
+    typer.echo(f"research_notes row {note.note_id} written (status={note.status})")
+
+
+analytics_app = typer.Typer(help="P5: performance metrics and breakdowns")
+app.add_typer(analytics_app, name="analytics")
+
+
+@analytics_app.command("report")
+def analytics_report_cmd(
+    segment: Segment = typer.Option(..., help="nse_stock, nse_index, us_stock, or us_index"),
+    frm: str = typer.Option(None, "--from", help="YYYY-MM-DD, defaults to 30 days ago"),
+    to: str = typer.Option(None, "--to", help="YYYY-MM-DD, defaults to now"),
+) -> None:
+    """Text performance summary for one segment — the CLI-first live
+    verification path for P5, same role `kairodex status`/`backtest run`
+    played for P1/P4."""
+    asyncio.run(_analytics_report(segment, frm, to))
+
+
+async def _analytics_report(segment: Segment, frm: str | None, to: str | None) -> None:
+    from kairodex.analytics import breakdowns, performance
+    from kairodex.analytics import loader as analytics_loader
+
+    to_dt = (
+        datetime.datetime.fromisoformat(to).replace(tzinfo=datetime.UTC)
+        if to
+        else datetime.datetime.now(datetime.UTC)
+    )
+    frm_dt = (
+        datetime.datetime.fromisoformat(frm).replace(tzinfo=datetime.UTC)
+        if frm
+        else to_dt - datetime.timedelta(days=30)
+    )
+
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        trades = await analytics_loader.load_trades(session, segment, frm=frm_dt, to=to_dt)
+        equity = await analytics_loader.load_equity_curve(session, segment, frm=frm_dt, to=to_dt)
+
+    summary = performance.summarize(trades)
+    eq_stats = performance.equity_curve_stats(equity)
+    typer.echo(f"{segment.value}  {frm_dt.date()} to {to_dt.date()}")
+    typer.echo(
+        f"trades: {summary.n_trades} ({summary.n_open} open, {summary.n_closed} closed)  "
+        f"win_rate={summary.win_rate}  profit_factor={summary.profit_factor}  "
+        f"avg_r={summary.avg_r_multiple}  net_pnl={summary.net_pnl}"
+    )
+    typer.echo(
+        f"equity: current={eq_stats.current_equity}  hwm={eq_stats.high_water_mark}  "
+        f"max_drawdown={eq_stats.max_drawdown_pct}  total_return={eq_stats.total_return_pct}"
+    )
+    for dim in ("weekday", "session", "expiry", "moneyness", "vol_regime", "regime"):
+        groups = breakdowns.breakdown(trades, dim)
+        if groups:
+            typer.echo(f"by {dim}: " + ", ".join(f"{k}={v.n_trades}" for k, v in groups.items()))
+
+
 @app.command("status")
 def status_cmd() -> None:
     """Minimal status page (ARCHITECTURE.md §19 P1 exit criterion): per-market

@@ -19,24 +19,36 @@ _PROVIDER_LABELS = {"upstox": "upstox (NSE)", "lse": "lse (US)"}
 _GAP_FLAGS = QualityFlag.STALE | QualityFlag.SEQUENCE_GAP
 
 
-async def gap_rate(session: AsyncSession, provider: str, since: datetime.datetime) -> float | None:
-    total = await session.scalar(
-        select(func.count())
-        .select_from(OptionQuote)
-        .where(OptionQuote.source == provider, OptionQuote.tier == 1, OptionQuote.ts >= since)
+async def gap_rate(
+    session: AsyncSession,
+    provider: str,
+    since: datetime.datetime,
+    *,
+    until: datetime.datetime | None = None,
+) -> float | None:
+    """`until=None` (the default, and every existing caller before this
+    parameter existed) means "up to now" — unbounded above, exactly the
+    original behavior. `kairodex.export.bundle` passes a real `until` so
+    a bundle's `data_quality.json` reports the gap rate *within its own
+    export window*, not always-up-to-the-current-moment — reusing this
+    function rather than a second copy of the same query."""
+    stmt = select(func.count()).select_from(OptionQuote).where(
+        OptionQuote.source == provider, OptionQuote.tier == 1, OptionQuote.ts >= since
     )
+    if until is not None:
+        stmt = stmt.where(OptionQuote.ts < until)
+    total = await session.scalar(stmt)
     if not total:
         return None
-    flagged = await session.scalar(
-        select(func.count())
-        .select_from(OptionQuote)
-        .where(
-            OptionQuote.source == provider,
-            OptionQuote.tier == 1,
-            OptionQuote.ts >= since,
-            OptionQuote.quality.op("&")(int(_GAP_FLAGS)) != 0,
-        )
+    flagged_stmt = select(func.count()).select_from(OptionQuote).where(
+        OptionQuote.source == provider,
+        OptionQuote.tier == 1,
+        OptionQuote.ts >= since,
+        OptionQuote.quality.op("&")(int(_GAP_FLAGS)) != 0,
     )
+    if until is not None:
+        flagged_stmt = flagged_stmt.where(OptionQuote.ts < until)
+    flagged = await session.scalar(flagged_stmt)
     return (flagged or 0) / total
 
 
