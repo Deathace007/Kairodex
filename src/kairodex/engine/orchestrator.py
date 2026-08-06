@@ -148,6 +148,7 @@ def _select_across_expiries(
     `selection.selected is None` check needs no change — same contract a
     single-snapshot call already had."""
     first: SelectionResult | None = None
+    informative: SelectionResult | None = None
     for snapshot in sorted(chain, key=lambda s: s.expiry):
         candidates = _candidates_from_chain(
             snapshot.quotes, snapshot.expiry, synthetic_quotes=synthetic_quotes
@@ -163,10 +164,25 @@ def _select_across_expiries(
         )
         if first is None:
             first = trial
+        # NO_CANDIDATES_IN_EXPIRY_WINDOW just means "this snapshot's DTE is
+        # outside the window" — for a near-daily-expiry underlying that is
+        # the *expected* answer for the 0-DTE snapshot and says nothing
+        # about why the trade didn't happen. Reporting it (the nearest
+        # snapshot's reason) masked the real blocker on the expiry that
+        # actually qualified. Verified live 2026-08-06: IWM's 0-DTE gave
+        # NO_CANDIDATES while its 1-DTE gave NO_CONTRACT_NEAR_TARGET_DELTA,
+        # and the signals table recorded the former — which sent a whole
+        # investigation after an expiry-window problem that did not exist.
+        # ARCHITECTURE.md §11 makes this a correctness issue, not cosmetics:
+        # "every denial is written to signals ... The rejections are
+        # training data." Prefer a reason from an expiry that cleared the
+        # DTE window and still failed for a substantive reason.
+        if informative is None and trial.reason != "NO_CANDIDATES_IN_EXPIRY_WINDOW":
+            informative = trial
         if trial.selected is not None and trial.mid_price is not None:
             return trial
     assert first is not None  # caller already checked `feature_ctx.chain` is non-empty
-    return first
+    return informative or first
 
 
 async def run_entry_tick(

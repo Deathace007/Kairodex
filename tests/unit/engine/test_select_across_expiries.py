@@ -81,18 +81,44 @@ def test_prefers_the_nearest_expiry_that_actually_works():
     assert result.selected.expiry == _TODAY + datetime.timedelta(days=1)
 
 
-def test_reports_the_nearest_snapshots_own_reason_when_nothing_selects():
-    """Same contract the old single-snapshot code had: when every expiry
-    fails, the caller's `selection.selected is None` check still works, and
-    the reported reason is the nearest (most relevant) attempt's own —
-    not the last one tried, which would be a farther, less relevant expiry."""
+def test_reports_no_candidates_when_that_is_genuinely_the_only_reason():
+    """When no expiry has any usable leg at all, the reason is honestly
+    NO_CANDIDATES_IN_EXPIRY_WINDOW — the caller's `selected is None` check
+    is unaffected."""
     chain = [
-        _snapshot(_TODAY, []),  # no legs at all: NO_CANDIDATES...
+        _snapshot(_TODAY, []),  # no legs at all
         _snapshot(_TODAY + datetime.timedelta(days=1), []),
     ]
     result = _select(chain)
     assert result.selected is None
     assert result.reason == "NO_CANDIDATES_IN_EXPIRY_WINDOW"
+
+
+def test_reports_the_substantive_reason_not_the_0dte_expiry_window_miss():
+    """Verified live 2026-08-06 on IWM: the 0-DTE snapshot returns
+    NO_CANDIDATES_IN_EXPIRY_WINDOW (expected — it's below min_dte and says
+    nothing about why no trade happened), while the 1-DTE snapshot that
+    actually qualified failed for a real reason. Reporting the nearest
+    snapshot's reason recorded the wrong cause in `signals`, which
+    ARCHITECTURE.md §11 treats as training data — and it sent a whole
+    investigation chasing an expiry-window problem that did not exist.
+
+    Here the 0 DTE legs are out-of-window; the 1 DTE leg is a 0.005-delta
+    lottery ticket that the delta cap rejects. The substantive reason must
+    win."""
+    lottery = _tick(400, delta=Decimal("0.005"), bid=Decimal(1), ask=Decimal(2))
+    chain = [
+        _snapshot(_TODAY, [100]),  # 0 DTE -> NO_CANDIDATES_IN_EXPIRY_WINDOW
+        ChainSnapshot(
+            underlying="IWM",
+            expiry=_TODAY + datetime.timedelta(days=1),
+            ts=_TS,
+            quotes=[lottery],
+        ),
+    ]
+    result = _select(chain)
+    assert result.selected is None
+    assert result.reason == "NO_CONTRACT_NEAR_TARGET_DELTA"
 
 
 def test_single_expiry_chain_behaves_exactly_as_before():
