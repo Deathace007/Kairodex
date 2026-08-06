@@ -1,6 +1,6 @@
 # Kairodex — Development Progress
 
-**Last updated:** 2026-08-05
+**Last updated:** 2026-08-06
 **Current phase:** P1 (The Recorder) is done pending the unattended
 5-session check (§7). P2 (Pricing & features) is functionally complete
 (§8). **P3 (Engine & paper execution) is functionally complete and
@@ -44,7 +44,21 @@ is live-verified against 12 real recorded signals (byte-identical
 replay), but no real trade has been TAKEN yet to replay a full
 open-to-close lifecycle against, so that specific case remains
 unexercised until one occurs.
-**Next phase:** P5 (Analytics & export).
+
+**P5 (Analytics & export) is functionally complete and subagent-reviewed**:
+`kairodex/analytics/` (performance, breakdowns by weekday/session/expiry/
+moneyness/vol_regime/regime, daily/weekly/monthly equity rollups) and
+`kairodex/export/` (the full ARCHITECTURE.md §14 bundle — manifest with
+embedded JSON Schema, trades/trade_events/rejected-signals/equity/
+performance/feature-dictionary/data-quality/digest/README — plus
+`research_notes` import). Live-verified against **real trades this
+session found already open on the VM** — see §11 for how P3's shadow
+engine had, without anyone watching for it, taken 3 real trades since
+the last session. An independent subagent review found and fixed 2
+live-affecting bugs in the already-deployed engine (`trades.avg_exit`
+silently `lot_size`x too large, `trades.fees` zeroed to 0 on every close)
+plus 8 more findings in this session's own new code — see §11e.
+**Next phase:** P6 (API & dashboards).
 
 > Read this file first, every session. Update it whenever a phase
 > completes, a decision changes, or a command/location changes. Deeper
@@ -457,3 +471,228 @@ Same process as §9e, applied to the full P4 diff. A subagent independently re-d
 4. **`sync_watchlist`'s duplicate-membership fix (§10c) checked `valid_to == date.max`**, while `watchlist_instruments` (the read path) checks `valid_to >= today` — the two conditions happen to coincide today (nothing sets a finite `valid_to` yet), but the mismatch would have silently reintroduced the exact duplicate-membership bug class the moment a "scheduled removal" feature is ever added. Fixed to match the read path's own condition exactly.
 
 3 new tests (relative-strength alignment regression, zero/negative `max_holding_bars`); 337 tests passing, ruff/mypy clean.
+
+---
+
+## 11. P5 — Analytics & export (2026-08-06)
+
+Scope per ARCHITECTURE.md §14/§19: "All metrics + breakdowns, rollups,
+export bundle with JSON Schema, digest, `research_notes` import." Exit
+criterion is "one month of shadow data exported and reviewed end-to-end
+in Claude Code, findings imported back" — see §11d for the honest status
+of that (there isn't a month of data yet; the mechanism is fully built
+and live-verified against the real data that does exist).
+
+### 11a. Real data existed before this session even started
+
+Checking the VM before building anything (docs/PROGRESS.md's own "read
+this first" habit, applied to the DB, not just the file) found P3's
+shadow engine had, unattended, **taken 3 real trades** since the last
+session — 1 `nse_stock`, 2 `nse_index`, all still open — and
+`equity_snapshots` had real per-tick data for all 4 segments going back
+to whenever P3's subagent-review fix (§9e #3, `risk/accounting.py`) was
+deployed. This matters for §11d below: P5 isn't being verified against
+an empty database.
+
+### 11b. `kairodex/analytics/` (23 tests)
+
+Same split as every other package: `types.py` (`TradeRecord` — one
+closed-or-open trade flattened from `trades`+`instruments`+
+`position_marks`; `EquityPoint`/`EquityCurveStats`/`RollupPoint`),
+`performance.py` (win rate, profit factor, expectancy, avg R-multiple,
+avg win/loss, equity curve stats — all DB-free, pure functions),
+`breakdowns.py` (group `TradeRecord`s by weekday/session/expiry/
+moneyness/vol_regime/regime and run `performance.summarize` on each
+group), `rollups.py` (daily/weekly/monthly equity OHLC-style rollup),
+`loader.py` (the one DB-touching file).
+
+**`TradeRecord.r_multiple`** is a pure price ratio,
+`(avg_exit - avg_entry) / (avg_entry - initial_stop_price)` — deliberately
+carries no quantity anywhere, so it's unaffected by partial exits
+changing a position's size over its life (unlike, say, summing per-leg
+R's weighted by lot count). `initial_stop_price` comes from
+`Trade.risk_params`, the same JSONB blob P3's exit-side already writes.
+
+**`mfe`/`mae`** are computed from `position_marks.unrealized` at query
+time (`MAX`/`MIN` per trade), not written back onto `trades` by the
+engine — `position_marks`' own docstring already says it "powers MFE/
+MAE," this is that promise finally cashed in.
+
+### 11c. `kairodex/export/` — the bundle builder (12 tests, + live)
+
+Pydantic models (`export/models.py`) define every bundle file's shape
+once; `bundle.py` serializes real data *through* those same models (so
+what's written can never silently drift from what it claims to be) and
+`Model.model_json_schema()` supplies the "JSON Schema" the roadmap names
+— embedded in `manifest.json` rather than a hand-maintained parallel
+`.schema.json` file, which could say something different from what the
+code actually writes and nothing would catch it.
+
+`build_bundle` writes: `manifest.json` (schema_version, window, sha256 of
+every other file, `code_sha` via `git rev-parse HEAD`, which strategies
+actually signalled in the window, embedded schemas), `trades.jsonl`,
+`trade_events.jsonl` (the full per-trade event log, Principle 2's source
+of truth), `signals_rejected.jsonl`, `equity.csv` (raw snapshots),
+`performance.json` (overall + every breakdown + equity curve + daily
+rollup), `feature_dictionary.json` (every registered feature's own
+docstring as its description — reusing P2's existing documentation
+rather than writing a second copy that could disagree with the code),
+`data_quality.json` (gap rate, incomplete chain snapshots, quotes
+missing our own Greeks — all scoped to the segment and window, see
+§11e #3), `digest.md` (token-budgeted, meant to paste into a fresh Claude
+Code session), `README.md` (generated, names every known caveat — see
+the file itself for the full list, it's long enough that duplicating it
+here would drift).
+
+`kairodex/export/research_import.py` + `kairodex research import-notes`:
+the return half of the loop. A `FindingsImport` pydantic model validates
+a hand-authored `findings.json` (only `findings` itself is required) and
+writes a `research_notes` row.
+
+### 11d. Live verification — real bundles, real research_notes row, honest gap
+
+`kairodex analytics report --segment nse_index` / `nse_stock` / `us_stock`
+against the VM's real data: correct trade counts, `None` for win_rate/
+profit_factor (correctly — nothing's closed yet), real equity figures
+(`current=51527.75`, `max_drawdown=2.49%`), real weekday/session/expiry
+breakdowns. `kairodex export --segment nse_index --from 2026-08-01 --to
+2026-08-06` wrote a real bundle: 2 real trades, 36 real trade_events,
+1177 real rejected signals, 1002 real equity points, correct sha256 per
+file (spot-checked against `sha256sum` directly), correct `code_sha`,
+correct `strategy_versions`. `kairodex research import-notes` wrote a
+real `research_notes` row (`note_id=1`), confirmed via `psql`, including
+the least-privilege check from P3's own precedent: `kairodex_app` has
+exactly `INSERT/SELECT/UPDATE/DELETE` on the new table (the
+`app_role_separation` migration's `ALTER DEFAULT PRIVILEGES` covered it
+automatically, sequence included).
+
+**Honest gap, not fixed this session**: the exit criterion's "one month
+of shadow data" hasn't elapsed — the 3 real trades are still open (§11a),
+so `win_rate`/`profit_factor`/R-multiple/every breakdown's P&L column are
+all correctly `None`/zero rather than fabricated. The mechanism is fully
+built, tested, and live-verified against every kind of real data that
+currently exists (open trades, rejected signals, equity snapshots); what
+it hasn't been exercised against yet is a closed trade or a month of
+history. Revisit once real calendar time (and a closed trade or two) has
+passed — same honest-gap pattern as P3 §9d and P4 §10c/e.
+
+### 11e. Subagent review pass — 10 findings, all fixed (380 tests)
+
+Per the same "verify everything in detail with subagents" discipline as
+P3/P4, an independent subagent reviewed the full P5 diff — re-derived
+`r_multiple`/`profit_factor`/`win_rate`/`expectancy` by hand, traced
+`orchestrator.py`'s context_entry/context_exit wiring field-by-field
+against the live engine, executed real VM values through every formula,
+and cross-checked every "found and fixed" claim in this file against the
+actual current code. Two findings were **live-affecting bugs in the
+already-deployed shadow engine** (present since P3, only surfaced because
+P5 was the first thing to actually read the columns), the rest were in
+this session's own new code:
+
+1. **`trades.avg_exit` was `lot_size`x too large.** `run_exit_tick`
+   accumulated `cum_exit_value` in money (`price * qty * lot_size`) but
+   `cum_exit_qty` in bare lots, so `avg_exit = cum_exit_value /
+   cum_exit_qty` came out scaled by `lot_size` — silently correct-looking
+   (a plausible-sized number) but wrong, and every `r_multiple` computed
+   from it would have been nonsense the moment any of the 3 real open
+   trades closed. Fixed: divide by `cum_exit_qty * trade.lot_size`.
+2. **`trades.fees` was zeroed to exactly 0 on every full close.** The
+   per-leg P&L split reused `trade.fees` itself as a shrinking "remaining
+   entry fees to allocate across legs" figure — correct for that one
+   internal purpose, wrong for the column's actual meaning (total fees
+   paid), so a closed trade always reported `fees=0` regardless of what
+   was genuinely paid. Fixed: entry-fee allocation now tracks its own
+   `remaining_entry_fees` in `risk_params`; `trade.fees` is a pure
+   running total (entry fee, seeded at fill time, plus every exit's own
+   fee) that only ever grows.
+3. **`data_quality.json` wasn't scoped to the segment being exported** —
+   `chain_snapshots_total`/`incomplete` and `option_quotes_missing_own_
+   greeks` counted the *entire* database regardless of `--segment`, so an
+   `nse_stock` and a `us_stock` bundle for the same window reported
+   identical numbers. Fixed: `option_quotes` scoped via a real join to
+   `Instrument.segment` (set at ingest time for option legs); chain
+   snapshots scoped via "was this underlying ever a member of this
+   segment's watchlist" (an approximation, not point-in-time-exact —
+   documented in the bundle's own README). Re-verified live: an
+   `nse_index` bundle and a `us_stock` bundle for the same window now
+   report genuinely different numbers (6,274 vs. 17,414 chain snapshots).
+4. **`status.gap_rate`'s new `until` parameter was dead** — the commit
+   that added it said it was so `export/bundle.py` could reuse the
+   function instead of a second copy of the same query, but the bundle
+   code had its own duplicate query anyway. Fixed to actually call
+   `gap_rate(..., until=to)`.
+5. **`--to` on `export`/`analytics report` silently excluded the given
+   date** — both convert `--to` to midnight UTC and every loader filters
+   `< to`, so `--to <today>` dropped every trade/signal from today
+   entirely (the review caught this making all 3 real VM trades vanish
+   from its own test bundle). Fixed: both commands now treat `--to` as
+   inclusive (bump to midnight of the day after internally).
+6. **Two tests didn't test what their names claimed**, and `bundle.py`
+   (350+ lines) had zero tests. A "round trip" test never parsed JSON
+   back into a model; an "unaffected by size" R-multiple test had no
+   size parameter to vary. Fixed both for real, added
+   `tests/unit/export/test_bundle.py` covering every DB-free helper
+   (`_trade_export`, `_summary_export`, `_write_equity_csv`,
+   `_sha256_file`, `_feature_dictionary`).
+7. **A crashed re-export into the same bundle directory could leave a
+   stale `manifest.json`** next to freshly-rewritten content files (the
+   directory name is deterministic — `bundle_<segment>_<from>_<to>` — so
+   re-running into it is the normal case, not an edge case). Fixed:
+   delete any existing `manifest.json` before writing anything new, so a
+   partial bundle has no manifest instead of a wrong one.
+8. **`breakdowns._session_bucket`'s US window was fixed EDT-only UTC**
+   (13:30-20:00) — under EST (~Nov-Mar) the real session is 14:30-21:00
+   UTC, so the fixed window silently dropped real closing-half-hour
+   trades from the breakdown entirely (`frac > 1`) and shifted the rest
+   by nearly a full third-of-session bucket. Fixed with stdlib
+   `zoneinfo` (`America/New_York`, real DST-aware local time — no new
+   dependency, Python 3.12 stdlib); NSE is unchanged (fixed IST offset,
+   genuinely no DST to account for). Two regression tests added, one per
+   DST side of the year.
+9. Minor, all fixed: `win_rate`'s denominator counted closed-but-`NULL`-
+   `net_pnl` trades while `expectancy`/`avg_win`/`avg_loss` silently
+   didn't (now consistent); the `"30d+"` expiry bucket label actually
+   meant `dte >= 31` (relabeled `"31d+"`); `expectancy` left Decimal's
+   ~28-digit division noise in `performance.json` (now quantized to
+   money precision, `numeric(18,4)`'s own convention); `manifest.
+   strategy_versions` listed every `Strategy` row for the segment rather
+   than ones that actually signalled in the window (now scoped via
+   `Signal.strategy_id`); `avg_holding_secs` could return an `int`
+   despite its `float | None` annotation (now always `float`).
+10. Documented rather than changed (architecturally defensible choices,
+    not bugs): `trades.jsonl` is scoped by `opened_at` while `equity.csv`
+    is scoped by snapshot `ts`, so a trade spanning the window boundary
+    can appear in one and not the other; `context_entry.underlying_px`
+    (1-minute bar close, what the engine actually acted on) and
+    `context_exit.underlying_px` (the exit quote's own vendor spot) come
+    from deliberately different sources; `equity_rollup_daily`'s
+    `max_drawdown_pct`/`return_pct` are whole-account/period-boundary
+    figures, not reset-per-day. All spelled out in the bundle's own
+    `README.md` rather than silently assumed.
+
+All 10 fixes re-verified live on the VM after redeploying: all 4 engine
+services restarted clean (no errors in logs), a fresh export shows
+`data_quality.json` now correctly differing between segments, `--to`
+inclusive confirmed (`window_to` in the manifest is one day past the
+given `--to`, and the 2 real trades stayed present). 380 tests passing
+(was 370), ruff/mypy clean, locally and on the VM.
+
+### 11f. Known gaps, not fixed this session (deliberate, not overlooked)
+
+- **The exit criterion's "one month of data, findings imported back"**
+  hasn't happened for real yet — see §11d. The mechanism is built and
+  live-verified against every kind of data that currently exists;
+  revisit once real calendar time has passed and at least one trade has
+  closed.
+- **`chain_snapshots_total`/`incomplete` scoping by watchlist membership
+  is an approximation**, not point-in-time-exact the way
+  `watchlist_membership` itself is (a symbol that changed segments or was
+  added/removed from the watchlist is scoped by its full membership
+  history). Documented in the bundle's README; revisit if this ever needs
+  to be exact.
+- **`ChainSnapshot.complete` is `False` for every row ever recorded**
+  since P0/P1 (`expected_count` is never populated by any vendor client)
+  — not a P5 bug, a pre-existing characteristic P5's `data_quality.json`
+  is simply the first thing to ever report on numerically. Documented in
+  the bundle's README; nothing downstream depends on this column being
+  meaningful today.
