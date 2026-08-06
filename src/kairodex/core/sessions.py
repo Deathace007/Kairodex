@@ -63,6 +63,21 @@ def is_session_open_now(market: Market, now: datetime.datetime) -> bool:
     """Is `now` (any tz-aware instant) inside the market's regular
     session, today in the market's own local date. Used both to gate
     live trading (`risk.loader.is_session_open`'s fallback) and to
-    bucket a past trade's entry time (`analytics.breakdowns`)."""
-    open_dt, close_dt = session_window_utc(market, local_date_for(market, now))
+    bucket a past trade's entry time (`analytics.breakdowns`).
+
+    Weekends are closed for both markets. This is deliberately NOT the
+    "no holiday calendar" gap in this module's own docstring — a holiday
+    is an irregular exception needing real exchange data, whereas
+    Saturday and Sunday are the regular weekly schedule and need no feed
+    to know. Without this the time-of-day check alone answered True at
+    e.g. 09:15 IST on a Saturday, so the engine would have evaluated and
+    logged signals against a shut exchange all weekend.
+
+    The weekday is taken on the *market's* local date, not UTC's: at
+    2026-08-08 00:30 IST it is already Saturday in Mumbai while still
+    Friday in UTC, and NSE's schedule follows Mumbai."""
+    local_date = local_date_for(market, now)
+    if local_date.weekday() >= 5:  # 5=Saturday, 6=Sunday
+        return False
+    open_dt, close_dt = session_window_utc(market, local_date)
     return open_dt <= now <= close_dt

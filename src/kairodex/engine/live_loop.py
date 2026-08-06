@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from kairodex.config.segments import get_segment_config
 from kairodex.core.clock import LiveClock
 from kairodex.core.enums import Market, Segment, StrategyStatus
+from kairodex.core.sessions import is_session_open_now
 from kairodex.data.recorder import watchlist_instruments
 from kairodex.engine.orchestrator import run_entry_tick, run_exit_tick
 from kairodex.execution.costs import compute_nse_costs, compute_us_costs
@@ -35,6 +36,12 @@ from kairodex.streaming.types import StreamMessage
 logger = logging.getLogger(__name__)
 
 EVAL_INTERVAL = datetime.timedelta(seconds=60)
+# How long to idle between checks while this segment's market is closed.
+# Nothing can change in between: no new quotes arrive, so no signal could
+# score differently and no exit could fill (the fill model rejects on
+# STALE_QUOTE anyway). Same reasoning, and the same shared
+# `core.sessions` window, as the recorder's own closed-market idle.
+CLOSED_MARKET_INTERVAL = datetime.timedelta(minutes=5)
 
 
 async def _ensure_strategy_row(
@@ -73,8 +80,37 @@ async def run_segment(segment: Segment, *, shadow: bool = True) -> None:
         strategy_row_id,
     )
 
+    market_was_open: bool | None = None
     while True:
         now = clock.now()
+
+        # Evaluate nothing at all while this segment's market is closed.
+        # `session_window_gate` already *rejects* such entries, but it runs
+        # as a risk gate — i.e. after the whole tick has computed features,
+        # scored a signal, and written a `signals` row. Live 2026-08-06 that
+        # produced 21,791 OUTSIDE_SESSION_WINDOW rows (~49% of every signal
+        # ever recorded), which is not merely wasted work: ARCHITECTURE.md
+        # §11 keeps rejections as training data, and a rejection that only
+        # means "the exchange was shut" teaches nothing while crowding out
+        # real ones — including on the dashboard's own opportunities feed,
+        # which is where a user noticed NSE names at 23:57 IST.
+        #
+        # The gate stays in the chain as defence in depth (backtest replay
+        # drives a different clock through the same gates, and it is the
+        # backstop if this loop check is ever bypassed) — this just stops
+        # the engine from doing the work to reach it.
+        if not is_session_open_now(segment.market, now):
+            if market_was_open is not False:
+                logger.info(
+                    "%s: market closed — idling until the next session", segment.value
+                )
+                market_was_open = False
+            await asyncio.sleep(CLOSED_MARKET_INTERVAL.total_seconds())
+            continue
+        if market_was_open is not True:
+            logger.info("%s: market open — evaluating", segment.value)
+            market_was_open = True
+
         async with sessionmaker() as session:
             underlyings = await watchlist_instruments(session, segment)
             if not underlyings:
