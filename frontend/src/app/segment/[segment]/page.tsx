@@ -7,6 +7,7 @@ import { StatTile } from "@/components/ui/StatTile";
 import { Badge, breakerStatus, pnlColor } from "@/components/ui/Badge";
 import { EquityChart } from "@/components/EquityChart";
 import { RecentActivity } from "@/components/RecentActivity";
+import { IS_STATIC_EXPORT } from "@/lib/renderMode";
 import {
   SEGMENTS,
   SEGMENT_LABEL,
@@ -19,10 +20,13 @@ import {
   type RiskSummary,
 } from "@/lib/types";
 
-// force-dynamic (see lib/api.ts) — positions/marks/risk change on the
-// engine's own 60s tick cadence; a page that only refreshes at build
-// time or on a cache-revalidate window is the wrong trade here.
-export const dynamic = "force-dynamic";
+// The static export needs every `[segment]` value enumerated up front
+// (no server to resolve an arbitrary one at request time); the live
+// server build doesn't use this — its pages render dynamically per
+// request anyway (lib/api.ts's `cache: "no-store"` fetches).
+export const generateStaticParams = IS_STATIC_EXPORT
+  ? () => SEGMENTS.map((segment) => ({ segment }))
+  : undefined;
 
 export default async function SegmentPage(props: PageProps<"/segment/[segment]">) {
   const { segment: raw } = await props.params;

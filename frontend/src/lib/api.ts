@@ -17,14 +17,26 @@ export class ApiError extends Error {
   }
 }
 
-// `cache: "no-store"` — this is a live trading dashboard, not a blog;
-// serving up-to-10s-stale positions/marks from Next's data cache is the
-// wrong trade for a single-user internal tool that already pays no real
-// traffic cost for a fresh fetch on every load (the API is a localhost
-// hop away). Every page using this also sets `export const dynamic =
-// "force-dynamic"` so the *page* itself isn't statically cached either.
+// `cache: "no-store"` on the VM's own live server build — this is a live
+// trading dashboard, not a blog; serving stale positions/marks from
+// Next's data cache is the wrong trade for a single-user internal tool
+// that already pays no real traffic cost for a fresh fetch on every load
+// (the API is a localhost hop away). A `no-store` fetch is itself what
+// makes Next.js render the whole page dynamically, per request — no
+// separate `export const dynamic` needed (that flag has to be a literal
+// string Next's build-time analyzer can read, so it can't be toggled
+// from here anyway).
+//
+// The Surge static export (`NEXT_OUTPUT_MODE=export`, see
+// next.config.ts) can't do per-request anything — no server exists once
+// the files are just sitting on Surge — so it fetches once, at build
+// time, cached normally (Next's default), and bakes the result into the
+// static HTML instead.
+const FETCH_CACHE: RequestCache | undefined =
+  process.env.NEXT_OUTPUT_MODE === "export" ? undefined : "no-store";
+
 export async function apiGet<T>(path: string): Promise<T> {
-  const res = await fetch(`${API_BASE}/api${path}`, { cache: "no-store" });
+  const res = await fetch(`${API_BASE}/api${path}`, { cache: FETCH_CACHE });
   if (!res.ok) {
     throw new ApiError(res.status, `GET ${path} -> ${res.status}`);
   }

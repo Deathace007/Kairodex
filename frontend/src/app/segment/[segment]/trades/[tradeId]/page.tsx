@@ -3,7 +3,8 @@ import { notFound } from "next/navigation";
 import { apiGetSafe } from "@/lib/api";
 import { fmtMoney, fmtNum, fmtTs } from "@/lib/format";
 import { Card } from "@/components/ui/Card";
-import { SEGMENTS, SEGMENT_LABEL, type Decimal, type Segment } from "@/lib/types";
+import { IS_STATIC_EXPORT } from "@/lib/renderMode";
+import { SEGMENTS, SEGMENT_LABEL, type Decimal, type Segment, type TradesPage } from "@/lib/types";
 
 interface TradeEvent {
   seq: number;
@@ -46,9 +47,32 @@ interface TradeDetail {
 }
 
 // ARCHITECTURE.md §15's drill-down endpoint — "full event timeline +
-// chart_ref." force-dynamic (see lib/api.ts) — a trade's event timeline
-// changes with every fill/partial exit, never pre-render this stale.
-export const dynamic = "force-dynamic";
+// chart_ref." Static export can't resolve an arbitrary trade_id at request time (no
+// server), so every trade currently on record gets its own pre-rendered
+// page — refreshed by the periodic rebuild+redeploy timer along with
+// everything else (docs/PROGRESS.md §12f). Cheap: this build already
+// runs against the real API on the VM.
+export const generateStaticParams = IS_STATIC_EXPORT
+  ? async () => {
+      const params: { segment: string; tradeId: string }[] = [];
+      for (const segment of SEGMENTS) {
+        const page = await apiGetSafe<TradesPage>(
+          `/segments/${segment}/trades?page_size=200`,
+        );
+        for (const t of page?.trades ?? []) {
+          params.push({ segment, tradeId: String(t.trade_id) });
+        }
+      }
+      // `output: "export"` hard-fails a dynamic-segment route with zero
+      // generated params ("at least one route must be generated") — a
+      // real possible state here (no trade taken yet, or the API simply
+      // unreachable during a local/CI build with no backend). One
+      // placeholder that resolves to a real 404 page keeps the export
+      // buildable either way; it's overwritten with real params the
+      // moment any trade exists.
+      return params.length > 0 ? params : [{ segment: "nse_stock", tradeId: "0" }];
+    }
+  : undefined;
 
 export default async function TradeDetailPage(
   props: PageProps<"/segment/[segment]/trades/[tradeId]">,
