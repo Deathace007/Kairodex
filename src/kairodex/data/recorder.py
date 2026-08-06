@@ -150,6 +150,15 @@ async def recover_underlying_bars(
             continue
         try:
             bars = await client.bars(vendor_key, Timeframe.ONE_MIN, start, today)
+        except RateLimitError as e:
+            # Same account-level fact as in t1_poll_loop: pushing on would
+            # spend one doomed call per remaining underlying on every
+            # restart, and a crash-looping unit turns that into thousands.
+            # Backfill is resumable by design (it re-derives `start` from
+            # the last stored bar), so abandoning the pass costs nothing
+            # the next healthy startup won't pick up.
+            logger.warning("%s quota exhausted — skipping bar backfill: %s", provider, e)
+            return
         except Exception:
             logger.exception("restart-recovery bar backfill failed for %s", u.symbol)
             continue
