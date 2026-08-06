@@ -17,8 +17,14 @@ export class ApiError extends Error {
   }
 }
 
-export async function apiGet<T>(path: string, revalidateSecs = 10): Promise<T> {
-  const res = await fetch(`${API_BASE}/api${path}`, { next: { revalidate: revalidateSecs } });
+// `cache: "no-store"` — this is a live trading dashboard, not a blog;
+// serving up-to-10s-stale positions/marks from Next's data cache is the
+// wrong trade for a single-user internal tool that already pays no real
+// traffic cost for a fresh fetch on every load (the API is a localhost
+// hop away). Every page using this also sets `export const dynamic =
+// "force-dynamic"` so the *page* itself isn't statically cached either.
+export async function apiGet<T>(path: string): Promise<T> {
+  const res = await fetch(`${API_BASE}/api${path}`, { cache: "no-store" });
   if (!res.ok) {
     throw new ApiError(res.status, `GET ${path} -> ${res.status}`);
   }
@@ -41,9 +47,9 @@ export async function apiPost<T>(path: string, body: unknown): Promise<T> {
 
 /** Same shape everywhere a fetch might fail — used to render "data
  * unavailable" instead of crashing a whole dashboard over one panel. */
-export async function apiGetSafe<T>(path: string, revalidateSecs = 10): Promise<T | null> {
+export async function apiGetSafe<T>(path: string): Promise<T | null> {
   try {
-    return await apiGet<T>(path, revalidateSecs);
+    return await apiGet<T>(path);
   } catch {
     return null;
   }

@@ -8,6 +8,9 @@ import { SEGMENT_LABEL } from "@/lib/types";
 import type { MasterOverview, FeedHealthRow, StrategyRow } from "@/lib/types";
 import Link from "next/link";
 
+// force-dynamic (see lib/api.ts) — same reasoning as the segment page.
+export const dynamic = "force-dynamic";
+
 export default async function MasterPage() {
   const [overview, feeds, strategies] = await Promise.all([
     apiGetSafe<MasterOverview>("/master/overview"),

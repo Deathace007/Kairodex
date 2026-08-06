@@ -19,9 +19,10 @@ import {
   type RiskSummary,
 } from "@/lib/types";
 
-export function generateStaticParams() {
-  return SEGMENTS.map((segment) => ({ segment }));
-}
+// force-dynamic (see lib/api.ts) — positions/marks/risk change on the
+// engine's own 60s tick cadence; a page that only refreshes at build
+// time or on a cache-revalidate window is the wrong trade here.
+export const dynamic = "force-dynamic";
 
 export default async function SegmentPage(props: PageProps<"/segment/[segment]">) {
   const { segment: raw } = await props.params;

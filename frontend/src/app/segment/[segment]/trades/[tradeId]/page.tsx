@@ -40,12 +40,9 @@ interface TradeDetail {
 }
 
 // ARCHITECTURE.md §15's drill-down endpoint — "full event timeline +
-// chart_ref." Static-generation-friendly params (same pattern as the
-// segment page); the trade_id itself is unbounded, so this route stays
-// dynamic beyond the segment prefix.
-export function generateStaticParams() {
-  return SEGMENTS.map((segment) => ({ segment }));
-}
+// chart_ref." force-dynamic (see lib/api.ts) — a trade's event timeline
+// changes with every fill/partial exit, never pre-render this stale.
+export const dynamic = "force-dynamic";
 
 export default async function TradeDetailPage(
   props: PageProps<"/segment/[segment]/trades/[tradeId]">,
@@ -54,10 +51,7 @@ export default async function TradeDetailPage(
   if (!SEGMENTS.includes(raw as Segment)) notFound();
   const segment = raw as Segment;
 
-  const detail = await apiGetSafe<TradeDetail>(
-    `/segments/${segment}/trades/${tradeId}`,
-    5,
-  );
+  const detail = await apiGetSafe<TradeDetail>(`/segments/${segment}/trades/${tradeId}`);
   if (!detail) notFound();
 
   const t = detail.trade;
