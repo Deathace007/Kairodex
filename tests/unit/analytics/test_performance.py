@@ -16,6 +16,7 @@ def _trade(
     avg_entry: Decimal = Decimal(100),
     avg_exit: Decimal | None = Decimal(110),
     initial_stop_price: Decimal | None = Decimal(90),
+    profit_target: Decimal | None = Decimal(120),
     holding_secs: int | None = 3600,
     fees: Decimal | None = Decimal(5),
 ) -> TradeRecord:
@@ -33,6 +34,7 @@ def _trade(
         avg_entry=avg_entry,
         avg_exit=avg_exit if closed else None,
         initial_stop_price=initial_stop_price,
+        profit_target=profit_target,
         gross_pnl=gross_pnl if gross_pnl is not None else net_pnl,
         net_pnl=net_pnl,
         fees=fees,

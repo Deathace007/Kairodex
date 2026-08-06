@@ -112,7 +112,13 @@ async def segment_positions(
                 }
                 if quote
                 else None,
+                # Current (possibly-ratcheted) stop — monitor.py's
+                # trailing-stop logic can move this up over the trade's
+                # life, so it's read fresh off risk_params each time, not
+                # the entry-time initial_stop_price analytics.TradeRecord
+                # carries for R-multiple math.
                 "stop_price": (t.risk_params or {}).get("stop_price"),
+                "profit_target": (t.risk_params or {}).get("profit_target"),
                 "risk_params": t.risk_params,
             }
         )
@@ -233,8 +239,9 @@ async def segment_trade_detail(
     # Same formula as analytics.types.TradeRecord.r_multiple — computed
     # inline here since this endpoint builds its "trade" dict directly
     # from the ORM row rather than through analytics.loader.load_trades.
+    risk_params = trade.risk_params or {}
     r_multiple = None
-    initial_stop_raw = (trade.risk_params or {}).get("initial_stop_price")
+    initial_stop_raw = risk_params.get("initial_stop_price")
     if trade.avg_exit is not None and initial_stop_raw is not None:
         risk = trade.avg_entry - Decimal(str(initial_stop_raw))
         if risk != 0:
@@ -256,6 +263,12 @@ async def segment_trade_detail(
             "net_pnl": trade.net_pnl,
             "fees": trade.fees,
             "r_multiple": r_multiple,
+            "initial_stop_price": initial_stop_raw,
+            # Current (possibly-ratcheted) stop, same distinction
+            # /positions draws — None once closed (risk_params isn't
+            # updated with a final stop_price on close).
+            "stop_price": risk_params.get("stop_price"),
+            "profit_target": risk_params.get("profit_target"),
             "holding_secs": trade.holding_secs,
             "exit_reason": trade.exit_reason,
             "risk_params": trade.risk_params,

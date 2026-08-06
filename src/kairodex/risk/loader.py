@@ -14,6 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from kairodex.core.enums import Market, Segment
+from kairodex.core.sessions import is_session_open_now
 from kairodex.risk.types import AccountState
 from kairodex.store.models import (
     EquitySnapshot,
@@ -30,16 +31,23 @@ _LIVE_RUN_ID = 0  # EquitySnapshot's sentinel for "live paper book" — see its 
 async def is_session_open(
     session: AsyncSession, market: Market, now: datetime.datetime
 ) -> bool:
-    """Checks `trading_calendar` first; falls back to an approximate,
-    DST-naive hardcoded window when no row exists for today — a real
-    vendor holiday/session-hours sync (ARCHITECTURE.md §6) hasn't been
-    built yet (same gap `kairodex.risk.gates.session_window_gate`'s own
-    docstring names). This fallback exists so live verification during
-    actual market hours is possible at all before that sync exists;
-    `trading_calendar` data always wins once it's populated.
-    ponytail: ignores exchange holidays and DST entirely — ok for "is a
-    signal roughly plausible right now" during interactive verification,
-    not a substitute for the real calendar.
+    """Checks `trading_calendar` first; falls back to `core.sessions`'
+    approximate, holiday-naive window when no row exists for today — a
+    real vendor holiday/session-hours sync (ARCHITECTURE.md §6) hasn't
+    been built yet (same gap `kairodex.risk.gates.session_window_gate`'s
+    own docstring names). This fallback exists so live verification
+    during actual market hours is possible at all before that sync
+    exists; `trading_calendar` data always wins once it's populated.
+
+    The fallback used to carry its own hardcoded, DST-naive UTC window
+    here — found and fixed while answering a question about it: a P6
+    subagent review had already fixed the *other* copy of this same
+    approximation (`kairodex.analytics.breakdowns`) to be DST-aware, but
+    this one, the one that actually gates live trading, still had the
+    stale fixed window (correct in EDT, an hour off in EST) and a
+    comment with the EST/EDT labeling backwards. Both now share
+    `core.sessions.is_session_open_now`, so a fix can't land in one copy
+    and miss the other again.
     """
     exchange = "NSE" if market is Market.NSE else "US"
     today = now.date()
@@ -52,12 +60,7 @@ async def is_session_open(
             return False
         return calendar_row.open_utc <= now <= calendar_row.close_utc  # type: ignore[operator]
 
-    if market is Market.NSE:  # 9:15-15:30 IST = 3:45-10:00 UTC, no DST
-        open_t, close_t = datetime.time(3, 45), datetime.time(10, 0)
-    else:  # US: 9:30-16:00 ET, approximated as 13:30-20:00 UTC (EST; off by 1h in EDT)
-        open_t, close_t = datetime.time(13, 30), datetime.time(20, 0)
-    now_t = now.timetz().replace(tzinfo=None)
-    return open_t <= now_t <= close_t
+    return is_session_open_now(market, now)
 
 
 async def build_account_state(

@@ -33,6 +33,8 @@ class TradeExport(BaseModel):
     closed_at: datetime.datetime | None
     avg_entry: Decimal
     avg_exit: Decimal | None
+    initial_stop_price: Decimal | None
+    profit_target: Decimal | None
     gross_pnl: Decimal | None
     net_pnl: Decimal | None
     fees: Decimal | None

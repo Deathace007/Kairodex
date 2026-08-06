@@ -25,6 +25,16 @@ class TradeRecord:
     §5.4/`core.enums.Side`'s own docstring — so this ratio's sign is always
     meaningful the same way).
 
+    `profit_target` comes from the same `risk_params` blob (`Trade.
+    risk_params["profit_target"]`, `_DEFAULT_PROFIT_TARGET_PCT` in
+    `engine.orchestrator`) — the take-profit level set at fill time, for
+    display (dashboards showing "what SL/TP was this trade opened with").
+    Unlike `initial_stop_price`, the live stop can ratchet up over a
+    trade's life (`monitor.py`'s trailing-stop logic) — this is always
+    the *entry-time* value, never the current one; the open-positions API
+    endpoint reads the current (possibly-ratcheted) stop separately,
+    straight off `risk_params["stop_price"]`, for exactly that reason.
+
     `mfe`/`mae` are the best/worst *unrealized* P&L (currency units) ever
     marked for this trade, from `position_marks.unrealized` — the column's
     own docstring says it "powers MFE/MAE," computed here at query time
@@ -46,6 +56,7 @@ class TradeRecord:
     avg_entry: Decimal
     avg_exit: Decimal | None
     initial_stop_price: Decimal | None
+    profit_target: Decimal | None
     gross_pnl: Decimal | None
     net_pnl: Decimal | None
     fees: Decimal | None

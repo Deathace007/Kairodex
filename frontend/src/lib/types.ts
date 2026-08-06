@@ -74,7 +74,10 @@ export interface Position {
     theta: Decimal | null;
     vega: Decimal | null;
   } | null;
-  stop_price: string | null;
+  // Current (possibly-ratcheted) stop — monitor.py's trailing-stop logic
+  // can move this up over the trade's life.
+  stop_price: Decimal | null;
+  profit_target: Decimal | null;
 }
 
 export interface Opportunity {
@@ -102,6 +105,8 @@ export interface TradeRow {
   closed_at: string | null;
   avg_entry: Decimal;
   avg_exit: Decimal | null;
+  initial_stop_price: Decimal | null;
+  profit_target: Decimal | null;
   gross_pnl: Decimal | null;
   net_pnl: Decimal | null;
   fees: Decimal | null;

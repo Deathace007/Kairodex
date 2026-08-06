@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { apiGetSafe } from "@/lib/api";
-import { fmtMoney, fmtNum, fmtTs } from "@/lib/format";
+import { fmtMoney, fmtNum, fmtTsIST } from "@/lib/format";
 import { Card } from "@/components/ui/Card";
 import { IS_STATIC_EXPORT } from "@/lib/renderMode";
 import { SEGMENTS, SEGMENT_LABEL, type Decimal, type Segment, type TradesPage } from "@/lib/types";
@@ -30,6 +30,10 @@ interface TradeDetail {
     lot_size: number;
     avg_entry: Decimal;
     avg_exit: Decimal | null;
+    initial_stop_price: Decimal | null;
+    // Current (possibly-ratcheted) stop — None once the trade is closed.
+    stop_price: Decimal | null;
+    profit_target: Decimal | null;
     gross_pnl: Decimal | null;
     net_pnl: Decimal | null;
     fees: Decimal | null;
@@ -100,11 +104,16 @@ export default async function TradeDetailPage(
       <Card title="Summary">
         <dl className="grid grid-cols-2 gap-3 text-sm md:grid-cols-3">
           <Field label="Underlying" value={t.underlying_symbol ?? "—"} />
-          <Field label="Opened" value={fmtTs(t.opened_at)} />
-          <Field label="Closed" value={t.closed_at ? fmtTs(t.closed_at) : "open"} />
+          <Field label="Entered (IST)" value={fmtTsIST(t.opened_at)} />
+          <Field label="Closed (IST)" value={t.closed_at ? fmtTsIST(t.closed_at) : "open"} />
           <Field label="Qty (lots)" value={String(t.qty_lots)} />
           <Field label="Avg entry" value={fmtNum(t.avg_entry)} />
           <Field label="Avg exit" value={fmtNum(t.avg_exit)} />
+          <Field
+            label="Stop"
+            value={fmtNum(t.stop_price ?? t.initial_stop_price)}
+          />
+          <Field label="Target" value={fmtNum(t.profit_target)} />
           <Field label="Gross P&L" value={fmtMoney(t.gross_pnl)} />
           <Field label="Net P&L" value={fmtMoney(t.net_pnl)} />
           <Field label="Fees" value={fmtMoney(t.fees)} />
@@ -141,7 +150,7 @@ export default async function TradeDetailPage(
               <li key={e.seq} className="border-l-2 pl-3" style={{ borderColor: "var(--series-1)" }}>
                 <div className="flex items-center gap-2">
                   <span className="font-medium">{e.event_type}</span>
-                  <span style={{ color: "var(--text-muted)" }}>{fmtTs(e.ts)}</span>
+                  <span style={{ color: "var(--text-muted)" }}>{fmtTsIST(e.ts)}</span>
                 </div>
                 <pre className="mt-1 overflow-x-auto text-xs" style={{ color: "var(--text-secondary)" }}>
                   {JSON.stringify(e.payload, null, 2)}

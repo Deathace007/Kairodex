@@ -32,6 +32,7 @@ def _trade(
         avg_entry=Decimal(10),
         avg_exit=Decimal(11),
         initial_stop_price=Decimal(9),
+        profit_target=Decimal(12),
         gross_pnl=net_pnl,
         net_pnl=net_pnl,
         fees=Decimal(1),

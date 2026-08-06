@@ -78,6 +78,8 @@ def trade_export(t: TradeRecord) -> em.TradeExport:
         closed_at=t.closed_at,
         avg_entry=t.avg_entry,
         avg_exit=t.avg_exit,
+        initial_stop_price=t.initial_stop_price,
+        profit_target=t.profit_target,
         gross_pnl=t.gross_pnl,
         net_pnl=t.net_pnl,
         fees=t.fees,

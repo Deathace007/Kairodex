@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { apiGetSafe } from "@/lib/api";
-import { fmtMoney, fmtPct, fmtNum, fmtTs } from "@/lib/format";
+import { fmtMoney, fmtPct, fmtNum, fmtTs, fmtTsIST } from "@/lib/format";
 import { Card } from "@/components/ui/Card";
 import { StatTile } from "@/components/ui/StatTile";
 import { Badge, breakerStatus, pnlColor } from "@/components/ui/Badge";
@@ -93,6 +93,7 @@ export default async function SegmentPage(props: PageProps<"/segment/[segment]">
               <thead>
                 <tr style={{ color: "var(--text-muted)" }} className="text-left">
                   <th className="pb-2 font-normal">Instrument</th>
+                  <th className="pb-2 font-normal">Entered (IST)</th>
                   <th className="pb-2 font-normal">Qty</th>
                   <th className="pb-2 font-normal">Entry</th>
                   <th className="pb-2 font-normal">Mark</th>
@@ -100,12 +101,16 @@ export default async function SegmentPage(props: PageProps<"/segment/[segment]">
                   <th className="pb-2 font-normal">IV</th>
                   <th className="pb-2 font-normal">Delta</th>
                   <th className="pb-2 font-normal">Stop</th>
+                  <th className="pb-2 font-normal">Target</th>
                 </tr>
               </thead>
               <tbody>
                 {positions.map((p) => (
                   <tr key={p.trade_id} className="border-t" style={{ borderColor: "var(--border)" }}>
                     <td className="py-1.5">{p.instrument_symbol}</td>
+                    <td className="py-1.5 whitespace-nowrap" style={{ color: "var(--text-secondary)" }}>
+                      {fmtTsIST(p.opened_at)}
+                    </td>
                     <td className="py-1.5">{p.qty_lots}</td>
                     <td className="py-1.5">{fmtNum(p.avg_entry)}</td>
                     <td className="py-1.5">{fmtNum(p.mark)}</td>
@@ -116,7 +121,12 @@ export default async function SegmentPage(props: PageProps<"/segment/[segment]">
                     </td>
                     <td className="py-1.5">{fmtNum(p.greeks?.iv)}</td>
                     <td className="py-1.5">{fmtNum(p.greeks?.delta)}</td>
-                    <td className="py-1.5" style={{ color: "var(--text-secondary)" }}>{p.stop_price ?? "—"}</td>
+                    <td className="py-1.5" style={{ color: "var(--text-secondary)" }}>
+                      {fmtNum(p.stop_price)}
+                    </td>
+                    <td className="py-1.5" style={{ color: "var(--text-secondary)" }}>
+                      {fmtNum(p.profit_target)}
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -172,7 +182,9 @@ export default async function SegmentPage(props: PageProps<"/segment/[segment]">
                 <thead>
                   <tr style={{ color: "var(--text-muted)" }} className="text-left">
                     <th className="pb-2 font-normal">Instrument</th>
-                    <th className="pb-2 font-normal">Opened</th>
+                    <th className="pb-2 font-normal">Entered (IST)</th>
+                    <th className="pb-2 font-normal">Stop</th>
+                    <th className="pb-2 font-normal">Target</th>
                     <th className="pb-2 font-normal">Net P&L</th>
                     <th className="pb-2 font-normal">R</th>
                   </tr>
@@ -185,7 +197,15 @@ export default async function SegmentPage(props: PageProps<"/segment/[segment]">
                           {t.instrument_symbol}
                         </Link>
                       </td>
-                      <td className="py-1.5" style={{ color: "var(--text-muted)" }}>{fmtTs(t.opened_at)}</td>
+                      <td className="py-1.5 whitespace-nowrap" style={{ color: "var(--text-muted)" }}>
+                        {fmtTsIST(t.opened_at)}
+                      </td>
+                      <td className="py-1.5" style={{ color: "var(--text-secondary)" }}>
+                        {fmtNum(t.initial_stop_price)}
+                      </td>
+                      <td className="py-1.5" style={{ color: "var(--text-secondary)" }}>
+                        {fmtNum(t.profit_target)}
+                      </td>
                       <td className="py-1.5">
                         <span style={{ color: pnlColor(t.net_pnl) }}>
                           {fmtMoney(t.net_pnl)}

@@ -24,7 +24,8 @@ def _trade() -> TradeRecord:
         underlying_symbol="BANKNIFTY", instrument_symbol="BANKNIFTY 58400.0 C 2026-08-25",
         option_type="C", strike=Decimal("58400.0000"), expiry=datetime.date(2026, 8, 25),
         opened_at=_TS, closed_at=None, avg_entry=Decimal("461.3700"), avg_exit=None,
-        initial_stop_price=Decimal("323.1750"), gross_pnl=None, net_pnl=None,
+        initial_stop_price=Decimal("323.1750"), profit_target=Decimal("922.7400"),
+        gross_pnl=None, net_pnl=None,
         fees=Decimal("0.3683"), holding_secs=None, exit_reason=None,
         context_entry={"underlying_px": 58200.0, "vol_regime": 1.1, "trend_state_strength": 0.01},
         mfe=Decimal("1683.25"), mae=Decimal("-160.50"),
@@ -39,6 +40,8 @@ def test_trade_export_maps_every_field():
     assert exported.underlying_symbol == "BANKNIFTY"
     assert exported.strike == t.strike
     assert exported.context_entry == t.context_entry
+    assert exported.initial_stop_price == t.initial_stop_price
+    assert exported.profit_target == t.profit_target
     assert exported.r_multiple is None  # unclosed trade
 
 

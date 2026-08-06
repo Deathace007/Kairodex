@@ -76,6 +76,8 @@ async def load_trades(
         risk_params = trade.risk_params or {}
         stop_raw = risk_params.get("initial_stop_price")
         initial_stop = Decimal(str(stop_raw)) if stop_raw is not None else None
+        target_raw = risk_params.get("profit_target")
+        profit_target = Decimal(str(target_raw)) if target_raw is not None else None
         mfe, mae = mfe_mae.get(trade.trade_id, (None, None))
         out.append(
             TradeRecord(
@@ -92,6 +94,7 @@ async def load_trades(
                 avg_entry=trade.avg_entry,
                 avg_exit=trade.avg_exit,
                 initial_stop_price=initial_stop,
+                profit_target=profit_target,
                 gross_pnl=trade.gross_pnl,
                 net_pnl=trade.net_pnl,
                 fees=trade.fees,

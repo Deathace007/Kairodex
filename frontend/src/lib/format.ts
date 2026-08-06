@@ -52,3 +52,24 @@ export function fmtTs(iso: string | null | undefined): string {
     minute: "2-digit",
   });
 }
+
+/** Position/trade entry & exit times, always in IST regardless of the
+ * viewer's own browser timezone or which market (NSE/US) the trade is
+ * in — a single user's own reference timezone, not "whatever locale the
+ * browser happens to report." kairodex.api sends real UTC ISO
+ * timestamps (`opened_at`/`closed_at`); `timeZone: "Asia/Kolkata"` does
+ * the conversion, same IST offset `kairodex.core.sessions` uses on the
+ * backend. */
+export function fmtTsIST(iso: string | null | undefined): string {
+  if (!iso) return "—";
+  const formatted = new Date(iso).toLocaleString("en-IN", {
+    timeZone: "Asia/Kolkata",
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: true,
+  });
+  return `${formatted} IST`;
+}
