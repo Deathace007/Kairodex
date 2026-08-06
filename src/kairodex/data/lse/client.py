@@ -37,7 +37,7 @@ from typing import Any
 from lse import LSE, LSEError, OptionTick
 
 from kairodex.core.enums import InstrumentKind
-from kairodex.core.errors import AuthError, VendorError
+from kairodex.core.errors import AuthError, RateLimitError, VendorError
 from kairodex.data.normalize import to_decimal, to_utc
 from kairodex.data.types import (
     Bar,
@@ -60,6 +60,24 @@ class LSEClient:
 
     async def aclose(self) -> None:
         await asyncio.to_thread(self._client.disconnect)
+
+    @staticmethod
+    def _wrap(e: LSEError, what: str) -> VendorError:
+        """LSE signals both its daily (15000/day) and weekly rolling caps as
+        a plain 429, and `_vault_call` raises the same `LSEError` for those
+        as for a malformed query — so every call site has to classify, or
+        none of them do. A quota rejection is a `RateLimitError` ("back off,
+        not retry" — core/errors.py), which is materially different from a
+        `VendorError` the caller should just log and step over.
+
+        Live 2026-08-06: not classifying this cost 28,152 rejected calls in
+        36h. The T1 poll caught the generic VendorError per-underlying,
+        logged it, and re-issued the full cycle 60s later — burning the
+        daily cap into the *weekly* rolling cap, which takes days to clear.
+        """
+        if e.status == 429:
+            return RateLimitError(f"LSE {what} quota exceeded: {e.message}")
+        return VendorError(f"LSE {what} failed: [{e.status}] {e.message}")
 
     # --- MarketDataProvider ---------------------------------------------
 
@@ -94,7 +112,7 @@ class LSEClient:
                 self._client.options, underlying, expiry=expiry.isoformat()
             )
         except LSEError as e:
-            raise VendorError(f"LSE options() failed: [{e.status}] {e.message}") from e
+            raise self._wrap(e, "options()") from e
 
         now = to_utc(datetime.datetime.now(datetime.UTC))
         quotes = [_parse_chain_row(row, now) for row in rows]
@@ -107,7 +125,7 @@ class LSEClient:
         try:
             rows = await asyncio.to_thread(self._client.options, underlying)
         except LSEError as e:
-            raise VendorError(f"LSE options() failed: [{e.status}] {e.message}") from e
+            raise self._wrap(e, "options()") from e
         today = datetime.date.today()
         expiries: set[datetime.date] = set()
         for row in rows:
@@ -134,7 +152,13 @@ class LSEClient:
         `window_days` calendar days directly rather than trust the
         vendor's broken range filter, stopping once 2 expiries are found
         (all a caller ever uses — ARCHITECTURE.md §6's "nearest 2
-        expiries")."""
+        expiries").
+
+        A no-expiry day is an expected miss, so the loop steps over an
+        ordinary `LSEError` — but a quota rejection is NOT a miss, and
+        swallowing it here meant probing 14 more times per underlying per
+        cycle while already over the cap. That re-raises now; only genuine
+        per-date failures continue."""
         found: list[datetime.date] = []
         for offset in range(window_days):
             day = today + datetime.timedelta(days=offset)
@@ -142,7 +166,9 @@ class LSEClient:
                 rows = await asyncio.to_thread(
                     self._client.options, underlying, expiry=day.isoformat()
                 )
-            except LSEError:
+            except LSEError as e:
+                if e.status == 429:
+                    raise self._wrap(e, "options()") from e
                 continue
             if rows:
                 found.append(day)
@@ -162,7 +188,7 @@ class LSEClient:
                 end.isoformat(),
             )
         except LSEError as e:
-            raise VendorError(f"LSE candles() failed: [{e.status}] {e.message}") from e
+            raise self._wrap(e, "candles()") from e
         return [_parse_candle_row(row) for row in rows]
 
     async def quota(self) -> QuotaStatus:
@@ -172,10 +198,19 @@ class LSEClient:
         # auth+HTTP for one endpoint. Degrades to "unknown" if it 404s on a
         # future/past API version instead of breaking ingestion over a
         # non-critical check.
+        #
+        # `/usage` is itself metered, so it 429s once you are over the cap —
+        # meaning the old blanket `except -> used_pct=0.0` reported "0% used"
+        # at exactly the moment the account was at 100%, and feed_health
+        # showed a reassuring 0.00 through three days of exhaustion. A 429
+        # here is positive evidence of exhaustion, not absence of evidence;
+        # any other failure is genuinely unknown, which is `None`, not zero.
         try:
             raw: dict[str, Any] = await asyncio.to_thread(self._client._vault_call, "/usage")
-        except LSEError:
-            return QuotaStatus(used_pct=0.0, raw={"available": False})
+        except LSEError as e:
+            if e.status == 429:
+                return QuotaStatus(used_pct=100.0, raw={"available": True, "inferred_from": "429"})
+            return QuotaStatus(used_pct=None, raw={"available": False})
         used = raw.get("used_pct") or raw.get("used")
         return QuotaStatus(used_pct=float(used) if used is not None else 0.0, raw=raw)
 

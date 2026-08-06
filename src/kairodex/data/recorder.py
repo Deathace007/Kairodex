@@ -31,6 +31,8 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from kairodex.core.enums import InstrumentKind, Market, Segment
+from kairodex.core.errors import RateLimitError
+from kairodex.core.sessions import is_session_open_now
 from kairodex.data.factory import make_client
 from kairodex.data.ingest import (
     option_quote_row,
@@ -47,6 +49,32 @@ from kairodex.store.models import FeedHealth, Instrument, UnderlyingBar, Watchli
 logger = logging.getLogger(__name__)
 
 T1_POLL_INTERVAL = datetime.timedelta(seconds=60)
+# LSE meters hard (15000 requests/day) where Upstox does not, so the US poll
+# has to be budgeted rather than merely tidied. With the session gate and the
+# per-day expiry cache below, a cycle costs `underlyings x 2 expiries + 1`
+# calls, and a US session is 6.5h:
+#
+#     22 underlyings -> 45 calls/cycle
+#      60s ->  390 cycles ->  17,572/day  OVER the 15000 cap
+#     120s ->  195 cycles ->   8,797/day  ~59% of cap
+#
+# 120s keeps real headroom for restarts (each re-runs bar backfill), the
+# SPY/QQQ probe path, and a watchlist that grows. Chain snapshots for US are
+# therefore 2 minutes apart — a real, vendor-imposed resolution limit worth
+# knowing before reading US features. Re-derive this before adding
+# underlyings; the cap is per-account, not per-symbol.
+T1_POLL_INTERVAL_BY_MARKET = {Market.US: datetime.timedelta(seconds=120)}
+# How long to idle between checks while the market is closed. The T1 poll has
+# nothing to record then — an option chain does not move — and against LSE's
+# 15000/day cap those calls are not merely wasted but actively harmful: US
+# options trade 32.5 of every 168 hours, so polling around the clock spent
+# ~81% of a day's entire quota on a closed book (live, 2026-08-06).
+CLOSED_MARKET_POLL_INTERVAL = datetime.timedelta(minutes=5)
+# Backoff after a vendor quota rejection. LSE meters daily AND on a rolling
+# 7-day window, so retrying into a 429 does not just fail — it deepens the
+# weekly debt and delays recovery past the next daily reset. Long enough that
+# a blown day costs a handful of probe calls, not tens of thousands.
+QUOTA_BACKOFF = datetime.timedelta(minutes=30)
 WS_FLUSH_INTERVAL = datetime.timedelta(seconds=3)
 WS_FLUSH_SIZE = 200
 BACKFILL_LOOKBACK_DAYS = 5  # how far back to search for the last recorded bar on a cold start
@@ -135,17 +163,38 @@ async def recover_underlying_bars(
 # --- T1: REST chain poll ----------------------------------------------------
 
 
+async def _expiries_cached(
+    client: MarketDataProvider,
+    vendor_key: str,
+    cache: dict[str, tuple[datetime.date, list[datetime.date]]],
+) -> list[datetime.date]:
+    """`list_expiries` costs a full unfiltered chain fetch (and for SPY/QQQ,
+    up to 14 more probe calls) to learn a set of dates that changes about
+    weekly. Re-asking every 60s was a third of the entire LSE daily budget
+    spent rediscovering a near-static fact. Cached per calendar day: an
+    expiry that lists intraday is picked up next day, and the nearest-2 the
+    caller actually uses are already known well before then."""
+    today = datetime.date.today()
+    hit = cache.get(vendor_key)
+    if hit is not None and hit[0] == today:
+        return hit[1]
+    expiries = await client.list_expiries(vendor_key)
+    cache[vendor_key] = (today, expiries)
+    return expiries
+
+
 async def poll_chain_once(
     session: AsyncSession,
     client: MarketDataProvider,
     provider: str,
     segment: Segment,
     underlying: Instrument,
+    expiry_cache: dict[str, tuple[datetime.date, list[datetime.date]]],
 ) -> None:
     vendor_key = _provider_key(underlying, provider)
     if vendor_key is None:
         return
-    expiries = await client.list_expiries(vendor_key)
+    expiries = await _expiries_cached(client, vendor_key, expiry_cache)
     underlying_rec = InstrumentRecord(
         exchange=underlying.exchange,
         symbol=underlying.symbol,
@@ -162,17 +211,55 @@ async def t1_poll_loop(
     sessionmaker: async_sessionmaker[AsyncSession],
     client: MarketDataProvider,
     provider: str,
+    market: Market,
     underlyings_by_segment: dict[Segment, list[Instrument]],
 ) -> None:
+    expiry_cache: dict[str, tuple[datetime.date, list[datetime.date]]] = {}
+    interval = T1_POLL_INTERVAL_BY_MARKET.get(market, T1_POLL_INTERVAL)
     while True:
         cycle_start = datetime.datetime.now(datetime.UTC)
+
+        if not is_session_open_now(market, cycle_start):
+            await asyncio.sleep(CLOSED_MARKET_POLL_INTERVAL.total_seconds())
+            continue
+
+        # A quota rejection is about the *account*, not this underlying, so
+        # it aborts the whole cycle: continuing the loop would issue one
+        # doomed call per remaining underlying, every cycle, forever. That
+        # is precisely how a blown daily cap became a blown weekly one.
+        rate_limited = False
         for segment, underlyings in underlyings_by_segment.items():
+            if rate_limited:
+                break
             for u in underlyings:
                 try:
                     async with sessionmaker() as session:
-                        await poll_chain_once(session, client, provider, segment, u)
+                        await poll_chain_once(
+                            session, client, provider, segment, u, expiry_cache
+                        )
+                except RateLimitError as e:
+                    logger.warning(
+                        "%s quota exhausted (%s) — pausing T1 poll for %.0f min",
+                        provider,
+                        e,
+                        QUOTA_BACKOFF.total_seconds() / 60,
+                    )
+                    async with sessionmaker() as session:
+                        await update_feed_health(
+                            session,
+                            provider,
+                            quota_used_pct=100.0,
+                            last_error=str(e)[:500],
+                            last_error_at=datetime.datetime.now(datetime.UTC),
+                        )
+                    rate_limited = True
+                    break
                 except Exception:
                     logger.exception("T1 poll failed for %s (%s)", u.symbol, segment.value)
+
+        if rate_limited:
+            await asyncio.sleep(QUOTA_BACKOFF.total_seconds())
+            continue
 
         try:
             quota = await client.quota()
@@ -182,7 +269,7 @@ async def t1_poll_loop(
             logger.exception("quota check failed for %s", provider)
 
         elapsed = (datetime.datetime.now(datetime.UTC) - cycle_start).total_seconds()
-        await asyncio.sleep(max(0.0, T1_POLL_INTERVAL.total_seconds() - elapsed))
+        await asyncio.sleep(max(0.0, interval.total_seconds() - elapsed))
 
 
 # --- WS stream ---------------------------------------------------------------
@@ -381,7 +468,7 @@ async def run_market(market: Market) -> None:
             await recover_underlying_bars(session, client, provider, all_underlyings)
 
         await asyncio.gather(
-            t1_poll_loop(sessionmaker, client, provider, underlyings_by_segment),
+            t1_poll_loop(sessionmaker, client, provider, market, underlyings_by_segment),
             ws_stream_loop(sessionmaker, client, provider, all_underlyings),
         )
     finally:

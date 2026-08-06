@@ -56,8 +56,13 @@ async def test_probe_returns_empty_when_nothing_found_in_window():
 
 
 async def test_list_expiries_falls_back_when_unfiltered_call_is_empty():
-    fake = _FakeVendorClient({"2026-08-05"})
+    # Unlike the tests above, list_expiries() probes forward from the real
+    # `date.today()`, so this fixture's expiry has to be relative. It was
+    # hardcoded to 2026-08-05, which rotted into a permanent failure the day
+    # it went past — a test that always fails stops being read at all.
+    tomorrow = datetime.date.today() + datetime.timedelta(days=1)
+    fake = _FakeVendorClient({tomorrow.isoformat()})
     client = _client_with_fake(fake)
     expiries = await client.list_expiries("SPY")
-    assert expiries == [datetime.date(2026, 8, 5)]
+    assert expiries == [tomorrow]
     assert fake.calls[0] is None  # tried the normal path first

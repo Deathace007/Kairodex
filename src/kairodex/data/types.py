@@ -122,8 +122,13 @@ class Bar:
 @dataclass(frozen=True, slots=True)
 class QuotaStatus:
     """Vendor-reported usage headroom (ARCHITECTURE.md §7 — LSE exposes this
-    via GET /vault/usage; Upstox via documented per-endpoint call limits)."""
+    via GET /vault/usage; Upstox via documented per-endpoint call limits).
 
-    used_pct: float
+    `used_pct=None` means "genuinely unknown" and must stay distinguishable
+    from `0.0` ("confirmed idle") — conflating the two is what let a fully
+    exhausted LSE account report 0.00% for three days. `feed_health` and
+    `kairodex status` already store/render the nullable form."""
+
+    used_pct: float | None
     resets_at: datetime.datetime | None = None
     raw: dict[str, object] = field(default_factory=dict)
