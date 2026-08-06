@@ -16,6 +16,12 @@ _LIQUIDITY_SPREAD_K = 10.0
 _LIQUIDITY_DEPTH_K = 100.0
 _LIQUIDITY_OI_K = 1000.0
 _LIQUIDITY_VOLUME_K = 500.0
+# How many near-ATM strikes the US synthesis fallback tries before giving
+# up (see liquidity_score's own docstring). 5 nearest calls on each side of
+# spot is a real strike range on any of this watchlist's names, not a
+# handful of cents — wide enough to usually find a genuinely liquid leg
+# without turning "nearest ATM" into "anywhere on the chain."
+_LIQUIDITY_ATM_WINDOW = 5
 
 
 def _all_quotes(snapshots: list[ChainSnapshot]) -> list[Tick]:
@@ -132,25 +138,48 @@ def liquidity_score(ctx: FeatureContext) -> float | None:
     value and fails closed on `None` ("an unpriced contract isn't
     'probably fine'"), which is the right call against a genuinely unknown
     book — but here the book was knowable, just not where this function
-    was looking. Before this fix, contract selection could clear (once
-    candidates existed) and every single signal still died one gate later
-    on a feature that could never be anything but `None` for this vendor
-    (live 2026-08-06: 951 of ~1,100 recent us_stock signals). Gated the
-    same explicit way as candidate synthesis — `Market.US` only, never a
-    blanket "whenever bid/ask happen to be missing" — so an NSE feed
-    hiccup can't silently start scoring liquidity on fiction."""
+    was looking. Gated the same explicit way as candidate synthesis —
+    `Market.US` only, never a blanket "whenever bid/ask happen to be
+    missing" — so an NSE feed hiccup can't silently start scoring
+    liquidity on fiction.
+
+    On US the fallback also widens which strike it samples. The single
+    literal nearest-ATM strike is fine on NSE, where LSE's real book means
+    it's almost always quoted — but measured live against the whole
+    watchlist (2026-08-06), typically well under 5% of legs on any US
+    chain clear the volume `synthesize_quote` requires to model a fillable
+    book, so picking exactly one fixed strike lands on an illiquid one
+    most of the time even when the chain has liquid legs a strike or two
+    away — precisely what the real selector (which searches the whole
+    window) found tradeable on 11/16 underlyings in the same replay. This
+    was the second bug behind "US never trades": fixing the raw-vs-
+    synthesized mismatch alone still left the feature sampling a single
+    point that usually missed. `_LIQUIDITY_ATM_WINDOW` nearest strikes is
+    an arbitrary-but-documented window, same status as the `_LIQUIDITY_*_K`
+    constants above — not a loosened threshold: every candidate strike
+    still has to clear the exact same `synthesize_quote` bar (spread floor,
+    `_MIN_TOP_OF_BOOK`) as before, and the strictly-worse illiquid strikes
+    are just no longer the only one asked. NSE (and any signal that already
+    has a raw book) is completely unaffected — this only replaces
+    LIQUIDITY_UNKNOWN when literally nothing nearby is fillable."""
     if not ctx.chain or ctx.spot is None:
         return None
     front = min(ctx.chain, key=lambda s: s.expiry)
     calls = [q for q in front.quotes if q.option_type == "C" and q.strike is not None]
     if not calls:
         return None
-    atm = min(calls, key=lambda q: abs(float(q.strike) - ctx.spot))  # type: ignore[arg-type,operator]
+    ranked = sorted(calls, key=lambda q: abs(float(q.strike) - ctx.spot))  # type: ignore[arg-type,operator]
+    atm = ranked[0]
     raw_bid, raw_ask, bid_sz, ask_sz = atm.bid, atm.ask, atm.bid_sz, atm.ask_sz
     if raw_bid is None or raw_ask is None or raw_bid <= 0:
         if ctx.segment.market is not Market.US:
             return None
-        modelled = synthesize_quote(atm.ltp, atm.volume)
+        modelled = None
+        for candidate in ranked[:_LIQUIDITY_ATM_WINDOW]:
+            modelled = synthesize_quote(candidate.ltp, candidate.volume)
+            if modelled is not None:
+                atm = candidate
+                break
         if modelled is None:
             return None
         raw_bid, raw_ask = modelled.bid, modelled.ask

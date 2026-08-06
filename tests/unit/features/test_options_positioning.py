@@ -154,6 +154,46 @@ def test_liquidity_score_falls_back_to_modelled_book_on_us():
     assert 0.0 < liquidity_score(ctx) <= 1.0
 
 
+def test_liquidity_score_searches_nearby_strikes_on_us_when_atm_is_too_thin():
+    """The second bug behind 'US never trades': fixing the raw/synthesized
+    mismatch alone still left this sampling one fixed strike, which real
+    US chains usually have illiquid at the exact ATM even when a strike or
+    two away is fine (measured live: well under 5% of legs on any US chain
+    clear the fillable-volume bar). The literal ATM (strike 100) has real
+    volume but too little to synthesize a fillable book; a nearby strike
+    (105) has plenty. The window must find it rather than reporting
+    LIQUIDITY_UNKNOWN with a tradeable leg one strike away."""
+    thin_atm = _leg(
+        "C1", "C", oi=10, strike=Decimal(100), ltp=Decimal("10"), volume=5
+    )  # volume 5 -> synthesize_quote returns None (below _MIN_TOP_OF_BOOK)
+    liquid_neighbor = _leg(
+        "C2", "C", oi=1000, strike=Decimal(105), ltp=Decimal("8"), volume=5000
+    )
+    ctx = FeatureContext(
+        as_of=_T0,
+        segment=Segment.US_STOCK,
+        chain=[_snapshot([thin_atm, liquid_neighbor])],
+        underlying_bars=[_bar(100)],
+    )
+    score = liquidity_score(ctx)
+    assert score is not None
+    assert 0.0 < score <= 1.0
+
+
+def test_liquidity_score_still_none_on_us_when_nothing_nearby_is_fillable():
+    """The window is a search radius, not a lowered bar — when every
+    nearby strike is genuinely too thin, the honest answer stays None,
+    same as before this fix."""
+    legs = [
+        _leg("C1", "C", oi=10, strike=Decimal(100), ltp=Decimal("10"), volume=5),
+        _leg("C2", "C", oi=10, strike=Decimal(101), ltp=Decimal("9"), volume=3),
+    ]
+    ctx = FeatureContext(
+        as_of=_T0, segment=Segment.US_STOCK, chain=[_snapshot(legs)], underlying_bars=[_bar(100)]
+    )
+    assert liquidity_score(ctx) is None
+
+
 def test_liquidity_score_none_on_us_with_no_last_price_either():
     """A contract that has never printed on this vendor either has no real
     book (the earlier case) or no evidence at all (no ltp) — both are
