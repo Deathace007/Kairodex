@@ -124,3 +124,52 @@ def test_mid_price_property():
 def test_mid_price_none_when_nothing_selected():
     result = _select([], Side.BUY)
     assert result.mid_price is None
+
+
+def test_rejects_the_closest_available_when_still_too_far_from_target():
+    """The gate found live 2026-08-06: on a thin US vendor, the only
+    candidates with enough recorded volume to synthesize a fillable book
+    were routinely far-OTM (delta ~0.005, a lottery ticket) — closest of a
+    bad set is still a bad pick. Before this gate, `min(key=distance)`
+    would have happily returned the 0.005-delta contract as 'selected'
+    just because nothing better existed; now it's rejected outright."""
+    lottery_ticket = _c(30, 400, "C", _NEAR_EXPIRY, 1, 2, "0.005")
+    result = _select([lottery_ticket], Side.BUY)
+    assert result.selected is None
+    assert result.reason == "NO_CONTRACT_NEAR_TARGET_DELTA"
+
+
+def test_deep_itm_is_also_rejected_not_just_deep_otm():
+    """The same live finding cut both ways — a 0.95-delta contract (a
+    leveraged stock substitute at a huge premium) is exactly as far from
+    target_delta=0.40 as a lottery ticket, just on the other side."""
+    near_stock = _c(31, 20, "C", _NEAR_EXPIRY, 80, 82, "0.95")
+    result = _select([near_stock], Side.BUY)
+    assert result.selected is None
+    assert result.reason == "NO_CONTRACT_NEAR_TARGET_DELTA"
+
+
+def test_exact_boundary_distance_still_selects():
+    """0.25 is the default max_delta_distance; a candidate exactly at that
+    distance (delta=0.15, dist=|0.15-0.40|=0.25) must still be accepted —
+    the check is `>`, not `>=`, matching this codebase's own affordability
+    boundary convention (test_affordability_boundary_exact_limit_passes)."""
+    boundary = _c(32, 120, "C", _NEAR_EXPIRY, 1, 2, "0.15")
+    result = _select([boundary], Side.BUY)
+    assert result.selected is not None
+
+
+def test_just_past_the_boundary_is_rejected():
+    boundary_plus = _c(33, 121, "C", _NEAR_EXPIRY, 1, 2, "0.149")
+    result = _select([boundary_plus], Side.BUY)
+    assert result.selected is None
+    assert result.reason == "NO_CONTRACT_NEAR_TARGET_DELTA"
+
+
+def test_delta_cap_still_lets_a_reasonable_contract_through():
+    """The gate must not become a blanket rejection — a genuinely
+    near-target contract (the existing hand-picked fixture) still selects
+    exactly as before this change."""
+    result = _select(_candidates(), Side.BUY)
+    assert result.selected is not None
+    assert result.selected.instrument_id == 2  # unchanged from the original test above

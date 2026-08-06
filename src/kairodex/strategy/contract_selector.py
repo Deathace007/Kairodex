@@ -25,6 +25,25 @@ _DEFAULT_TARGET_DELTA = 0.40  # ponytail: first-pass — a common "slightly
 # OTM, cheaper premium, still meaningful directional exposure" choice;
 # recalibrate once backtesting can measure what delta actually performs.
 
+# How far from target_delta the "closest available" candidate is still
+# allowed to be. Without this, `min(affordable, key=distance)` always
+# returns *something* — even the single closest of a pool that's nowhere
+# near tradeable. Found live 2026-08-06: on a thin US vendor, the only
+# candidates with enough recorded volume to synthesize a fillable book
+# (execution.synthetic_quote) were routinely far-OTM (delta ~0.005, a
+# lottery ticket) or far-ITM (delta ~0.95, a leveraged stock substitute at
+# a huge premium) — "closest of a bad set" is still a bad pick, and the
+# user's own standing instruction is to trade only high-conviction setups,
+# not whatever is technically fillable. 0.25 keeps calls roughly in a
+# 0.15-0.65 delta band: same documented-assumption status as
+# _DEFAULT_TARGET_DELTA itself — a first-pass judgment call, not derived
+# or backtested, and the user's explicit choice over leaving this
+# unbounded. Applied identically to the no-delta moneyness fallback below
+# even though the two are on different scales (delta vs normalized strike
+# distance) — that path is rare (this vendor supplies delta on nearly
+# every leg) and not worth a second, separately-tuned threshold yet.
+_DEFAULT_MAX_DELTA_DISTANCE = 0.25
+
 
 @dataclass(frozen=True, slots=True)
 class ContractCandidate:
@@ -68,6 +87,7 @@ def select_contract(
     min_dte: int = _DEFAULT_MIN_DTE,
     max_dte: int = _DEFAULT_MAX_DTE,
     target_delta: float = _DEFAULT_TARGET_DELTA,
+    max_delta_distance: float = _DEFAULT_MAX_DELTA_DISTANCE,
 ) -> SelectionResult:
     option_type = "C" if direction is Side.BUY else "P"
     in_window = [
@@ -103,4 +123,6 @@ def select_contract(
         return abs(float(c.strike - spot)) / float(spot) if spot > 0 else float("inf")
 
     selected = min(affordable, key=distance)
+    if distance(selected) > max_delta_distance:
+        return SelectionResult(None, "NO_CONTRACT_NEAR_TARGET_DELTA")
     return SelectionResult(selected)
