@@ -1127,18 +1127,63 @@ The weekly cap was already tripped, so US ingestion stays down until it
 clears on its rolling window — the fix stops the bleeding, it does not
 restore service instantly.
 
-### 13e. Open, in priority order
+### 13e. US last-price entry path — done (2026-08-06)
 
-1. **US last-price execution path** — extend the entry side to work from
-   last price plus an *explicit* modeled spread (we have live IV and
-   greeks to model from). `or mark`'s implicit zero-spread would
-   understate entry cost and flatter every US trade's P&L, so the
-   assumption has to be stated, not inherited.
-2. **Zero closed trades, ever.** 3 open, 0 closed. Realized P&L, fees,
+`kairodex/execution/synthetic_quote.py` models a book from last price for
+US only, gated by an explicit `segment.market is Market.US` opt-in rather
+than "synthesize whenever bid/ask are missing" — the latter would let an
+NSE feed hiccup silently move a real-book segment onto modelled prices,
+which is worse than the bug being fixed. Three rules, each pinned by a
+test: recorded data is never touched (`option_quotes.bid/ask` stay NULL
+and faithfully so); it errs expensive (4% of premium, well above real
+liquid US spreads, below fills.py's own 500bps limit) because a too-tight
+spread manufactures edge that does not exist; and every such fill is
+labelled on the trade (`context_entry.synthetic_quote`).
+
+`SPREAD_PCT` is an assumption, not a measurement — there is no bid/ask
+from this vendor to calibrate against. Not YAML config yet, deliberately:
+a knob implies a calibration that does not exist.
+
+**The size proxy mattered more than the spread.** Measured on real legs,
+US volume is far thinner than intuition suggests (p99 ~102/day; the
+busiest contract in the entire watchlist did 3,628). A first-pass
+volume/100 proxy left only 1.4% of legs at size >= 1, and fills.py fills
+`floor(0.25 * top_of_book)` — so size 1 fills zero lots. That would have
+swapped `NO_CANDIDATES_IN_EXPIRY_WINDOW` for
+`NO_LIQUIDITY_AT_TOP_OF_BOOK` and left US still not trading, one line
+further on. The proxy now scales sub-linearly (volume/20, capped at 50),
+and below the size that can fill one lot `synthesize_quote` returns None
+— the contract fails to be a *candidate* rather than being selected on
+delta and rejected at execution every time.
+
+Verified by replaying 21,734 real recorded US legs through the real
+selector and the real fill model: **0 candidates before, a fillable
+contract on 11 of 16 underlyings after.** The 4 underlyings with nothing
+liquid enough (COST, DIS, WMT, XOM) are correctly excluded rather than
+traded on fiction, and BAC's pick was rejected `SPREAD_TOO_WIDE` by the
+fill model's own policy. Replay used recorded data, not a live session —
+US ingestion is still down until the LSE weekly cap clears (§13d), so no
+live US trade has been taken yet.
+
+Also 2026-08-06 (user's call): `nse_stock` `max_concurrent` 1 -> 5.
+ARCHITECTURE.md §11's table now states configured `max_concurrent` rather
+than the old "realistic concurrency" prediction. The capital math still
+sits below the new ceiling — `exposure_cap_pct` 0.40 caps exposure at
+Rs 20,000 while `max_premium_pct` 0.35 allows Rs 17,500 in one position,
+so the exposure gate, not `max_concurrent`, remains binding.
+
+### 13f. Open, in priority order
+
+1. **Zero closed trades, ever.** 3 open, 0 closed. Realized P&L, fees,
    R-multiple and equity update have run in tests only, never in
    production. Every P7 gate is a closed-trade statistic. The 3-day theta
    guard means the first natural close is ~2026-08-09.
-3. Then P7 (strategy build-out).
+2. **US ingestion still down** until LSE's rolling weekly cap clears
+   (§13d). The entry path is fixed and replay-verified, but no live US
+   trade can happen until data flows again.
+3. **Re-check the synthetic spread and size proxy** once any US trade
+   closes — they are the two least-evidenced numbers in the live path.
+4. Then P7 (strategy build-out).
 
 **Standing constraint on all of the above** (user, 2026-08-06): trade
 only high-conviction setups — neither overtrade nor undertrade. A low
