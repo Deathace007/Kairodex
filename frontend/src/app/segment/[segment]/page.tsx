@@ -53,9 +53,11 @@ export default async function SegmentPage(props: PageProps<"/segment/[segment]">
             label="Equity"
             value={fmtMoney(overview?.equity.current_equity ?? null)}
             delta={overview ? fmtPct(overview.equity.total_return_pct) : undefined}
-            deltaGood={overview?.equity.total_return_pct !== undefined && overview?.equity.total_return_pct !== null
-              ? overview.equity.total_return_pct >= 0
-              : null}
+            deltaGood={
+              overview?.equity.total_return_pct != null
+                ? Number(overview.equity.total_return_pct) >= 0
+                : null
+            }
           />
           <StatTile
             label="Max drawdown"

@@ -33,7 +33,7 @@ export default async function MasterPage() {
                   label={SEGMENT_LABEL[s.segment]}
                   value={fmtMoney(s.equity, s.currency)}
                   delta={s.max_drawdown_pct !== null ? `DD ${fmtPct(s.max_drawdown_pct)}` : undefined}
-                  deltaGood={s.max_drawdown_pct !== null ? s.max_drawdown_pct < 0.05 : null}
+                  deltaGood={s.max_drawdown_pct !== null ? Number(s.max_drawdown_pct) < 0.05 : null}
                   sub={s.breaker_status}
                 />
               </Link>

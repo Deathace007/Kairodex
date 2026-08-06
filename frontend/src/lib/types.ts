@@ -8,29 +8,38 @@ export type Segment = "nse_stock" | "nse_index" | "us_stock" | "us_index";
 
 export const SEGMENTS: Segment[] = ["nse_stock", "nse_index", "us_stock", "us_index"];
 
+/** A Python `Decimal` field, as it actually arrives over the wire — a
+ * JSON *string* (FastAPI's precision-preserving choice, matching this
+ * codebase's "money is numeric(18,4), never float" convention all the
+ * way out to the API), not a `number`. `float`/`int`-sourced fields
+ * (win_rate, confidence, counts) stay plain `number`. Always render a
+ * `Decimal` through `lib/format.ts`'s `fmt*` helpers, which coerce both
+ * shapes — see that file's own note. */
+export type Decimal = string;
+
 export interface PerformanceSummary {
   n_trades: number;
   n_open: number;
   n_closed: number;
   win_rate: number | null;
   profit_factor: number | null;
-  expectancy: number | null;
+  expectancy: Decimal | null;
   avg_r_multiple: number | null;
-  gross_pnl: number;
-  net_pnl: number;
-  total_fees: number;
-  avg_win: number | null;
-  avg_loss: number | null;
+  gross_pnl: Decimal;
+  net_pnl: Decimal;
+  total_fees: Decimal;
+  avg_win: Decimal | null;
+  avg_loss: Decimal | null;
   avg_holding_secs: number | null;
 }
 
 export interface EquityCurveStats {
   n_points: number;
-  start_equity: number | null;
-  current_equity: number | null;
-  high_water_mark: number | null;
-  max_drawdown_pct: number | null;
-  total_return_pct: number | null;
+  start_equity: Decimal | null;
+  current_equity: Decimal | null;
+  high_water_mark: Decimal | null;
+  max_drawdown_pct: Decimal | null;
+  total_return_pct: Decimal | null;
 }
 
 export interface SegmentOverview {
@@ -44,10 +53,10 @@ export interface SegmentOverview {
 
 export interface EquityPoint {
   ts: string;
-  equity: number;
-  high_water_mark: number;
-  drawdown: number;
-  exposure: number;
+  equity: Decimal;
+  high_water_mark: Decimal;
+  drawdown: Decimal;
+  exposure: Decimal;
 }
 
 export interface Position {
@@ -55,15 +64,15 @@ export interface Position {
   instrument_symbol: string | null;
   opened_at: string;
   qty_lots: number;
-  avg_entry: number;
-  mark: number | null;
-  unrealized: number | null;
+  avg_entry: Decimal;
+  mark: Decimal | null;
+  unrealized: Decimal | null;
   greeks: {
-    iv: number | null;
-    delta: number | null;
-    gamma: number | null;
-    theta: number | null;
-    vega: number | null;
+    iv: Decimal | null;
+    delta: Decimal | null;
+    gamma: Decimal | null;
+    theta: Decimal | null;
+    vega: Decimal | null;
   } | null;
   stop_price: string | null;
 }
@@ -87,18 +96,18 @@ export interface TradeRow {
   underlying_symbol: string;
   instrument_symbol: string;
   option_type: string | null;
-  strike: number | null;
+  strike: Decimal | null;
   expiry: string | null;
   opened_at: string;
   closed_at: string | null;
-  avg_entry: number;
-  avg_exit: number | null;
-  gross_pnl: number | null;
-  net_pnl: number | null;
-  fees: number | null;
+  avg_entry: Decimal;
+  avg_exit: Decimal | null;
+  gross_pnl: Decimal | null;
+  net_pnl: Decimal | null;
+  fees: Decimal | null;
   r_multiple: number | null;
-  mfe: number | null;
-  mae: number | null;
+  mfe: Decimal | null;
+  mae: Decimal | null;
   holding_secs: number | null;
   exit_reason: string | null;
 }
@@ -113,13 +122,13 @@ export interface TradesPage {
 export interface RiskSummary {
   segment: Segment;
   config: Record<string, number | string>;
-  daily_pnl: number | null;
-  weekly_pnl: number | null;
+  daily_pnl: Decimal | null;
+  weekly_pnl: Decimal | null;
   consecutive_losses: number;
   breaker_status: string;
   breaker_reason: string | null;
   blocked_until: string | null;
-  risk_multiplier: number | null;
+  risk_multiplier: Decimal | null;
 }
 
 export interface FeedHealthRow {
@@ -137,10 +146,10 @@ export interface FeedHealthRow {
 export interface MasterSegmentRow {
   segment: Segment;
   currency: string;
-  equity: number | null;
-  equity_converted: number | null;
-  high_water_mark: number | null;
-  max_drawdown_pct: number | null;
+  equity: Decimal | null;
+  equity_converted: Decimal | null;
+  high_water_mark: Decimal | null;
+  max_drawdown_pct: Decimal | null;
   breaker_status: string;
 }
 

@@ -42,7 +42,10 @@ export function EquityChart({ points }: { points: EquityPoint[] }) {
     series.setData(
       points.map((p) => ({
         time: Math.floor(new Date(p.ts).getTime() / 1000) as never,
-        value: p.equity,
+        // p.equity is a JSON string (kairodex.api serializes Decimal as
+        // string — see lib/format.ts) — lightweight-charts needs a real
+        // number, unlike the rest of this app's display-only formatters.
+        value: Number(p.equity),
       })),
     );
     chart.timeScale().fitContent();

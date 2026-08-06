@@ -32,10 +32,13 @@ export function breakerStatus(status: string): Status {
 
 /** P&L text color as a direct CSS value (not a Status label — this is
  * for coloring a plain number inline, where a dot+label badge would be
- * noise; the number's own sign is the label). */
-export function pnlColor(value: number | null): string {
-  if (value === null) return "var(--text-secondary)";
-  if (value > 0) return "var(--status-good)";
-  if (value < 0) return "var(--status-critical)";
+ * noise; the number's own sign is the label). Accepts a string because
+ * kairodex.api serializes Decimal (money) fields as JSON strings — see
+ * lib/format.ts's own note on why. */
+export function pnlColor(value: number | string | null): string {
+  const n = value === null ? null : typeof value === "string" ? Number(value) : value;
+  if (n === null || !Number.isFinite(n)) return "var(--text-secondary)";
+  if (n > 0) return "var(--status-good)";
+  if (n < 0) return "var(--status-critical)";
   return "var(--text-secondary)";
 }
