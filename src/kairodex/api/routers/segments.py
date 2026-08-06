@@ -178,7 +178,15 @@ async def segment_trades(
     strategy: int | None = None,
     outcome: str | None = Query(None, description="'win' | 'loss' | 'open'"),
     page: int = Query(1, ge=1),
-    page_size: int = Query(50, le=200),
+    # `ge=1` as well as `le=200`: `page` had a lower bound and `page_size`
+    # did not, so `?page_size=-5` returned HTTP 200 with an empty `trades`
+    # list and `page_size: -5` echoed back, while `?page_size=99999999`
+    # correctly 422'd — the same validation boundary answering two
+    # different ways. Harmless today (a negative slice just yields nothing)
+    # but it is a lie in the response body, and the asymmetry is exactly
+    # the kind of thing that becomes a real bug once a caller trusts the
+    # echoed value. Found by probing the live API, 2026-08-06.
+    page_size: int = Query(50, ge=1, le=200),
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, object]:
     frm_dt = parse_iso_date(frm, "from")
