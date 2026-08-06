@@ -128,7 +128,7 @@ def test_drawdown_throttle():
 
 
 def test_max_concurrent_reached():
-    account = _account(open_positions_count=1)  # == max_concurrent for NSE_STOCK (1)
+    account = _account(open_positions_count=5)  # == max_concurrent for NSE_STOCK (5)
     result = run_gate_chain(_proposal(), account, _CONFIG, now=_NOW)
     assert result.reject_stage == "max_concurrent"
     assert len(result.evaluated) == 8

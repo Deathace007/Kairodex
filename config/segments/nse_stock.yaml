@@ -9,7 +9,7 @@ currency: INR
 base_risk_pct: 0.08
 hard_ceiling_pct: 0.35
 max_premium_pct: 0.35
-max_concurrent: 1
+max_concurrent: 5  # user's call, 2026-08-06 (was 1)
 daily_loss_limit_pct: 0.16
 weekly_loss_limit_pct: 0.30
 max_drawdown_pct: 0.40

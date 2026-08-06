@@ -30,11 +30,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from kairodex.config.segments import SegmentRiskConfig
-from kairodex.core.enums import Segment, Side
+from kairodex.core.enums import Market, Segment, Side
 from kairodex.data.types import Tick
 from kairodex.engine import event_log
 from kairodex.engine.monitor import Position, evaluate_exits
 from kairodex.execution.simulator import ExecutionPort, ExecutionResult
+from kairodex.execution.synthetic_quote import SPREAD_PCT, synthesize_quote
 from kairodex.execution.types import OrderRequest, QuoteSnapshot
 from kairodex.features import loader as feature_loader
 from kairodex.features import registry as feature_registry
@@ -67,27 +68,46 @@ class TickOutcome:
     trade_id: int | None = None
 
 
-def _candidates_from_chain(quotes: list[Tick], expiry: datetime.date) -> list[ContractCandidate]:
+def _candidates_from_chain(
+    quotes: list[Tick], expiry: datetime.date, *, synthetic_quotes: bool = False
+) -> list[ContractCandidate]:
     """`quotes` is a list of `kairodex.data.types.Tick` from one
     `ChainSnapshot`'s legs — `expiry` is that snapshot's own expiry
     (every leg in it shares one), passed in rather than guessed, since
     `Tick` itself carries no `expiry` field (see `FeatureContext`'s
-    docstring in `kairodex.features.types` for why)."""
+    docstring in `kairodex.features.types` for why).
+
+    `synthetic_quotes` models a book from last price where the vendor
+    publishes none (US/LSE — see execution.synthetic_quote). It is an
+    explicit per-market opt-in rather than "synthesize whenever bid/ask
+    happen to be missing": the latter would mean an NSE feed hiccup
+    silently switched a real-book segment onto modelled prices, which is a
+    far worse failure than skipping a contract for one tick.
+    """
     out = []
     for q in quotes:
-        if q.strike is None or q.option_type is None or q.bid is None or q.ask is None:
+        if q.strike is None or q.option_type is None:
             continue
+        bid, ask, bid_sz, ask_sz = q.bid, q.ask, q.bid_sz, q.ask_sz
+        if bid is None or ask is None:
+            if not synthetic_quotes:
+                continue
+            modelled = synthesize_quote(q.ltp, q.volume)
+            if modelled is None:
+                continue
+            bid, ask = modelled.bid, modelled.ask
+            bid_sz, ask_sz = modelled.bid_sz, modelled.ask_sz
         out.append(
             ContractCandidate(
                 instrument_id=0,  # resolved separately, by instrument_key -> DB lookup
                 strike=q.strike,
                 option_type=q.option_type,
                 expiry=expiry,
-                bid=q.bid,
-                ask=q.ask,
+                bid=bid,
+                ask=ask,
                 delta=q.delta,
-                bid_sz=q.bid_sz,
-                ask_sz=q.ask_sz,
+                bid_sz=bid_sz,
+                ask_sz=ask_sz,
                 oi=q.oi,
                 quote_ts=q.ts,
             )
@@ -155,7 +175,14 @@ async def run_entry_tick(
         return TickOutcome(signal.signal_id, False, signal.reject_stage, signal.reject_reason)
 
     front = min(feature_ctx.chain, key=lambda s: s.expiry)
-    candidates = _candidates_from_chain(front.quotes, front.expiry)
+    # LSE (the only US options vendor) publishes no book at all, so US
+    # candidates are modelled from last price — see execution.synthetic_quote
+    # for the three rules that keep that honest. NSE has real depth and must
+    # never take this path.
+    synthetic_quotes = segment.market is Market.US
+    candidates = _candidates_from_chain(
+        front.quotes, front.expiry, synthetic_quotes=synthetic_quotes
+    )
 
     lot_size = 25 if segment.market.value == "nse" else 100  # ponytail: instrument_specs (P0
     # table, SCD-2 lot size) isn't wired into this path yet — a fixed per-market default
@@ -265,6 +292,7 @@ async def run_entry_tick(
         now=now,
         spot=feature_ctx.spot,
         values=values,
+        synthetic_quote=synthetic_quotes,
     )
     signal.decision = "TAKEN"
     await session.commit()
@@ -300,6 +328,7 @@ async def _record_fill(
     now: datetime.datetime,
     spot: float | None,
     values: dict[str, float],
+    synthetic_quote: bool = False,
 ) -> int:
     assert execution.price is not None
     premium_paid = execution.price * execution.filled_qty * lot_size
@@ -327,6 +356,13 @@ async def _record_fill(
             "vol_regime": values.get("volatility_regime"),
             "trend_state_strength": values.get("trend_state_strength"),
             "liquidity_score": values.get("liquidity_score"),
+            # This fill was priced off a modelled book, not an observed one
+            # (execution.synthetic_quote). Recorded per-trade rather than
+            # inferred from the segment later, because the assumption can
+            # change while old trades keep whatever they were actually
+            # filled under — analysis must never silently mix the two.
+            "synthetic_quote": synthetic_quote,
+            "synthetic_spread_pct": float(SPREAD_PCT) if synthetic_quote else None,
         },
         risk_params={
             "stop_price": str(execution.price - stop_distance),

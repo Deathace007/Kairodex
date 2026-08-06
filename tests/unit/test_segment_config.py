@@ -11,7 +11,7 @@ from kairodex.core.enums import Segment
 @pytest.mark.parametrize(
     "segment,capital,currency,base_risk_pct,hard_ceiling_pct,max_premium_pct,max_concurrent",
     [
-        (Segment.NSE_STOCK, 50000, "INR", 0.08, 0.35, 0.35, 1),
+        (Segment.NSE_STOCK, 50000, "INR", 0.08, 0.35, 0.35, 5),
         (Segment.NSE_INDEX, 50000, "INR", 0.07, 0.25, 0.35, 2),
         (Segment.US_STOCK, 50000, "USD", 0.015, 0.03, 0.05, 6),
         (Segment.US_INDEX, 50000, "USD", 0.015, 0.03, 0.05, 6),

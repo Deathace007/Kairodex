@@ -531,12 +531,24 @@ if risk(1 lot) > hard_ceiling_pct × equity: reject SIZE_EXCEEDS_CEILING
 
 **Per-segment risk config.** Capital was kept at the specified levels (SPEC_REVIEW A2), so NSE necessarily runs at elevated risk. That is configured openly rather than hidden:
 
-| Segment | Capital | `base_risk_pct` | `hard_ceiling_pct` | Realistic concurrency |
+| Segment | Capital | `base_risk_pct` | `hard_ceiling_pct` | `max_concurrent` |
 |---|---|---|---|---|
-| NSE Stock | ₹50,000 | 8% | 35% | 0–1 |
-| NSE Index | ₹50,000 | 7% | 25% | 1–2 |
-| US Stock | $50,000 | 1.5% | 3% | 4–6 |
-| US Index | $50,000 | 1.5% | 3% | 4–6 |
+| NSE Stock | ₹50,000 | 8% | 35% | 5 |
+| NSE Index | ₹50,000 | 7% | 25% | 2 |
+| US Stock | $50,000 | 1.5% | 3% | 6 |
+| US Index | $50,000 | 1.5% | 3% | 6 |
+
+This column was originally "realistic concurrency" — a prediction of what
+the capital allows (NSE Stock 0–1) rather than the configured cap. It now
+states the actual `max_concurrent` in `config/segments/*.yaml`, since that
+is the value the gate chain enforces and the value the test suite pins.
+NSE Stock was raised 1 → 5 on 2026-08-06 (user's call). Note that this
+raises a ceiling the capital math still sits below: `exposure_cap_pct`
+0.40 caps total exposure at ₹20,000 while `max_premium_pct` 0.35 allows
+₹17,500 in any one position, so the exposure gate — not `max_concurrent` —
+remains the binding constraint on this book. The higher cap lets several
+genuinely small positions coexist; it does not authorise five full-size
+ones.
 
 Every trade record stores the risk parameters in force, and both the dashboard and the export bundle display the segment's risk profile alongside its returns — so NSE performance is never read as if it were achieved at US risk levels. Cross-segment comparison on the Master Dashboard is therefore shown **risk-adjusted by default**; raw P&L comparison across segments at 5× different risk-per-trade would be actively misleading.
 
