@@ -31,7 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from kairodex.config.segments import SegmentRiskConfig
 from kairodex.core.enums import Market, Segment, Side
-from kairodex.data.types import Tick
+from kairodex.data.types import ChainSnapshot, Tick
 from kairodex.engine import event_log
 from kairodex.engine.monitor import Position, evaluate_exits
 from kairodex.execution.simulator import ExecutionPort, ExecutionResult
@@ -43,7 +43,7 @@ from kairodex.risk.gates import run_gate_chain
 from kairodex.risk.sizing import size_position
 from kairodex.risk.types import AccountState, TradeProposal
 from kairodex.store.models import Fill, Instrument, OptionQuote, Order, PositionMark, Signal, Trade
-from kairodex.strategy.contract_selector import ContractCandidate, select_contract
+from kairodex.strategy.contract_selector import ContractCandidate, SelectionResult, select_contract
 from kairodex.strategy.protocol import Strategy
 from kairodex.strategy.scorer import ConfluenceScorer
 from kairodex.strategy.types import MarketContext
@@ -115,6 +115,60 @@ def _candidates_from_chain(
     return out
 
 
+def _select_across_expiries(
+    chain: list[ChainSnapshot],
+    direction: Side,
+    *,
+    spot: Decimal,
+    equity: Decimal,
+    max_premium_pct: float,
+    lot_size: int,
+    as_of: datetime.date,
+    synthetic_quotes: bool,
+) -> SelectionResult:
+    """Try every loaded expiry snapshot, nearest first, not just the single
+    nearest one — pulled out of `run_entry_tick` so this exact loop has a
+    unit test, since `run_entry_tick` itself is DB-touching and only ever
+    exercised on the VM.
+
+    Bug found live 2026-08-06: the previous code committed to
+    `min(chain, key=expiry)` and gave up if THAT snapshot's DTE fell
+    outside `select_contract`'s own min_dte/max_dte window — even when a
+    second, perfectly good snapshot was sitting unused in the same
+    `feature_ctx.chain`. This was the dominant reason us_index never
+    traded: SPY/QQQ/IWM trade near-daily expiries, so the nearest one is
+    almost always 0 DTE (today), which `min_dte=1` correctly rejects,
+    while the very next snapshot (traced live: SPY/QQQ/IWM all had one at
+    1 DTE) would select cleanly. DTE bounds are still exactly
+    `select_contract`'s own to enforce; this only makes sure every loaded
+    expiry actually gets asked.
+
+    Returns the first snapshot's own failing `SelectionResult` when
+    nothing across the whole chain selects, so the caller's existing
+    `selection.selected is None` check needs no change — same contract a
+    single-snapshot call already had."""
+    first: SelectionResult | None = None
+    for snapshot in sorted(chain, key=lambda s: s.expiry):
+        candidates = _candidates_from_chain(
+            snapshot.quotes, snapshot.expiry, synthetic_quotes=synthetic_quotes
+        )
+        trial = select_contract(
+            candidates,
+            direction,
+            spot=spot,
+            equity=equity,
+            max_premium_pct=max_premium_pct,
+            lot_size=lot_size,
+            as_of=as_of,
+        )
+        if first is None:
+            first = trial
+        if trial.selected is not None and trial.mid_price is not None:
+            return trial
+    assert first is not None  # caller already checked `feature_ctx.chain` is non-empty
+    return first
+
+
 async def run_entry_tick(
     session: AsyncSession,
     *,
@@ -174,15 +228,11 @@ async def run_entry_tick(
         await session.commit()
         return TickOutcome(signal.signal_id, False, signal.reject_stage, signal.reject_reason)
 
-    front = min(feature_ctx.chain, key=lambda s: s.expiry)
     # LSE (the only US options vendor) publishes no book at all, so US
     # candidates are modelled from last price — see execution.synthetic_quote
     # for the three rules that keep that honest. NSE has real depth and must
     # never take this path.
     synthetic_quotes = segment.market is Market.US
-    candidates = _candidates_from_chain(
-        front.quotes, front.expiry, synthetic_quotes=synthetic_quotes
-    )
 
     lot_size = 25 if segment.market.value == "nse" else 100  # ponytail: instrument_specs (P0
     # table, SCD-2 lot size) isn't wired into this path yet — a fixed per-market default
@@ -192,14 +242,15 @@ async def run_entry_tick(
     # using the wrong lot_size there would silently pass contracts that are actually
     # unaffordable once sized for real.
 
-    selection = select_contract(
-        candidates,
+    selection = _select_across_expiries(
+        feature_ctx.chain,
         result.direction,
         spot=Decimal(str(feature_ctx.spot)),
         equity=account.equity,
         max_premium_pct=config.max_premium_pct,
         lot_size=lot_size,
         as_of=now.date(),
+        synthetic_quotes=synthetic_quotes,
     )
     if selection.selected is None or selection.mid_price is None:
         signal.reject_stage, signal.reject_reason = "contract_selection", selection.reason
