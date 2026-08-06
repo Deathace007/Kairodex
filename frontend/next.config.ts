@@ -23,6 +23,19 @@ const isStaticExport = process.env.NEXT_OUTPUT_MODE === "export";
 
 const nextConfig: NextConfig = {
   output: isStaticExport ? "export" : undefined,
+  // The two modes MUST NOT share a build directory. Both used to write the
+  // default `.next`, and since the export build runs on the same VM, in the
+  // same checkout, as the live `kairodex-frontend` service (which is just
+  // `next start` reading `.next`), every Surge deploy silently replaced the
+  // live server's build with a static export — and the 5-minute timer did it
+  // again every 5 minutes. The "live" dashboard was serving data frozen at
+  // the last export build, which is exactly what this file's comment above
+  // says the export must never become: a *separate* mode, "not a
+  // replacement for it". Found 2026-08-06 by noticing the dashboard showed
+  // a stop of 376.04 while the API simultaneously returned 384.65.
+  // `out/` (what deploy-surge.sh publishes) is unaffected — with
+  // `output: "export"` that stays the export target regardless of distDir.
+  distDir: isStaticExport ? ".next-export" : undefined,
 };
 
 export default nextConfig;
