@@ -60,13 +60,32 @@ _PENNY_TICK_THRESHOLD = Decimal("3")
 _TICK_BELOW = Decimal("0.01")
 _TICK_ABOVE = Decimal("0.05")
 
-# Top-of-book size proxy: today's volume divided by this. Displayed size for
-# a liquid US option runs tens of contracts against daily volume in the
-# thousands, so ~1% is the right order of magnitude. The valuable property
-# is the edge case, not the ratio: a contract with no prints today gets size
-# 0 and is rejected by the fill model's own NO_LIQUIDITY_AT_TOP_OF_BOOK,
-# which is exactly the right answer for a contract nobody is trading.
-_VOLUME_TO_TOP_OF_BOOK = 100
+# Top-of-book size proxy, from today's volume. Displayed size and daily
+# volume are only loosely coupled in reality — a market maker shows tens of
+# contracts on a liquid option almost regardless of how many trade — so this
+# scales sub-linearly and caps out rather than pretending a busy contract
+# shows a proportionally enormous book.
+#
+# This is the loosest assumption in this module and the one most worth
+# revisiting first. Measured against real recorded US legs (2026-08-06):
+# volume is far thinner than the "chain full of liquid options" intuition
+# suggests — p99 across all legs is ~102/day and the single busiest contract
+# in the whole watchlist did 3,628. So the divisor materially decides how
+# much of the chain is tradeable at all, and a too-generous one would
+# manufacture fills on contracts nobody could actually get filled in.
+_VOLUME_TO_TOP_OF_BOOK = 20
+_MAX_TOP_OF_BOOK = 50
+
+# execution.fills fills at most `partial_fill_alpha` (0.25) of top-of-book,
+# floored — so a modelled size below 4 cannot fill even one lot, and the
+# contract would be selected and then rejected NO_LIQUIDITY_AT_TOP_OF_BOOK
+# every time. Dropping it here instead makes thin contracts fail to be
+# *candidates* rather than fail at execution, which is both cheaper and
+# more honest: the selector then picks the best contract it can actually
+# trade, rather than picking on delta alone and discovering afterwards that
+# nobody is quoting it. That ordering is also what "only high-conviction
+# setups" requires — an untradeable strike is not a setup.
+_MIN_TOP_OF_BOOK = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,10 +105,15 @@ def synthesize_quote(
     """Build a modelled book around `ltp`, or None when there is nothing
     honest to build one from.
 
-    Returns None — rather than a zero-width or zero-size quote — when last
-    price is missing or non-positive, so the caller drops the contract
-    instead of trading a fabricated one. A contract with no last price has
-    never traded; there is no evidence it can be bought at any price.
+    Returns None — rather than a zero-width or unfillable quote — in three
+    cases, so the caller drops the contract instead of trading a fabricated
+    one:
+
+      * no last price: the contract has never printed, so there is no
+        evidence it can be bought at any price;
+      * sub-tick premium, where a book cannot straddle zero;
+      * too little volume to model a fillable top of book (see
+        `_MIN_TOP_OF_BOOK`) — a strike nobody is trading is not a setup.
     """
     if ltp is None or ltp <= 0:
         return None
@@ -99,8 +123,10 @@ def synthesize_quote(
 
     bid = ltp - half_spread
     if bid <= 0:
-        # Sub-tick premium: a book cannot straddle zero. Nothing to model.
         return None
 
-    size = max(0, (volume or 0) // _VOLUME_TO_TOP_OF_BOOK)
+    size = min((volume or 0) // _VOLUME_TO_TOP_OF_BOOK, _MAX_TOP_OF_BOOK)
+    if size < _MIN_TOP_OF_BOOK:
+        return None
+
     return SyntheticQuote(bid=bid, ask=ltp + half_spread, bid_sz=size, ask_sz=size)

@@ -51,23 +51,32 @@ def test_no_last_price_means_no_quote():
     assert synthesize_quote(Decimal("-1"), volume=1000) is None
 
 
-def test_zero_volume_yields_zero_size_so_the_fill_model_rejects_it():
-    """The point of the volume proxy is this edge case: nobody traded this
-    contract today, so there is no top of book to lift."""
-    q = synthesize_quote(Decimal("10.00"), volume=0)
-    assert q is not None
-    assert q.bid_sz == 0 and q.ask_sz == 0
-
-    q_none = synthesize_quote(Decimal("10.00"), volume=None)
-    assert q_none is not None
-    assert q_none.bid_sz == 0
+def test_untraded_contract_is_dropped_entirely():
+    """Nobody traded this today, so there is no book to lift. Dropping it
+    beats returning a zero-size quote that the selector would choose on
+    delta and the fill model would then reject every single time."""
+    assert synthesize_quote(Decimal("10.00"), volume=0) is None
+    assert synthesize_quote(Decimal("10.00"), volume=None) is None
 
 
-def test_size_scales_with_volume():
-    thin = synthesize_quote(Decimal("10.00"), volume=500)
-    thick = synthesize_quote(Decimal("10.00"), volume=50_000)
+def test_volume_too_thin_to_fill_one_lot_is_dropped():
+    """fills.py fills floor(0.25 * top_of_book), so a size below 4 cannot
+    fill even one lot. Such a contract must fail to be a candidate, not
+    fail at execution — measured on real US legs, this is the difference
+    between US trading and US failing at a different line."""
+    assert synthesize_quote(Decimal("10.00"), volume=79) is None  # -> size 3
+    assert synthesize_quote(Decimal("10.00"), volume=80) is not None  # -> size 4
+
+
+def test_size_scales_with_volume_but_is_capped():
+    thin = synthesize_quote(Decimal("10.00"), volume=200)
+    thick = synthesize_quote(Decimal("10.00"), volume=5_000)
     assert thin is not None and thick is not None
     assert thick.bid_sz > thin.bid_sz
+    # Displayed size does not grow without bound just because volume does.
+    huge = synthesize_quote(Decimal("10.00"), volume=10_000_000)
+    assert huge is not None
+    assert huge.bid_sz == thick.bid_sz or huge.bid_sz <= 50
 
 
 def test_bid_never_goes_non_positive():
