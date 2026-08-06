@@ -1190,3 +1190,51 @@ only high-conviction setups — neither overtrade nor undertrade. A low
 take-rate is not itself a bug. But a rejection for *plumbing* (§13c) is a
 bug wearing a conviction rejection's clothes, and the two must never be
 conflated when tuning gates.
+
+### 13g. The "live" dashboard had not been live (2026-08-06)
+
+Found while doing a routine "update the VM and frontend": the dashboard
+rendered a stop of `376.04` and a Target of `—` while `/api/segments/
+nse_index/positions`, queried at the same instant, returned `384.65` and
+`922.740000`. Two independent bugs, both introduced by §12f's own mirror:
+
+1. **The export build clobbered the live build.** Both modes wrote the
+   default `.next`, and `deploy-surge.sh` runs in the same checkout, on
+   the same VM, as `kairodex-frontend` — whose unit is a bare
+   `npx next start` with no build step. So every Surge deploy replaced the
+   live server's build with a static export, and the 5-minute timer did it
+   again every 5 minutes. `next.config.ts` already *said* the export must
+   be "a *separate* build mode ... not a replacement for it"; sharing
+   `distDir` made it exactly a replacement. Export now builds into
+   `.next-export`.
+2. **The mirror was stale too.** The export fetches at build time with
+   Next's default caching (a static export has no server, so `no-store`
+   isn't available to it), and Next persists those results in
+   `.next/cache/fetch-cache` **across builds** — so the timer rebuilt
+   faithfully and re-baked the same payloads forever. Demonstrated rather
+   than assumed: the 20:06:57 export baked `376.04`/null-target while the
+   API already served `384.65`/`922.74`; once the cache was cleared, the
+   next export baked the correct values. `deploy-surge.sh` now drops the
+   fetch cache before each build.
+
+**Non-obvious detail that caused a third, self-inflicted bug:** with
+`output: "export"`, `distDir` **is** the directory the exported site is
+written to — it does not merely relocate build artifacts and leave `out/`
+as the export target. After splitting `distDir`, `deploy-surge.sh` kept
+uploading a stale leftover `out/`, and `surge` reported `Success!` each
+time because the path still existed. (It aborts loudly when the directory
+is genuinely absent — that is how this was caught.) It now publishes
+`.next-export`, verified to contain only the site: `404.html`,
+`index.html`, `_next/`, `segment/`, `CNAME`, no build internals.
+
+Verified after the fix: live dashboard and mirror both render
+`384.65 / 922.74`, the live routes build as `ƒ (Dynamic) server-rendered
+on demand` and answer with `Cache-Control: private, no-cache, no-store,
+must-revalidate` (a static export cannot), the live build survives an
+export deploy unchanged, and the timer's own service unit — not just a
+manual run — completes with `Result=success`.
+
+**Worth generalising:** every fault in §13 was silent. This one had a
+green systemd unit, a green `Success!` from Surge, and a dashboard that
+rendered plausible numbers. The only thing that caught it was comparing
+two sources of the same fact at the same instant.
