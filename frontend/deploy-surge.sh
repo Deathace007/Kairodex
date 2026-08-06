@@ -19,7 +19,17 @@ cd "$(dirname "$0")"
 # it was still serving a positions payload from before profit_target
 # existed, rendering Target as "—" against an API that had it.
 # Cheap to discard: this is one small localhost fetch per panel.
-rm -rf .next-export/cache/fetch-cache
+#
+# The path is under `.next`, NOT under the export's own distDir: Next keeps
+# the Data Cache in `.next/cache` even when `distDir` moves the export
+# output elsewhere. Clearing only the fetch cache leaves the live server's
+# build (`.next/BUILD_ID`, `.next/server/...`) untouched.
+rm -rf .next/cache/fetch-cache
 
 NEXT_OUTPUT_MODE=export npm run build
-surge ./out app.swingpro.tech
+
+# Publish the export's distDir, which with `output: "export"` IS the built
+# site (see next.config.ts). Publishing `./out` here silently shipped a
+# stale directory left over from before distDir was split — Surge reported
+# "Success!" either way, since it only ever checked that the path existed.
+surge ./.next-export app.swingpro.tech

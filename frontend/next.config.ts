@@ -33,8 +33,17 @@ const nextConfig: NextConfig = {
   // says the export must never become: a *separate* mode, "not a
   // replacement for it". Found 2026-08-06 by noticing the dashboard showed
   // a stop of 376.04 while the API simultaneously returned 384.65.
-  // `out/` (what deploy-surge.sh publishes) is unaffected — with
-  // `output: "export"` that stays the export target regardless of distDir.
+  //
+  // NOTE, and it is not obvious: with `output: "export"`, `distDir` IS the
+  // directory the exported *site* is written to — it does not merely move
+  // build artifacts and leave `out/` as the export target. So
+  // `.next-export/` is what deploy-surge.sh publishes, and no `out/` is
+  // produced in this mode at all. An earlier revision of this very comment
+  // asserted the opposite, and the deploy script duly kept publishing a
+  // stale leftover `out/` while reporting "Success!". The export build does
+  // still share `.next/cache` with the live build for Next's Data Cache,
+  // which is why deploy-surge.sh clears the fetch cache there and not under
+  // distDir.
   distDir: isStaticExport ? ".next-export" : undefined,
 };
 
