@@ -581,3 +581,50 @@ class ResearchNote(Base):
         ARRAY(BigInteger), nullable=False, default=list
     )
     status: Mapped[str] = mapped_column(String, nullable=False, default="open")
+
+
+class SystemState(Base):
+    """P6 — the persisted global kill switch (ARCHITECTURE.md §11's gate
+    chain order comment: "kill switch -> breaker state -> ..." and §15's
+    `POST /api/kill`; SPEC_REVIEW.md B8: "a global kill switch (manual,
+    halts all four [segments]) ... persisted, requiring explicit human
+    re-arm"). Single-row table (`id` pinned to `1` by the CHECK
+    constraint) — there is exactly one kill switch, not one per segment
+    (that's `risk_state.breaker_status` instead, already per-segment).
+
+    Before this table existed, `risk.loader.build_account_state`'s
+    `kill_switch_engaged` parameter only ever took its hardcoded `False`
+    default — nothing anywhere ever set it `True` for a real reason, so
+    the kill switch named in the gate chain's own docstring was inert in
+    the live engine. `build_account_state` now reads this table by
+    default; `/api/kill` is what actually gets to flip it.
+    """
+
+    __tablename__ = "system_state"
+    __table_args__ = (CheckConstraint("id = 1", name="ck_system_state_singleton"),)
+
+    id: Mapped[int] = mapped_column(SmallInteger, primary_key=True, default=1)
+    kill_engaged: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    kill_reason: Mapped[str | None] = mapped_column(String)
+    updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class AuditLog(Base):
+    """§5.5 — every human control action the API allows (`POST
+    .../promote`, `.../breaker`, `/api/kill`), per §15's "Writes are
+    limited to human control actions, all audited." `before`/`after` are
+    plain JSONB snapshots of whatever changed (a `risk_state.
+    breaker_status` value, a `strategies.status` value, the kill switch's
+    own state) — a generic shape rather than one table per action type,
+    since there are only ever a handful of these and they share nothing
+    structurally worth a shared base class for."""
+
+    __tablename__ = "audit_log"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    ts: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    actor: Mapped[str] = mapped_column(String, nullable=False)
+    action: Mapped[str] = mapped_column(String, nullable=False)
+    target: Mapped[str] = mapped_column(String, nullable=False)
+    before: Mapped[dict[str, object] | None] = mapped_column(JSONB)
+    after: Mapped[dict[str, object] | None] = mapped_column(JSONB)

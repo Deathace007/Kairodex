@@ -27,7 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from kairodex.backtest import metrics
 from kairodex.backtest.types import BacktestSignal
 from kairodex.backtest.validation import WalkForwardFold, deflated_sharpe, walk_forward_efficiency
-from kairodex.core.enums import Segment, StrategyStatus
+from kairodex.core.enums import Segment, is_valid_strategy_transition
 from kairodex.store.models import EquitySnapshot, Fill, Order, Trade
 
 _MIN_TRACK_A_SAMPLE = 200
@@ -46,20 +46,13 @@ _MAX_SLIPPAGE_REALISM_RATIO = 1.5  # ponytail: first-pass — realized/modelled
 # slippage within 1.5x is "roughly what the model assumed"; no exact
 # tolerance is given in the doc, recalibrate once real fills accumulate.
 
-# ARCHITECTURE.md §10's transition graph, literally.
-_VALID_TRANSITIONS: dict[StrategyStatus, frozenset[StrategyStatus]] = {
-    StrategyStatus.DRAFT: frozenset({StrategyStatus.BACKTESTED}),
-    StrategyStatus.BACKTESTED: frozenset({StrategyStatus.VALIDATED}),
-    StrategyStatus.VALIDATED: frozenset({StrategyStatus.SHADOW}),
-    StrategyStatus.SHADOW: frozenset({StrategyStatus.PAPER_SMALL, StrategyStatus.RETIRED}),
-    StrategyStatus.PAPER_SMALL: frozenset({StrategyStatus.PAPER_FULL, StrategyStatus.RETIRED}),
-    StrategyStatus.PAPER_FULL: frozenset({StrategyStatus.RETIRED}),
-    StrategyStatus.RETIRED: frozenset(),
-}
-
-
-def is_valid_transition(from_status: StrategyStatus, to_status: StrategyStatus) -> bool:
-    return to_status in _VALID_TRANSITIONS.get(from_status, frozenset())
+# The transition graph itself now lives in kairodex.core.enums (P6) — so
+# kairodex.api's promote endpoint can validate a requested transition
+# without importing this module (forbidden by the import-linter contract
+# "API is glue, not business logic"). Re-exported here under its
+# original name so every existing caller/test in this module keeps
+# working unchanged.
+is_valid_transition = is_valid_strategy_transition
 
 
 @dataclass(frozen=True, slots=True)

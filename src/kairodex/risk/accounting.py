@@ -128,14 +128,34 @@ async def update_equity_and_risk_state(
     # breaker tripped on a bad day un-trips the next calendar day —
     # deliberately stateless, no separate manual-reset workflow for a
     # paper system).
-    breaker_status = "ARMED"
-    breaker_reason = None
-    if equity > 0 and float(-daily_pnl) / float(equity) >= config.daily_loss_limit_pct:
-        breaker_status, breaker_reason = "TRIPPED", "DAILY_LOSS_LIMIT_REACHED"
-    elif equity > 0 and float(-weekly_pnl) / float(equity) >= config.weekly_loss_limit_pct:
-        breaker_status, breaker_reason = "TRIPPED", "WEEKLY_LOSS_LIMIT_REACHED"
-    elif float(drawdown) >= config.max_drawdown_pct:
-        breaker_status, breaker_reason = "TRIPPED", "MAX_DRAWDOWN_REACHED"
+    #
+    # A P6 subagent... — no, caught directly this session: a MANUAL trip
+    # (`POST /api/segments/{seg}/breaker`, `kairodex.api`) needs to
+    # actually stay tripped — without this check, this function runs
+    # every engine tick (`live_loop.run_segment`) and would silently
+    # recompute `breaker_status` back to `"ARMED"` the very next cycle
+    # (~60s later) the moment the auto-trip conditions weren't *also*
+    # breached, undoing a human's explicit halt before they could act on
+    # it. `breaker_reason` starting `"MANUAL_"` is the sentinel
+    # (`api.routers.control`'s own convention) — sticky until a human
+    # explicitly re-arms it via the same endpoint, matching SPEC_REVIEW.md
+    # B8's "both persisted, both requiring explicit human re-arm."
+    existing_risk_state = await session.get(RiskState, segment)
+    existing_reason = existing_risk_state.breaker_reason if existing_risk_state else None
+    manually_tripped = existing_reason is not None and existing_reason.startswith("MANUAL_")
+
+    if manually_tripped:
+        breaker_status: str = "TRIPPED"
+        breaker_reason: str | None = existing_reason
+    else:
+        breaker_status = "ARMED"
+        breaker_reason = None
+        if equity > 0 and float(-daily_pnl) / float(equity) >= config.daily_loss_limit_pct:
+            breaker_status, breaker_reason = "TRIPPED", "DAILY_LOSS_LIMIT_REACHED"
+        elif equity > 0 and float(-weekly_pnl) / float(equity) >= config.weekly_loss_limit_pct:
+            breaker_status, breaker_reason = "TRIPPED", "WEEKLY_LOSS_LIMIT_REACHED"
+        elif float(drawdown) >= config.max_drawdown_pct:
+            breaker_status, breaker_reason = "TRIPPED", "MAX_DRAWDOWN_REACHED"
 
     mult = risk_multiplier(equity, hwm, consecutive_losses)
 
@@ -155,7 +175,7 @@ async def update_equity_and_risk_state(
         )
     )
 
-    risk_state = await session.get(RiskState, segment)
+    risk_state = existing_risk_state
     if risk_state is None:
         risk_state = RiskState(segment=segment, as_of=now)
         session.add(risk_state)

@@ -25,10 +25,12 @@ from kairodex.execution.simulator import ExecutionPort, ShadowLogger, SimulatedB
 from kairodex.risk.accounting import update_equity_and_risk_state
 from kairodex.risk.loader import build_account_state
 from kairodex.store.base import get_sessionmaker
+from kairodex.store.models import PositionMark, RiskState, Trade
 from kairodex.store.models import Strategy as StrategyRow
-from kairodex.store.models import Trade
 from kairodex.strategy.protocol import ReferenceStrategy
 from kairodex.strategy.scorer import ConfluenceScorer
+from kairodex.streaming.bus import publish
+from kairodex.streaming.types import StreamMessage
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +107,21 @@ async def run_segment(segment: Segment, *, shadow: bool = True) -> None:
                             outcome.reject_stage,
                             outcome.reject_reason,
                         )
+                        await publish(
+                            StreamMessage(
+                                type="signal",
+                                segment=segment.value,
+                                ts=now,
+                                data={
+                                    "signal_id": outcome.signal_id,
+                                    "underlying_symbol": underlying.symbol,
+                                    "taken": outcome.taken,
+                                    "reject_stage": outcome.reject_stage,
+                                    "reject_reason": outcome.reject_reason,
+                                    "trade_id": outcome.trade_id,
+                                },
+                            )
+                        )
                 except Exception:
                     logger.exception(
                         "%s: entry tick failed for %s", segment.value, underlying.symbol
@@ -124,11 +141,56 @@ async def run_segment(segment: Segment, *, shadow: bool = True) -> None:
                     )
                     if exit_outcome.closed:
                         logger.info("trade %d closed: %s", trade.trade_id, exit_outcome.action)
+                        await publish(
+                            StreamMessage(
+                                type="trade_closed",
+                                segment=segment.value,
+                                ts=now,
+                                data={"trade_id": trade.trade_id, "reason": exit_outcome.action},
+                            )
+                        )
+                    else:
+                        mark = await session.scalar(
+                            select(PositionMark)
+                            .where(PositionMark.trade_id == trade.trade_id)
+                            .order_by(PositionMark.ts.desc())
+                            .limit(1)
+                        )
+                        await publish(
+                            StreamMessage(
+                                type="position_update",
+                                segment=segment.value,
+                                ts=now,
+                                data={
+                                    "trade_id": trade.trade_id,
+                                    "action": exit_outcome.action,
+                                    "mark": str(mark.mark) if mark else None,
+                                    "unrealized": str(mark.unrealized) if mark else None,
+                                },
+                            )
+                        )
                 except Exception:
                     logger.exception("exit tick failed for trade %d", trade.trade_id)
 
             try:
                 await update_equity_and_risk_state(session, segment, now)
+                risk_state = await session.get(RiskState, segment)
+                if risk_state is not None:
+                    await publish(
+                        StreamMessage(
+                            type="risk_update",
+                            segment=segment.value,
+                            ts=now,
+                            data={
+                                "daily_pnl": str(risk_state.daily_pnl),
+                                "weekly_pnl": str(risk_state.weekly_pnl),
+                                "consecutive_losses": risk_state.consecutive_losses,
+                                "breaker_status": risk_state.breaker_status,
+                                "breaker_reason": risk_state.breaker_reason,
+                                "risk_multiplier": str(risk_state.risk_multiplier),
+                            },
+                        )
+                    )
             except Exception:
                 logger.exception("%s: equity/risk-state update failed", segment.value)
 

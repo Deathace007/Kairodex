@@ -487,5 +487,17 @@ def jobs_cmd() -> None:
     run()
 
 
+@app.command("api")
+def api_cmd(
+    host: str = typer.Option("127.0.0.1", help="Bind address — see kairodex.api.main's docstring"),
+    port: int = typer.Option(8000),
+    reload: bool = typer.Option(False, help="Auto-reload on code change (dev only)"),
+) -> None:
+    """P6: the read-mostly FastAPI process (ARCHITECTURE.md §3/§15)."""
+    import uvicorn
+
+    uvicorn.run("kairodex.api.main:app", host=host, port=port, reload=reload)
+
+
 if __name__ == "__main__":
     app()

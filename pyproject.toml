@@ -21,6 +21,8 @@ dependencies = [
   "apscheduler>=3.11",
   "lse-data>=0.14.0",
   "protobuf>=7.35.1",
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.34",
 ]
 
 [dependency-groups]
@@ -58,6 +60,9 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 [tool.ruff.lint.per-file-ignores]
 # Typer's Option()/Argument() defaults are call-in-default by design.
 "src/kairodex/cli.py" = ["B008"]
+# FastAPI's Depends()/Query() defaults are the same call-in-default
+# pattern, equally by design (FastAPI's own DI resolves them per-request).
+"src/kairodex/api/**" = ["B008"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -76,6 +81,13 @@ testpaths = ["tests"]
 
 [tool.importlinter]
 root_package = "kairodex"
+# Required for the "Optuna stays out..." contract below, whose forbidden
+# module (`optuna`) is external to `kairodex` — found via the same P6
+# `lint-imports` crash that also caught `kairodex/strategy`'s missing
+# `__init__.py`; without this, import-linter refuses to even start
+# ("must have include_external_packages=True when there are external
+# forbidden modules"), so this contract had never actually run either.
+include_external_packages = true
 
 [[tool.importlinter.contracts]]
 name = "API is glue, not business logic"

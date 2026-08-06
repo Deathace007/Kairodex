@@ -15,7 +15,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from kairodex.core.enums import Market, Segment
 from kairodex.risk.types import AccountState
-from kairodex.store.models import EquitySnapshot, Instrument, RiskState, Trade, TradingCalendar
+from kairodex.store.models import (
+    EquitySnapshot,
+    Instrument,
+    RiskState,
+    SystemState,
+    Trade,
+    TradingCalendar,
+)
 
 _LIVE_RUN_ID = 0  # EquitySnapshot's sentinel for "live paper book" — see its model docstring
 
@@ -58,9 +65,20 @@ async def build_account_state(
     segment: Segment,
     now: datetime.datetime,
     *,
-    kill_switch_engaged: bool = False,
+    kill_switch_engaged: bool | None = None,
 ) -> AccountState:
+    """`kill_switch_engaged=None` (the default) reads the real, persisted
+    global kill switch from `system_state` (P6, `POST /api/kill`) —
+    before that table existed, this parameter's hardcoded `False` default
+    meant the kill switch named in the gate chain's own docstring order
+    was permanently inert; nothing anywhere could ever engage it. Passing
+    an explicit `True`/`False` still overrides (tests, and any future
+    caller with its own source of truth)."""
     default_capital = Decimal("50000")  # overwritten below once an equity_snapshots row exists
+
+    if kill_switch_engaged is None:
+        system_state = await session.get(SystemState, 1)
+        kill_switch_engaged = system_state.kill_engaged if system_state is not None else False
 
     risk_state = await session.get(RiskState, segment)
     latest_snapshot = await session.scalar(

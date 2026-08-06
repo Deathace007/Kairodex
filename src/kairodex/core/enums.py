@@ -82,3 +82,27 @@ class StrategyStatus(enum.StrEnum):
     PAPER_SMALL = "paper_small"
     PAPER_FULL = "paper_full"
     RETIRED = "retired"
+
+
+# ARCHITECTURE.md §10's transition graph, literally. Lives here (not in
+# kairodex.backtest.promotion, where it originated) so kairodex.api's
+# `POST /strategies/{id}/promote` can validate a human-requested
+# transition without importing kairodex.backtest at all — the
+# import-linter contract "API is glue, not business logic" forbids that
+# import outright, and this table is pure enum topology, not business
+# logic (the actual gate *evaluation* — is a strategy good enough to
+# promote — stays in kairodex.backtest.promotion, correctly off-limits
+# to the API; this is only "which transitions are topologically legal").
+_VALID_STRATEGY_TRANSITIONS: dict[StrategyStatus, frozenset[StrategyStatus]] = {
+    StrategyStatus.DRAFT: frozenset({StrategyStatus.BACKTESTED}),
+    StrategyStatus.BACKTESTED: frozenset({StrategyStatus.VALIDATED}),
+    StrategyStatus.VALIDATED: frozenset({StrategyStatus.SHADOW}),
+    StrategyStatus.SHADOW: frozenset({StrategyStatus.PAPER_SMALL, StrategyStatus.RETIRED}),
+    StrategyStatus.PAPER_SMALL: frozenset({StrategyStatus.PAPER_FULL, StrategyStatus.RETIRED}),
+    StrategyStatus.PAPER_FULL: frozenset({StrategyStatus.RETIRED}),
+    StrategyStatus.RETIRED: frozenset(),
+}
+
+
+def is_valid_strategy_transition(from_status: StrategyStatus, to_status: StrategyStatus) -> bool:
+    return to_status in _VALID_STRATEGY_TRANSITIONS.get(from_status, frozenset())
