@@ -1,7 +1,7 @@
 "use client";
 
 import { useStream } from "@/lib/useStream";
-import { fmtTs } from "@/lib/format";
+import { fmtNum, fmtTs } from "@/lib/format";
 import { Badge } from "./ui/Badge";
 
 const TYPE_LABEL: Record<string, string> = {
@@ -57,7 +57,10 @@ function summarize(m: { type: string; data: Record<string, unknown> }): string {
     case "trade_closed":
       return `trade ${m.data.trade_id} — ${m.data.reason}`;
     case "position_update":
-      return `trade ${m.data.trade_id} mark ${m.data.mark ?? "—"}`;
+      // m.data.mark is a Decimal string (live_loop.py str()s it before
+      // publishing) — through fmtNum for consistency with the rest of
+      // the app rather than rendering the raw wire value.
+      return `trade ${m.data.trade_id} mark ${fmtNum(m.data.mark as string | null)}`;
     case "risk_update":
       return `breaker ${m.data.breaker_status}`;
     default:

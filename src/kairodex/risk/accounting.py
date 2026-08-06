@@ -129,18 +129,30 @@ async def update_equity_and_risk_state(
     # deliberately stateless, no separate manual-reset workflow for a
     # paper system).
     #
-    # A P6 subagent... — no, caught directly this session: a MANUAL trip
-    # (`POST /api/segments/{seg}/breaker`, `kairodex.api`) needs to
-    # actually stay tripped — without this check, this function runs
-    # every engine tick (`live_loop.run_segment`) and would silently
-    # recompute `breaker_status` back to `"ARMED"` the very next cycle
-    # (~60s later) the moment the auto-trip conditions weren't *also*
-    # breached, undoing a human's explicit halt before they could act on
-    # it. `breaker_reason` starting `"MANUAL_"` is the sentinel
+    # Caught directly this session: a MANUAL trip (`POST /api/segments/
+    # {seg}/breaker`, `kairodex.api`) needs to actually stay tripped —
+    # without this check, this function runs every engine tick
+    # (`live_loop.run_segment`) and would silently recompute
+    # `breaker_status` back to `"ARMED"` the very next cycle (~60s later)
+    # the moment the auto-trip conditions weren't *also* breached,
+    # undoing a human's explicit halt before they could act on it.
+    # `breaker_reason` starting `"MANUAL_"` is the sentinel
     # (`api.routers.control`'s own convention) — sticky until a human
     # explicitly re-arms it via the same endpoint, matching SPEC_REVIEW.md
     # B8's "both persisted, both requiring explicit human re-arm."
+    #
+    # `session.get()` alone can return a *stale* row here: this session
+    # was opened at the top of `run_segment`'s tick, several seconds
+    # before this call, and `expire_on_commit=False` (`store/base.py`)
+    # means an intermediate commit from earlier in the same tick doesn't
+    # invalidate the identity-mapped `RiskState` object — so a manual
+    # trip landing via a *different* session mid-tick can be invisible
+    # here (a P6 subagent review traced this exactly). `refresh()` forces
+    # a real read, narrowing the race to "between this query and the
+    # `UPDATE` below" instead of "the whole ~6.5s active tick phase."
     existing_risk_state = await session.get(RiskState, segment)
+    if existing_risk_state is not None:
+        await session.refresh(existing_risk_state, attribute_names=["breaker_reason"])
     existing_reason = existing_risk_state.breaker_reason if existing_risk_state else None
     manually_tripped = existing_reason is not None and existing_reason.startswith("MANUAL_")
 

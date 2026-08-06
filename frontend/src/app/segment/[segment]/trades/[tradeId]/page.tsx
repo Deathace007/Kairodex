@@ -3,7 +3,7 @@ import { notFound } from "next/navigation";
 import { apiGetSafe } from "@/lib/api";
 import { fmtMoney, fmtNum, fmtTs } from "@/lib/format";
 import { Card } from "@/components/ui/Card";
-import { SEGMENTS, SEGMENT_LABEL, type Segment } from "@/lib/types";
+import { SEGMENTS, SEGMENT_LABEL, type Decimal, type Segment } from "@/lib/types";
 
 interface TradeEvent {
   seq: number;
@@ -12,6 +12,11 @@ interface TradeEvent {
   payload: Record<string, unknown>;
 }
 
+// Every money field here is Decimal (a JSON string, not a number — see
+// lib/types.ts's own note); a P6 subagent review caught that this local
+// interface had drifted from that convention (typed `number`), which
+// would have made a future direct comparison a silent-NaN bug rather
+// than the compile error the Decimal alias exists to produce.
 interface TradeDetail {
   trade: {
     trade_id: number;
@@ -22,11 +27,12 @@ interface TradeDetail {
     closed_at: string | null;
     qty_lots: number;
     lot_size: number;
-    avg_entry: number;
-    avg_exit: number | null;
-    gross_pnl: number | null;
-    net_pnl: number | null;
-    fees: number | null;
+    avg_entry: Decimal;
+    avg_exit: Decimal | null;
+    gross_pnl: Decimal | null;
+    net_pnl: Decimal | null;
+    fees: Decimal | null;
+    r_multiple: number | null;
     holding_secs: number | null;
     exit_reason: string | null;
     risk_params: Record<string, unknown> | null;
@@ -78,6 +84,7 @@ export default async function TradeDetailPage(
           <Field label="Gross P&L" value={fmtMoney(t.gross_pnl)} />
           <Field label="Net P&L" value={fmtMoney(t.net_pnl)} />
           <Field label="Fees" value={fmtMoney(t.fees)} />
+          <Field label="R multiple" value={fmtNum(t.r_multiple)} />
           <Field label="Exit reason" value={t.exit_reason ?? "—"} />
           <Field
             label="Holding"

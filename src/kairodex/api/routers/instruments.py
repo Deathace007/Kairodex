@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-import datetime
-
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from kairodex.api.deps import get_session
+from kairodex.api.deps import get_session, parse_iso_date
 from kairodex.core.enums import InstrumentKind
 from kairodex.store.models import Instrument, OptionQuote
 
@@ -38,7 +36,7 @@ async def instrument_chain(
             )
         )
     )
-    at_dt = datetime.datetime.fromisoformat(at).replace(tzinfo=datetime.UTC) if at else None
+    at_dt = parse_iso_date(at, "at")
 
     out = []
     for leg in legs:

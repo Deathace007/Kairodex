@@ -6,6 +6,7 @@ query-building and response shaping.
 from __future__ import annotations
 
 import datetime
+from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select
@@ -15,8 +16,9 @@ from sqlalchemy.orm import aliased
 from kairodex.analytics import breakdowns, performance
 from kairodex.analytics import loader as analytics_loader
 from kairodex.analytics.types import PerformanceSummary
-from kairodex.api.deps import get_session, parse_window
+from kairodex.api.deps import get_session, parse_iso_date, parse_window
 from kairodex.core.enums import Segment
+from kairodex.export.bundle import trade_export
 from kairodex.store.models import (
     Instrument,
     OptionQuote,
@@ -173,13 +175,10 @@ async def segment_trades(
     page_size: int = Query(50, le=200),
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, object]:
-    frm_dt = datetime.datetime.fromisoformat(frm).replace(tzinfo=datetime.UTC) if frm else None
-    to_dt = (
-        datetime.datetime.fromisoformat(to).replace(tzinfo=datetime.UTC)
-        + datetime.timedelta(days=1)
-        if to
-        else None
-    )
+    frm_dt = parse_iso_date(frm, "from")
+    to_dt = parse_iso_date(to, "to")
+    if to_dt is not None:
+        to_dt += datetime.timedelta(days=1)
     trades = await analytics_loader.load_trades(session, segment, frm=frm_dt, to=to_dt)
     if strategy is not None:
         trades = [t for t in trades if t.strategy_id == strategy]
@@ -196,7 +195,13 @@ async def segment_trades(
         "total": total,
         "page": page,
         "page_size": page_size,
-        "trades": page_rows,
+        # trade_export (kairodex.export.bundle), not the raw TradeRecord
+        # dataclass — TradeRecord.r_multiple/is_closed/underlying_px_entry
+        # are @property, not fields, so FastAPI's dataclass-only
+        # jsonable_encoder silently drops them (caught by a P6 subagent
+        # review: the trade-history "R" column could never show a value).
+        # TradeExport declares r_multiple as a real field, computed once.
+        "trades": [trade_export(t) for t in page_rows],
     }
 
 
@@ -224,6 +229,17 @@ async def segment_trade_detail(
         )
     ).first()
     instrument, underlying_row = row if row else (None, None)
+
+    # Same formula as analytics.types.TradeRecord.r_multiple — computed
+    # inline here since this endpoint builds its "trade" dict directly
+    # from the ORM row rather than through analytics.loader.load_trades.
+    r_multiple = None
+    initial_stop_raw = (trade.risk_params or {}).get("initial_stop_price")
+    if trade.avg_exit is not None and initial_stop_raw is not None:
+        risk = trade.avg_entry - Decimal(str(initial_stop_raw))
+        if risk != 0:
+            r_multiple = float((trade.avg_exit - trade.avg_entry) / risk)
+
     return {
         "trade": {
             "trade_id": trade.trade_id,
@@ -239,6 +255,7 @@ async def segment_trade_detail(
             "gross_pnl": trade.gross_pnl,
             "net_pnl": trade.net_pnl,
             "fees": trade.fees,
+            "r_multiple": r_multiple,
             "holding_secs": trade.holding_secs,
             "exit_reason": trade.exit_reason,
             "risk_params": trade.risk_params,

@@ -43,9 +43,10 @@ async def convert(
 
 
 def parse_window(window: str | None) -> tuple[datetime.datetime, datetime.datetime]:
-    """`?window=7d|30d|90d|all` -> a `[frm, to)` pair ending now.
-    `all` returns from the epoch, which is fine — every query here is
-    already indexed on the relevant timestamp column."""
+    """`?window=7d|30d|90d|all` -> a `[frm, to)` pair ending now. `all`
+    returns from a fixed pre-launch anchor (2020-01-01, well before this
+    project's own first recorded data), which is fine — every query here
+    is already indexed on the relevant timestamp column."""
     to = datetime.datetime.now(datetime.UTC)
     if window is None or window == "30d":
         return to - datetime.timedelta(days=30), to
@@ -54,3 +55,18 @@ def parse_window(window: str | None) -> tuple[datetime.datetime, datetime.dateti
     if window.endswith("d") and window[:-1].isdigit():
         return to - datetime.timedelta(days=int(window[:-1])), to
     raise HTTPException(422, f"invalid window {window!r} — expected '<N>d' or 'all'")
+
+
+def parse_iso_date(raw: str | None, param_name: str) -> datetime.datetime | None:
+    """`?from=`/`?to=`/`?at=`-style query params — a plain `YYYY-MM-DD`
+    (or full ISO timestamp) string, `None` if the caller omitted it,
+    HTTP 422 (not a 500, ASGI-traceback-and-all) on anything else. A P6
+    subagent review caught `fromisoformat()` called unguarded at two call
+    sites — a malformed date crashed the request with an unhandled
+    `ValueError` instead of a clean client error."""
+    if raw is None:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(raw).replace(tzinfo=datetime.UTC)
+    except ValueError as e:
+        raise HTTPException(422, f"invalid {param_name}={raw!r}: {e}") from e

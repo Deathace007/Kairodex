@@ -64,7 +64,7 @@ def _code_sha() -> str | None:
         return None  # not a git checkout, or git unavailable — code_sha is best-effort provenance
 
 
-def _trade_export(t: TradeRecord) -> em.TradeExport:
+def trade_export(t: TradeRecord) -> em.TradeExport:
     return em.TradeExport(
         trade_id=t.trade_id,
         segment=t.segment.value,
@@ -256,7 +256,7 @@ async def build_bundle(
 
     trades_path = out_dir / "trades.jsonl"
     trades_path.write_text(
-        "\n".join(_trade_export(t).model_dump_json() for t in trades) + ("\n" if trades else "")
+        "\n".join(trade_export(t).model_dump_json() for t in trades) + ("\n" if trades else "")
     )
     written.append(("trades.jsonl", len(trades)))
 

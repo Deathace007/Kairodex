@@ -33,7 +33,7 @@ def _trade() -> TradeRecord:
 
 def test_trade_export_maps_every_field():
     t = _trade()
-    exported = bundle._trade_export(t)
+    exported = bundle.trade_export(t)
     assert exported.trade_id == 3
     assert exported.segment == "nse_index"
     assert exported.underlying_symbol == "BANKNIFTY"

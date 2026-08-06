@@ -36,5 +36,10 @@ async def publish(message: StreamMessage) -> None:
     try:
         client = get_redis()
         await client.publish(REDIS_CHANNEL, message.model_dump_json())
-    except Exception:
-        logger.warning("stream publish failed (non-fatal)", exc_info=True)
+    except Exception as e:
+        # No exc_info — this fires once per publish call while Redis is
+        # down (up to ~4/tick across 4 segments, indefinitely), and a
+        # full traceback per call floods the journal for a known,
+        # already-explained, non-fatal condition. The message alone is
+        # enough to notice and diagnose it.
+        logger.warning("stream publish failed (non-fatal): %s", e)

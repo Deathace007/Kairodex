@@ -58,7 +58,26 @@ the last session. An independent subagent review found and fixed 2
 live-affecting bugs in the already-deployed engine (`trades.avg_exit`
 silently `lot_size`x too large, `trades.fees` zeroed to 0 on every close)
 plus 8 more findings in this session's own new code — see §11e.
-**Next phase:** P6 (API & dashboards).
+
+**P6 (API & dashboards) is functionally complete, deployed, and
+subagent-reviewed**: FastAPI read layer (every endpoint ARCHITECTURE.md
+§15 names), `WS /ws/stream` backed by a real Redis pub/sub fanout (the
+first real consumer of the Redis wiring P1 left unbuilt), and a Next.js
+master + parameterized-segment dashboard with real TradingView charts.
+Deployed as 2 more systemd units (`kairodex-api`, `kairodex-frontend`) —
+the full stack is now 9 units. Two genuinely dangerous, previously-inert
+safety controls became real this session: the global kill switch (named
+in the risk gate chain's own docstring order since P3, never actually
+wireable to anything until now) and per-segment manual breaker halts —
+both **live-verified by actually engaging them against the real running
+engine**: the kill switch produced 20 real `kill_switch`-rejected
+signals in the DB before being released, and a manual breaker trip
+survived a full engine tick cycle without auto-reverting before being
+re-armed. An independent subagent review found and fixed a live
+connection-leak in the WS handler (found by inspecting real orphaned
+Redis subscribers on the VM) plus 7 more findings. See §12 for the full
+account.
+**Next phase:** P7 (Strategy build-out & hardening).
 
 > Read this file first, every session. Update it whenever a phase
 > completes, a decision changes, or a command/location changes. Deeper
@@ -696,3 +715,266 @@ given `--to`, and the 2 real trades stayed present). 380 tests passing
   is simply the first thing to ever report on numerically. Documented in
   the bundle's README; nothing downstream depends on this column being
   meaningful today.
+
+---
+
+## 12. P6 — API & dashboards (2026-08-06)
+
+Scope per ARCHITECTURE.md §15/§16/§19: "FastAPI read layer, WS stream,
+Next.js master + parameterized segment dashboard, charts." Exit
+criterion is "all five dashboards live; p95 < 200ms on overview
+endpoints" — the five dashboards are live (§12c); p95 latency wasn't
+formally load-tested (single-user tool, no load to test against yet),
+but every endpoint hit during live verification returned in well under
+200ms against real VM data (§12c).
+
+### 12a. `kairodex/api/` — the FastAPI read layer (7 tests, + extensive live verification)
+
+Every endpoint ARCHITECTURE.md §15 names: `health`/`health/feeds`,
+`segments` (list/overview/positions/opportunities/trades/trades-detail/
+signals/performance/equity-curve/analytics-breakdown/risk),
+`master/overview` (multi-segment, `?ccy=` conversion via `fx_rates`),
+`instruments/{id}/chain`, `strategies` (list/report/promote),
+`research/notes`, `segments/{seg}/breaker` + `/kill` (both audited via a
+new `audit_log` table), `exports` (in-process — `kairodex.export` is
+allowed) and `backtests` (shells out to the CLI — `kairodex.backtest` is
+forbidden to the API by the import-linter contract "API is glue, not
+business logic," and the `import-linter` fix in §12d.4 is what finally
+let that contract actually run and confirm it).
+
+**Two previously-inert safety controls became real.** Before this
+session, `risk.loader.build_account_state`'s `kill_switch_engaged`
+parameter only ever took its hardcoded `False` default — nothing
+anywhere could ever set it `True` for a real reason, so the kill switch
+named first in the gate chain's own docstring order (`kill switch ->
+breaker state -> ...`) was structurally inert in the live engine since
+P3. It now reads a new `system_state` singleton table by default.
+Similarly, `risk.accounting.update_equity_and_risk_state` recomputes
+`breaker_status` from scratch every engine tick (~60s) — without a fix,
+a manual trip via the new `/api/segments/{seg}/breaker` endpoint would
+have silently un-tripped itself before a human could act on it.
+Accounting now respects a sticky `MANUAL_`-prefixed `breaker_reason`
+convention, only cleared by an explicit re-arm through the same
+endpoint — matching SPEC_REVIEW.md B8's "both persisted, both requiring
+explicit human re-arm."
+
+**Live-verified by actually engaging both**, not just unit-tested: `POST
+/api/kill {"action":"engage",...}`, waited a full tick cycle, confirmed
+via `psql` that **20 real signals were rejected at `reject_stage=
+"kill_switch"`** in that window — then released, confirmed normal
+evaluation resumed. `POST /api/segments/nse_index/breaker
+{"action":"trip",...}`, waited a full tick cycle, confirmed the segment
+stayed `TRIPPED`/`MANUAL_HALT: ...` (not silently reverted to `ARMED`),
+then re-armed. Every action produced a real `audit_log` row with
+accurate `before`/`after` state, verified via direct SQL.
+
+`POST /api/exports` and `POST /api/backtests` also live-verified against
+real data: a real bundle (2 trades, real sha256 hashes) and a real
+`kairodex backtest run` (7,525 signals, matching P4's own numbers)
+round-tripped through the API exactly as the CLI does directly.
+
+### 12b. `kairodex/streaming/` + WS fanout (the first real Redis consumer since P1)
+
+A small, neutral package (`types.py`'s `StreamMessage` discriminated
+union — `tick`/`signal`/`position_update`/`trade_closed`/`risk_update`/
+`feed_health`, `bus.py`'s thin publish wrapper) living where neither the
+publisher (`kairodex.engine`) nor the subscriber (`kairodex.api`) owns
+it — `kairodex.api` may not import `kairodex.engine` at all under the
+import-linter contract. `live_loop.py` now publishes `signal`/
+`trade_closed`/`position_update`/`risk_update` on its existing 60s tick
+cadence; `tick` and `feed_health` are declared in the union but have no
+publisher yet (no current consumer needs raw market ticks over this
+channel; feed status is already served by the fast-changing-rarely
+`/api/health/feeds` REST endpoint). `GET /ws/stream?segments=...`
+subscribes to one Redis channel and filters client-side.
+
+**Live-verified two ways**: subscribed directly to the Redis channel
+(`redis-cli subscribe kairodex:stream`) during real market evaluation
+and captured real signal-rejection/risk-update/position-update messages,
+including a real growing-profit `position_update` for the same
+BANKNIFTY position §11a found; then connected an actual WebSocket client
+to `/ws/stream?segments=nse_index` and confirmed it received only
+`nse_index` messages, correctly filtered.
+
+### 12c. Frontend — Next.js 16, app router + TypeScript + Tailwind + Lightweight Charts
+
+Two routes — `/` (master: per-segment equity, feed health, strategies,
+research insights, live activity) and `/segment/[segment]` (equity
+curve chart, open positions with live Greeks, opportunities, trade
+history with drill-down to `/segment/[segment]/trades/[tradeId]`'s full
+event timeline, risk panel, live activity) — matching the spec's "four
+dedicated segment dashboards... same detail" via one parameterized
+component, not four copies (ARCHITECTURE.md §16's own instruction).
+That's the five dashboards the exit criterion names (master + 4 segment
+instances of the one route).
+
+Palette and status colors are the `dataviz` skill's validated reference
+instance (`references/palette.md`), unmodified — six-checks validator
+run, both light and dark modes pass. `shadcn/ui` itself wasn't installed
+(no interactive terminal to run its init CLI against, and a single-user
+internal tool doesn't need its component surface) — a handful of small,
+hand-rolled Tailwind primitives (`Card`, `Badge`, `StatTile`) cover
+everything used, a deliberate, documented deviation from the doc's
+literal stack, same class of decision as P2's Bjerksund-Stensland swap.
+
+**Every page is `force-dynamic`, not statically generated with ISR** —
+see §12d.6 for why the first deploy attempt got this wrong. Every fetch
+is `cache: "no-store"`. This is a live trading dashboard on a 60s tick
+cadence for a single user where a fresh per-request fetch (a localhost
+hop) costs nothing; the correctness of "never show data older than the
+engine's actual last tick" was worth more than the marginal performance
+of static generation.
+
+**How to reach the dashboards**: both `kairodex-api` (127.0.0.1:8000)
+and `kairodex-frontend` (127.0.0.1:3000) bind localhost-only on the VM —
+`kairodex.api.main`'s own docstring explains why (this process holds
+`POST /api/kill`). Reach them from a laptop via SSH tunnel, the same
+access pattern already used for everything else in this repo, not a new
+firewall rule: `ssh -L 8000:localhost:8000 -L 3000:localhost:3000 -i
+~/.ssh/id_ed25519_personal root@164.52.206.92`, then open
+`http://localhost:3000` in a browser. `frontend/.env.production`'s
+`NEXT_PUBLIC_API_BASE_URL=http://localhost:8000` is what makes the same
+URL work for both the Next.js server (running on the VM, "localhost"
+means the VM) and the browser (tunneled to the same port number) — see
+`frontend/src/lib/api.ts`'s own docstring.
+
+**Live-verified with real data end to end**: `curl` against the deployed
+`kairodex-frontend` renders the real `BANKNIFTY 58400.0 C 2026-08-25`
+open position (with live Greeks and a real, growing unrealized P&L) on
+the segment dashboard, and the trade-detail drill-down renders that
+trade's real `FILLED` event from `trade_events`. All 9 systemd units
+(2 ingest, 1 jobs, 4 engine, `kairodex-api`, `kairodex-frontend`)
+confirmed `active (running)` with clean logs after every restart this
+session.
+
+### 12d. Subagent review pass — 9 findings, all fixed (388 tests, 24 new this phase)
+
+Per the same discipline as P3/P4/P5, an independent subagent reviewed
+the full P6 diff — re-derived the sticky-manual-breaker logic by hand
+(including building a scratch SQLAlchemy reproduction to check exactly
+what gets written to the DB under a stale read), inspected real orphaned
+connections on the VM, probed the export path-traversal guard with real
+encoded-payload requests, and swept the entire frontend for every place
+a `Decimal`-typed field could still bypass the coercing formatters. It
+found 9 real issues (2 CONFIRMED-serious, the rest lower-severity or
+narrow-window), all fixed here:
+
+1. **The WS handler leaked one Redis pub/sub connection + one live task
+   per client disconnect it never noticed.** `stream()` only ever
+   learned a client was gone when a `send_text` on a *matching* message
+   happened to fail — a client with a narrow `?segments=` filter, or a
+   half-open TCP connection (a dropped SSH tunnel, a sleeping laptop),
+   could go unnoticed indefinitely. **Confirmed live**: a subscriber from
+   the original verification session was still connected 25+ minutes
+   after its tunnel closed, with zero `connection closed` log lines the
+   whole time. Fixed: race `websocket.receive_text()` (to detect a
+   disconnect promptly via ASGI's own signal) against the pubsub forward
+   loop with `asyncio.wait(..., return_when=FIRST_COMPLETED)`; either
+   side finishing tears the whole pair down.
+2. **`/segments/{seg}/trades`'s "R" column could never show a value.**
+   `TradeRecord.r_multiple` is a `@property`, not a dataclass field —
+   FastAPI's `jsonable_encoder` serializes dataclasses by field only, so
+   the key was silently absent from every response, forever, including
+   for closed trades. Fixed: route through `kairodex.export.bundle`'s
+   `trade_export` (promoted from a private helper to a shared one — it
+   already existed for exactly this "TradeRecord -> real JSON shape"
+   job, reused rather than reinvented) instead of relying on automatic
+   dataclass serialization. Also added the same field to the trade-detail
+   endpoint's hand-built dict (computed inline, same formula).
+3. **Two unguarded `datetime.fromisoformat()` calls turned a malformed
+   query param into an HTTP 500 with a raw ASGI traceback**
+   (`/segments/{seg}/trades?from=garbage`, `/instruments/{id}/chain?
+   at=garbage`) instead of the clean 422 `deps.parse_window` already
+   modeled. Fixed with a new shared `deps.parse_iso_date` both call sites
+   now use.
+4. **`docs/PROGRESS.md` had no P6 section at all** before this pass —
+   the "read this file first" instruction had nothing to read about the
+   API/frontend deployment, the new `kairodex api` CLI command, the new
+   systemd units/ports, or the two live-caught bugs, all of which existed
+   only in git history. This section is that fix.
+5. **`/api/backtests`'s subprocess-correlation could return the wrong
+   run.** After the CLI subprocess exits, the handler re-queried "newest
+   `backtest_runs` row for this segment/strategy" — but `created_at` is
+   stamped at a run's *start*, not its write time, so a slower run
+   started earlier could finish (and be shadowed by) a faster run started
+   later, silently returning someone else's result. Fixed: parse the real
+   `run_id` the CLI already prints on its own last line
+   (`"backtest_runs row {id} written"`) instead of re-querying.
+6. **A narrow (~10% of wall-clock) race could still drop the sticky
+   manual-breaker sentinel.** `update_equity_and_risk_state` reads
+   `RiskState` once near the top of each ~60s tick; SQLAlchemy's
+   `expire_on_commit=False` means that read can be stale for the
+   remainder of the tick's active ~6.5s phase. If a manual trip lands via
+   a different session in that exact window *and* an auto-trip condition
+   is independently true, the auto-trip write wins — `breaker_status`
+   stays safely `TRIPPED`, but the `MANUAL_` sentinel is overwritten,
+   silently making the halt auto-un-trippable the next calendar day
+   instead of requiring the intended explicit re-arm. Fixed:
+   `session.refresh()` the row immediately before the sticky check,
+   narrowing the race window from "the whole tick" to "one query."
+7. **A frontend trade-detail page's local TypeScript interface had
+   drifted back to `number` for Decimal-sourced fields**, undermining
+   the compile-time safety `Decimal = string` (§12d.9 below) exists to
+   provide. Fixed to use the shared alias; also added the now-available
+   `r_multiple` field to its display.
+8. **`feed_health` messages (`segment: null`) could never reach a
+   filtered WS client** — no real segment value can ever string-match a
+   literal `null`, so `?segments=nse_stock` would silently drop a
+   provider-scoped message forever. Dormant today (nothing publishes
+   `feed_health` yet, §12b), fixed for when something does: a `null`
+   segment now always forwards regardless of a client's filter.
+9. **Minor, all fixed**: `streaming.bus.publish`'s failure log included a
+   full traceback per call — with Redis down that's up to 4/tick across
+   4 segments, indefinitely, flooding the journal for an already-explained,
+   non-fatal condition (now a one-line warning); `RecentActivity.tsx`
+   rendered a live position's raw Decimal-string mark instead of through
+   `fmtNum`; `parse_window`'s docstring said "the epoch" for a fixed
+   2020-01-01 anchor.
+
+**Not fixed, explicitly low-severity** (subagent's own assessment,
+independently checked and agreed with): a TOCTOU gap on the audited
+writes (`control.py`/`strategies.py` read-then-write with no row lock) —
+real, but this is a single-user tool driven by a human clicking one
+button at a time, not worth the complexity of optimistic locking for a
+race that needs two simultaneous requests from the same one user.
+
+**Cross-checked and confirmed correct, not just claimed**: `kairodex/
+strategy/__init__.py`'s absence really did crash `lint-imports` outright
+(reproduced live in a scratch worktree at the pre-P6 commit); `pyproject.
+toml`'s missing `include_external_packages = true` really was a second,
+independent blocker for the same command; the kill-switch default really
+does take effect within one tick with no restart; the export
+path-traversal guard really is sufficient against every encoding trick
+tried (`..%2f`, double-encoding, embedded nulls, `--path-as-is`); the
+`useStream.ts` reconnect logic has no client-side leak (the leak was
+entirely server-side, finding #1); every other Decimal-vs-number spot in
+the frontend was already safe.
+
+388 tests passing (381 + 7 new this phase — `tests/unit/api/`, DB-free:
+app-assembly/route-inventory and `parse_window`), ruff/mypy/`lint-imports`
+clean; `next build`/`eslint`/`tsc --noEmit` clean. `tests/unit/
+test_lse_expiry_probe.py`'s one failure is the same pre-existing,
+unrelated calendar-drift issue flagged since the P5 review pass (§11e) —
+confirmed still present at the pre-P6 commit too, not a regression.
+
+### 12e. Known gaps, not fixed this session (deliberate, not overlooked)
+
+- **`fx_rates` has zero rows** — `?ccy=` on `/api/master/overview`
+  correctly degrades to `null` for non-native currencies rather than
+  fabricating a rate, but nothing populates the table yet and the
+  frontend doesn't expose a currency selector (would be dead UI against
+  data that doesn't exist). Revisit together once a real FX-rate sync
+  exists.
+- **Master dashboard doesn't show a single combined cross-segment equity
+  figure** (blocked on the same `fx_rates` gap — INR and USD segments
+  can't be summed without a real conversion rate) — the four per-segment
+  tiles are shown instead.
+- **`tick` and `feed_health` stream message types have no publisher** —
+  declared in the union, consumed correctly by the WS filter (§12d.8),
+  but nothing calls `publish()` for either yet. Revisit if a live price
+  chart or a real-time system-health panel is ever built against them.
+- **p95 latency wasn't formally load-tested** — every endpoint measured
+  during live verification was well under 200ms, but that's one user, one
+  request at a time, not a load test. No load-testing infrastructure
+  exists in this repo yet; revisit if/when this ever needs to serve more
+  than one concurrent user.

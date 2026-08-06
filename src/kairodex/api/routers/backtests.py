@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import re
 import sys
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -77,18 +78,24 @@ async def create_backtest(
             500, f"backtest run failed (exit {proc.returncode}): {stderr.decode()[-2000:]}"
         )
 
-    run = await session.scalar(
-        select(BacktestRun)
-        .where(
-            BacktestRun.segment == body.segment, BacktestRun.strategy_id == strategy.strategy_id
-        )
-        .order_by(BacktestRun.created_at.desc())
-        .limit(1)
-    )
-    if run is None:
+    # Read the *specific* row this subprocess just wrote off its own
+    # stdout ("backtest_runs row {run_id} written" — cli.py's own final
+    # line), rather than re-querying "newest row for this segment/
+    # strategy." A P6 subagent review caught that the re-query approach
+    # could return a DIFFERENT run's row: nothing serializes concurrent
+    # POSTs (or a POST racing a manually-launched `kairodex backtest
+    # run`) against each other, and `created_at` is stamped at the
+    # *start* of a run, not at write time, so a slower run started
+    # earlier can finish after — and be shadowed by — a faster one
+    # started later.
+    match = re.search(r"backtest_runs row (\d+) written", stdout.decode())
+    if match is None:
         raise HTTPException(
             500, f"subprocess succeeded but wrote no backtest_runs row: {stdout.decode()[-2000:]}"
         )
+    run = await session.get(BacktestRun, int(match.group(1)))
+    if run is None:
+        raise HTTPException(500, f"backtest_runs row {match.group(1)} not found after write")
     return {"id": run.run_id, "status": "complete", "metrics": run.metrics}
 
 
