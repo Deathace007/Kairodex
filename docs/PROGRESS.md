@@ -1020,3 +1020,128 @@ no path to `kairodex-api` at all from there, by design — so it renders
 its own empty state permanently on this mirror. Every other panel is
 real data, just as fresh as the last 5-minute rebuild rather than
 per-request.
+
+---
+
+## 13. Post-P6 findings — what three days of live running exposed (2026-08-06)
+
+Not a phase. P6 finished, the stack ran unattended, and answering two
+plain user questions ("show entry time and SL/TP", "when does it trade",
+"why has US never traded") turned up four live faults that no test could
+have caught, because each was a *disagreement between the code and the
+world* rather than a broken invariant. Recorded here because the pattern
+matters more than the individual bugs: **everything below was silently
+wrong while every dashboard read green.**
+
+### 13a. Entry time (IST) + SL/TP on positions/trades
+
+User request. `TradeRecord`/`TradeExport` gained `profit_target`
+(mirroring the existing `initial_stop_price`, both from
+`Trade.risk_params`), so it flows analytics.loader -> export.bundle ->
+API like everything else. `/segments/{seg}/positions` and
+`.../trades/{id}` also expose the *current* (possibly-ratcheted)
+`stop_price`, distinct from the entry-time `initial_stop_price` that
+analytics keeps for R-multiple math. Frontend: new `fmtTsIST` — always
+Asia/Kolkata regardless of the viewer's browser timezone or the trade's
+market, since it is one user's own reference timezone.
+
+### 13b. The live trading gate was DST-naive (found while answering "when does it trade")
+
+`risk.loader.is_session_open` — the gate deciding whether the engine
+evaluates signals at all — carried a hardcoded `13:30-20:00 UTC` US
+window with its EST/EDT comment backwards. A P6 subagent review had
+already fixed the *other* copy of this approximation
+(`analytics.breakdowns`) to be DST-aware; the fix never propagated to the
+one that matters for trading. In August (EDT) it was correct by
+coincidence; every EST month (Nov-Mar) it would have been an hour wrong
+with nothing to alert on. Both call sites now share
+**`kairodex/core/sessions.py`** (`session_window_utc`,
+`is_session_open_now`, `local_date_for`), so a future DST fix cannot land
+in one and miss the other. The recorder's session gate (§13d) uses it too
+— recorder and engine can no longer disagree about "open".
+
+Real answer: **NSE 09:15-15:30 IST; US 09:30-16:00 ET (DST-aware)**.
+Still no holiday/half-day calendar (ARCHITECTURE.md §6, pre-existing).
+
+### 13c. US has never traded, and it is not a strategy problem
+
+15,084 US signals, **100% rejected** at `NO_CANDIDATES_IN_EXPIRY_WINDOW`
+— every one, across every hour, whether that hour saw 375,000 fresh
+quote rows or zero. Not one reached the risk gates.
+
+Cause: **LSE publishes no bid/ask for options at all.** Confirmed live
+against the streaming feed during an open US session — 400 consecutive
+option ticks, every one `bid=None, ask=None`. The vendor's `Tick` type
+declares the fields; they are never populated. These are trade prints
+(time & sales), not quotes; the REST `options()` chain has no bid/ask
+columns either. What we *do* get is real and live: last price, volume,
+IV, full greeks, underlying price.
+
+`orchestrator.py`'s `_candidates_from_chain` skips any quote with
+`bid is None or ask is None`, so the candidate list is always empty
+before the selector ever runs; `ContractCandidate.bid/.ask` are
+non-optional, and `execution/fills.py` prices every fill off
+`mid +/- half_spread`. Both were written against Upstox, which does
+deliver depth. **Not yet fixed** — see §13e.
+
+Asymmetry worth knowing: the *exit* path already degrades gracefully
+(`bid=latest_quote.bid or mark`). Only entry hard-skips.
+
+### 13d. LSE quota exhausted — 28,152 rejected calls in 36h
+
+US ingestion had been dead since 04:05 UTC with the daily cap (15000/day)
+gone and the rolling *weekly* cap also tripped. Nobody had multiplied:
+22 US underlyings x 3 calls x 1440 min = **~96,000 calls/day** against a
+15,000 cap — exhausted in 3.7h, every day, by design.
+
+Fixed (`recorder.py`, `lse/client.py`):
+- **Session gate** — the poll ran 24/7; US options trade 32.5 of every
+  168 hours, so ~81% of the quota went to a closed book.
+- **Per-day expiry cache** — `list_expiries` refetched a whole chain
+  every 60s to learn dates that change weekly (a third of the budget).
+- **Real 429 backoff** — `RateLimitError` already existed, unused, with
+  the docstring "callers should back off, not retry immediately". LSE
+  now raises it; a quota rejection aborts the whole cycle (an
+  account-level fact, not a per-underlying one) and sleeps 30 min.
+  `_probe_expiries` re-raises instead of swallowing it and burning 14
+  more calls; startup bar backfill likewise.
+- **Interval** — gate + cache alone still came to 17,572/day, so
+  `T1_POLL_INTERVAL_BY_MARKET` puts US at 120s (8,797/day, ~59% of cap).
+  NSE stays 60s; tuning the shared loop to the tolerant vendor is what
+  caused this. **US chain snapshots are therefore 2 min apart** — a real
+  vendor-imposed resolution limit, worth knowing before reading US
+  features. A test recomputes the budget rather than asserting a magic
+  number, so watchlist growth trips CI, not the vendor.
+
+**The sensor was inverted**, which is why it ran three days unnoticed:
+`/usage` is itself metered, so it 429s once you are over — and `quota()`
+caught that and returned `used_pct=0.0`. `feed_health` read a reassuring
+**0.00% while the account sat at 100%**. A 429 now reports 100.0;
+any other failure reports `None` (unknown). `QuotaStatus.used_pct` is
+`float | None` — the DB column and `kairodex status` already handled
+nullable; only the dataclass type was lying.
+
+Verified live: 7,920 429s in a comparable pre-fix window -> **0** after,
+`feed_health.lse.quota_used_pct` now reads 100.00 with the real error.
+The weekly cap was already tripped, so US ingestion stays down until it
+clears on its rolling window — the fix stops the bleeding, it does not
+restore service instantly.
+
+### 13e. Open, in priority order
+
+1. **US last-price execution path** — extend the entry side to work from
+   last price plus an *explicit* modeled spread (we have live IV and
+   greeks to model from). `or mark`'s implicit zero-spread would
+   understate entry cost and flatter every US trade's P&L, so the
+   assumption has to be stated, not inherited.
+2. **Zero closed trades, ever.** 3 open, 0 closed. Realized P&L, fees,
+   R-multiple and equity update have run in tests only, never in
+   production. Every P7 gate is a closed-trade statistic. The 3-day theta
+   guard means the first natural close is ~2026-08-09.
+3. Then P7 (strategy build-out).
+
+**Standing constraint on all of the above** (user, 2026-08-06): trade
+only high-conviction setups — neither overtrade nor undertrade. A low
+take-rate is not itself a bug. But a rejection for *plumbing* (§13c) is a
+bug wearing a conviction rejection's clothes, and the two must never be
+conflated when tuning gates.
