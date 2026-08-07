@@ -136,6 +136,25 @@ async def run_segment(segment: Segment, *, shadow: bool = True) -> None:
                 await asyncio.sleep(EVAL_INTERVAL.total_seconds())
                 continue
 
+            # Rebuilt after every fill inside the loop below, not just here.
+            # The gates that meter scarcity — max_concurrent, exposure cap,
+            # correlation cluster — all read this snapshot, so evaluating a
+            # whole watchlist against one pre-tick copy means the Nth
+            # underlying is judged as though the first N-1 fills had not
+            # happened. Live 2026-08-07, the first tick after US entries
+            # started working opened 6 us_stock positions in a single
+            # instant against a max_concurrent of 6 that was already holding
+            # 4: ten open positions and $6,697 committed against a $6,000
+            # exposure cap, with the gate reporting MAX_CONCURRENT correctly
+            # on every *later* tick. §14c saw the same shape on nse_stock
+            # ("4 of 5 slots in the opening tick") and read it as a missing
+            # conviction floor; the floor was necessary but this is the
+            # other half.
+            #
+            # Re-read rather than decrement in place: the loader owns how
+            # exposure and equity are derived, and a second copy of that
+            # arithmetic here would be free to drift from it. One extra
+            # query per *taken* trade, not per underlying.
             account = await build_account_state(session, segment, now)
 
             for underlying in underlyings:
@@ -152,6 +171,8 @@ async def run_segment(segment: Segment, *, shadow: bool = True) -> None:
                         broker=execution,
                         now=now,
                     )
+                    if outcome is not None and outcome.taken:
+                        account = await build_account_state(session, segment, now)
                     if outcome is not None:
                         logger.info(
                             "%s: signal %d %s (%s/%s)",
