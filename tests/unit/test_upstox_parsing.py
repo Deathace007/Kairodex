@@ -3,10 +3,16 @@ consequences if it's wrong (a stock option misfiled as an index option
 would corrupt segment isolation). Fixtures are trimmed real records pulled
 from the live Upstox NSE instrument master on 2026-08-04."""
 
+import datetime
 from decimal import Decimal
 
 from kairodex.core.enums import InstrumentKind, Segment
-from kairodex.data.upstox.client import _epoch_ms_to_ist_date, _parse_instrument
+from kairodex.data.types import Timeframe
+from kairodex.data.upstox.client import (
+    UpstoxClient,
+    _epoch_ms_to_ist_date,
+    _parse_instrument,
+)
 
 _INDEX_OPTION = {
     "segment": "NSE_FO",
@@ -94,3 +100,50 @@ def test_expiry_epoch_reads_in_ist_not_utc():
     # own date would still land on 2026-10-27 for this particular timestamp,
     # so this also pins the value itself, not just the timezone plumbing.
     assert _epoch_ms_to_ist_date(1793125799000).isoformat() == "2026-10-27"
+
+
+class _RecordingUpstox:
+    """Only `bars` is exercised, and it only needs `_get` — building a real
+    client would drag in auth and an HTTP pool for a URL-shape assertion."""
+
+    def __init__(self) -> None:
+        self.urls: list[str] = []
+
+    async def _get(self, url: str, params: object = None) -> dict[str, object]:
+        self.urls.append(url)
+        return {"data": {"candles": []}}
+
+    bars = UpstoxClient.bars
+
+
+async def test_bars_also_fetches_intraday_when_the_window_includes_today():
+    """v3's historical-candle endpoint serves nothing for the current
+    trading day — verified live 2026-08-07 after the NSE close, where
+    historical over 08-06..08-08 returned 375 bars all dated 08-06 while
+    the intraday path returned that day's own 375. Without the second
+    call, NSE bars could never advance past yesterday however often the
+    refresh ran."""
+    client = _RecordingUpstox()
+    today = datetime.date.today()
+    await client.bars(  # type: ignore[arg-type]
+        "NSE_EQ|INE002A01018",
+        Timeframe.ONE_MIN,
+        today - datetime.timedelta(days=2),
+        today + datetime.timedelta(days=1),
+    )
+    assert len(client.urls) == 2
+    assert "/historical-candle/intraday/" in client.urls[1]
+
+
+async def test_bars_skips_intraday_for_a_purely_historical_window():
+    """A backtest pulling a closed date range must not pay a second call
+    per underlying for a day it did not ask about."""
+    client = _RecordingUpstox()
+    await client.bars(  # type: ignore[arg-type]
+        "NSE_EQ|INE002A01018",
+        Timeframe.ONE_MIN,
+        datetime.date(2026, 1, 5),
+        datetime.date(2026, 1, 9),
+    )
+    assert len(client.urls) == 1
+    assert "intraday" not in client.urls[0]

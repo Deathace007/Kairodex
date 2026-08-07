@@ -26,6 +26,7 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 
 from kairodex.core.enums import ExerciseStyle, InstrumentKind, Market, Segment, Settlement
 from kairodex.core.errors import VendorError
+from kairodex.core.sessions import local_date_for
 from kairodex.core.tz import exchange_tz
 from kairodex.data.normalize import to_decimal, to_utc
 from kairodex.data.types import (
@@ -155,7 +156,24 @@ class UpstoxClient:
             f"{end.isoformat()}/{start.isoformat()}"
         )
         candles = data.get("data", {}).get("candles", [])
-        return [_parse_candle(c) for c in candles]
+        bars = [_parse_candle(c) for c in candles]
+
+        # v3's historical-candle endpoint does not serve the current trading
+        # day at all — today's candles live behind a separate `intraday`
+        # path with no date arguments. Verified live 2026-08-07 after the
+        # NSE close: historical for 08-06..08-08 returned 375 bars, all of
+        # them 08-06, while intraday returned that day's own 375 (09:15 to
+        # 15:29 IST). Without this, `recover_underlying_bars` could not pull
+        # NSE bars past yesterday no matter how often it ran, so every
+        # bar-derived feature stayed a day stale — the LSE half of that bug
+        # was an exclusive `end` date, this is the same symptom from an
+        # unrelated vendor cause.
+        if start <= local_date_for(Market.NSE, datetime.datetime.now(datetime.UTC)) <= end:
+            today_data = await self._get(
+                f"{_BARS_BASE_URL}/historical-candle/intraday/{key}/{unit}/{interval}"
+            )
+            bars += [_parse_candle(c) for c in today_data.get("data", {}).get("candles", [])]
+        return bars
 
     async def quota(self) -> QuotaStatus:
         # Upstox publishes fixed rate-limit constants rather than exposing a
