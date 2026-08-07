@@ -1,6 +1,6 @@
 # Kairodex — Development Progress
 
-**Last updated:** 2026-08-06
+**Last updated:** 2026-08-07
 **Current phase:** P1 (The Recorder) is done pending the unattended
 5-session check (§7). P2 (Pricing & features) is functionally complete
 (§8). **P3 (Engine & paper execution) is functionally complete and
@@ -1020,6 +1020,33 @@ no path to `kairodex-api` at all from there, by design — so it renders
 its own empty state permanently on this mirror. Every other panel is
 real data, just as fresh as the last 5-minute rebuild rather than
 per-request.
+
+**Incident, 2026-08-07: silently frozen for ~10 hours.** User-reported
+stale open-position marks that survived a hard refresh, cleared
+cookies, and a different browser — all pointless against this, since
+the page itself hadn't changed at the source. Root cause: Surge's
+free-tier plan rate-limits how often one domain can be republished,
+and `OnUnitActiveSec=5min` blew through it. Every redeploy from
+02:25 IST onward aborted with `Rate limited. (domain). Verify email or
+try again in 15 hours` (101 failures counted that day) — the timer
+kept firing and kept failing, quietly, with nothing surfacing it
+anywhere; the public site stayed pinned to the 02:20 IST snapshot
+(pre-market) the whole time. Fixed in two parts: the user verified
+their Surge account email, which lifted the block immediately (a
+manual `systemctl start kairodex-surge-deploy.service` succeeded on
+the first retry, confirmed via `curl -D-` showing `surge-cache: MISS`
+/ `age: 0` and the freshly-baked mark); and `OnUnitActiveSec` widened
+5min -> 20min (VM-local unit file, not checked into the repo — same as
+`.env`, see §2) so the same cadence doesn't re-trigger the limit.
+**Lesson: an automation loop that fails needs its failure to be loud
+somewhere** — a `Rate limited` abort every 5 minutes for 10 straight
+hours produced zero signal outside `journalctl` on a box nobody was
+tailing; `kairodex status`/dashboard health has no notion of "is the
+public mirror itself current," only of the live VM dashboard's own
+data freshness, which was never actually affected here — worth adding
+a real check (e.g. a `Surge-Cache`/`age` header probe, or the
+deploy script exiting loud enough for a monitoring hook) if this class
+of gap needs closing.
 
 ---
 
