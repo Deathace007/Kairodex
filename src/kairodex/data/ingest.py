@@ -158,12 +158,15 @@ async def write_option_quotes_batch(session: AsyncSession, rows: list[dict[str, 
     """
     if not rows:
         return 0
-    stmt = pg_insert(OptionQuote).values(rows).on_conflict_do_nothing(
-        index_elements=[OptionQuote.instrument_id, OptionQuote.ts]
+    stmt = (
+        pg_insert(OptionQuote)
+        .values(rows)
+        .on_conflict_do_nothing(index_elements=[OptionQuote.instrument_id, OptionQuote.ts])
+        .returning(OptionQuote.ts)
     )
-    await session.execute(stmt)
+    inserted = len((await session.execute(stmt)).all())
     await session.commit()
-    return len(rows)
+    return inserted
 
 
 async def write_underlying_bars_batch(
@@ -171,7 +174,16 @@ async def write_underlying_bars_batch(
 ) -> int:
     """Batched upsert for `bars()` results — used by restart recovery
     (ARCHITECTURE.md §7) to backfill underlying OHLCV missed while the
-    recorder was down. Same dedupe-on-conflict shape as option quotes."""
+    recorder was down. Same dedupe-on-conflict shape as option quotes.
+
+    Returns rows actually inserted (`RETURNING` skips the ones the
+    conflict clause dropped), not rows attempted. The difference is not
+    cosmetic: the caller logs this number as "backfilled N 1m bars", and
+    while it counted attempts it printed a confident `backfilled 942 1m
+    bars for AAPL` for a batch in which every single row was a duplicate
+    and nothing moved. That log line was the only evidence anyone had
+    that the refresh worked, and it said yes while the newest bar in the
+    table stayed 14 hours old."""
     if not bars:
         return 0
     rows = [
@@ -189,9 +201,14 @@ async def write_underlying_bars_batch(
         )
         for b in bars
     ]
-    stmt = pg_insert(UnderlyingBar).values(rows).on_conflict_do_nothing(
-        index_elements=[UnderlyingBar.instrument_id, UnderlyingBar.timeframe, UnderlyingBar.ts]
+    stmt = (
+        pg_insert(UnderlyingBar)
+        .values(rows)
+        .on_conflict_do_nothing(
+            index_elements=[UnderlyingBar.instrument_id, UnderlyingBar.timeframe, UnderlyingBar.ts]
+        )
+        .returning(UnderlyingBar.ts)
     )
-    await session.execute(stmt)
+    inserted = len((await session.execute(stmt)).all())
     await session.commit()
-    return len(rows)
+    return inserted

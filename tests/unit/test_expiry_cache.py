@@ -151,8 +151,15 @@ async def test_bars_refresh_when_the_newest_is_older_than_max_age(monkeypatch):
         session, client, "lse", Market.US, [_INSTRUMENT], max_age=BAR_REFRESH_INTERVAL
     )
     assert client.pulls, "a stale bar must trigger a refetch mid-session"
-    _, start, _ = client.pulls[0]
+    _, start, end = client.pulls[0]
     assert start == _STALE_TS.date()
+    # The vendor's `end` is exclusive: measured live against LSE on
+    # 2026-08-07 at 14:33 UTC with the US market open, end=2026-08-07
+    # returned 942 bars ending 2026-08-06 23:59 while end=2026-08-08
+    # returned 1327 ending 2026-08-07 14:33. Asking for `today` therefore
+    # cannot ever reach today's session — the refresh ran, logged success,
+    # and wrote nothing.
+    assert end > datetime.date.today(), "end is exclusive — today's bars are unreachable"
 
 
 async def test_bars_not_refetched_while_still_fresh():

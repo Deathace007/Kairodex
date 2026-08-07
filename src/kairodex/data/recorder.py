@@ -213,7 +213,16 @@ async def recover_underlying_bars(
         lookback = datetime.timedelta(days=BACKFILL_LOOKBACK_DAYS)
         start = local_date_for(market, last_ts) if last_ts else today - lookback
         try:
-            bars = await client.bars(vendor_key, Timeframe.ONE_MIN, start, today)
+            # `end` is EXCLUSIVE at the vendor, so asking for `today` returns
+            # everything up to *yesterday's* close and today's session is
+            # structurally unreachable. Measured live 2026-08-07 14:33 UTC
+            # against LSE with the US market open: end=2026-08-07 -> 942 bars
+            # ending 2026-08-06 23:59; end=2026-08-08 -> 1327 bars ending
+            # 2026-08-07 14:33. Harmless on a vendor whose `end` is inclusive
+            # instead — bars that do not exist yet cannot be returned.
+            bars = await client.bars(
+                vendor_key, Timeframe.ONE_MIN, start, today + datetime.timedelta(days=1)
+            )
         except RateLimitError as e:
             # Same account-level fact as in t1_poll_loop: pushing on would
             # spend one doomed call per remaining underlying on every
