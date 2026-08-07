@@ -2,6 +2,7 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import { apiGetSafe } from "@/lib/api";
 import { fmtMoney, fmtPct, fmtNum, fmtTs, fmtTsIST } from "@/lib/format";
+import { AutoRefresh } from "@/components/AutoRefresh";
 import { Card } from "@/components/ui/Card";
 import { StatTile } from "@/components/ui/StatTile";
 import { Badge, breakerStatus, pnlColor } from "@/components/ui/Badge";
@@ -44,6 +45,7 @@ export default async function SegmentPage(props: PageProps<"/segment/[segment]">
 
   return (
     <div className="mx-auto max-w-6xl space-y-6">
+      <AutoRefresh />
       <div className="flex items-center justify-between">
         <h1 className="text-xl font-semibold">{SEGMENT_LABEL[segment]}</h1>
         {overview && (

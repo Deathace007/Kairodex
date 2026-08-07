@@ -1,5 +1,6 @@
 import { apiGetSafe } from "@/lib/api";
 import { fmtMoney, fmtPct, fmtAge, fmtTs } from "@/lib/format";
+import { AutoRefresh } from "@/components/AutoRefresh";
 import { Card } from "@/components/ui/Card";
 import { StatTile } from "@/components/ui/StatTile";
 import { Badge } from "@/components/ui/Badge";
@@ -17,6 +18,7 @@ export default async function MasterPage() {
 
   return (
     <div className="mx-auto max-w-6xl space-y-6">
+      <AutoRefresh />
       <h1 className="text-xl font-semibold">Master overview</h1>
 
       <Card title="Segments">
