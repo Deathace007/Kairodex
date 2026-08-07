@@ -32,7 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from kairodex.core.enums import InstrumentKind, Market, Segment
 from kairodex.core.errors import RateLimitError
-from kairodex.core.sessions import is_session_open_now
+from kairodex.core.sessions import is_session_open_now, local_date_for
 from kairodex.data.factory import make_client
 from kairodex.data.ingest import (
     option_quote_row,
@@ -75,6 +75,18 @@ CLOSED_MARKET_POLL_INTERVAL = datetime.timedelta(minutes=5)
 # weekly debt and delays recovery past the next daily reset. Long enough that
 # a blown day costs a handful of probe calls, not tens of thousands.
 QUOTA_BACKOFF = datetime.timedelta(minutes=30)
+# How stale `underlying_bars` may get before `t1_poll_loop` pulls them
+# forward again. Costs one metered call per underlying per refresh, so it is
+# budgeted against LSE's cap exactly like the poll interval above:
+#
+#     22 underlyings x (390 session min / 10 min) = 858 calls/day
+#     8,797 (chain poll) + 858 = 9,655/day, ~64% of the 15000 cap
+#
+# 10 min rather than 1 min because the features reading these bars are EMA
+# spreads and 5-day cumulative returns — they move on the scale of tens of
+# minutes, not of a single bar — and because the headroom that absorbs
+# restarts and watchlist growth is the thing that must not be spent.
+BAR_REFRESH_INTERVAL = datetime.timedelta(minutes=10)
 
 # WS reconnect ceilings. A dropped connection is usually transient, so the
 # normal cap stays short. A 401/403 on the *handshake* is not transient —
@@ -151,9 +163,41 @@ async def recover_underlying_bars(
     session: AsyncSession,
     client: MarketDataProvider,
     provider: str,
+    market: Market,
     underlyings: list[Instrument],
+    *,
+    max_age: datetime.timedelta = BAR_REFRESH_INTERVAL,
 ) -> None:
-    today = datetime.date.today()
+    """Pull `underlying_bars` forward to now for every underlying whose
+    newest bar is older than `max_age`.
+
+    Called at startup *and* on a timer from `t1_poll_loop` — which it was
+    not, and that was a live fault, not a tuning choice. The old guard
+    (`if start >= today: continue`, against a startup-only call site) meant
+    the newest bar a running process ever saw was whatever existed the
+    moment it booted. Measured live 2026-08-07: with the recorders started
+    at 10:15 UTC, the freshest US bar was still 2026-08-06 23:59 four hours
+    into the US session, and the freshest NSE bar 2026-08-06 09:59. Every
+    bar-derived feature was therefore constant for the whole session —
+    `trend_state_strength` (and so the STRUCTURE detector family) returned
+    one frozen value per underlying per process lifetime, confirmed by
+    every one of the 20 US and 12 NSE underlyings that emitted signals that
+    day having exactly one distinct `trend_structure` score in the evidence
+    log while `iv_skew_sentiment`, which reads the chain the T1 poll keeps
+    current, moved normally. A frozen detector is not a quiet one: it kept
+    voting, at a stale magnitude near zero, and dragged the confluence
+    average down with it.
+
+    `local_date_for` rather than `date.today()`: the process clock is IST
+    on the VM while US bars are timestamped UTC and the US session runs
+    past midnight IST, so the two disagreed about which day it was for
+    exactly the market that needed the refresh most.
+
+    Backfill is idempotent (`write_underlying_bars_batch` upserts) and
+    resumable — it re-derives `start` from the last stored bar — so a
+    skipped or failed pass costs nothing the next one won't pick up."""
+    now = datetime.datetime.now(datetime.UTC)
+    today = local_date_for(market, now)
     for u in underlyings:
         vendor_key = _provider_key(u, provider)
         if vendor_key is None:
@@ -164,10 +208,10 @@ async def recover_underlying_bars(
                 UnderlyingBar.timeframe == Timeframe.ONE_MIN.value,
             )
         )
-        lookback = datetime.timedelta(days=BACKFILL_LOOKBACK_DAYS)
-        start = last_ts.date() if last_ts else today - lookback
-        if start >= today:
+        if last_ts is not None and now - last_ts < max_age:
             continue
+        lookback = datetime.timedelta(days=BACKFILL_LOOKBACK_DAYS)
+        start = local_date_for(market, last_ts) if last_ts else today - lookback
         try:
             bars = await client.bars(vendor_key, Timeframe.ONE_MIN, start, today)
         except RateLimitError as e:
@@ -251,6 +295,22 @@ async def t1_poll_loop(
         if not is_session_open_now(market, cycle_start):
             await asyncio.sleep(CLOSED_MARKET_POLL_INTERVAL.total_seconds())
             continue
+
+        # Keep `underlying_bars` moving during the session, not just at
+        # startup — see `recover_underlying_bars`. Inside the session gate
+        # so a closed book costs no metered calls, and before the chain
+        # poll so a quota abort below doesn't starve bars specifically.
+        try:
+            async with sessionmaker() as session:
+                await recover_underlying_bars(
+                    session,
+                    client,
+                    provider,
+                    market,
+                    [u for us in underlyings_by_segment.values() for u in us],
+                )
+        except Exception:
+            logger.exception("bar refresh failed for %s", provider)
 
         # A quota rejection is about the *account*, not this underlying, so
         # it aborts the whole cycle: continuing the loop would issue one
@@ -495,7 +555,7 @@ async def run_market(market: Market) -> None:
             )
 
         async with sessionmaker() as session:
-            await recover_underlying_bars(session, client, provider, all_underlyings)
+            await recover_underlying_bars(session, client, provider, market, all_underlyings)
 
         await asyncio.gather(
             t1_poll_loop(sessionmaker, client, provider, market, underlyings_by_segment),
