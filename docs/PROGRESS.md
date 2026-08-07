@@ -1265,3 +1265,135 @@ manual run — completes with `Result=success`.
 green systemd unit, a green `Success!` from Surge, and a dashboard that
 rendered plausible numbers. The only thing that caught it was comparing
 two sources of the same fact at the same instant.
+
+---
+
+## 14. The first eight real trades, audited (2026-08-07)
+
+Prompted by a plain question — "analyse the ongoing, rejected and closed
+trades" — with eight real trades and ~33k signals finally on disk. Six
+faults, every one of them silent, none reachable by the 438 tests that
+were passing at the time. Fixed in `3e627ca` + `5fa1d69`; **447 tests
+now**, each new one written against the real recorded numbers of the
+trade it came from and checked to fail against the old code.
+
+### 14a. Stop-losses were not executing, and nothing said so
+
+The headline. Trade 2 (HDFCBANK 750 C) marked **8.75 then 8.70 against an
+8.75 stop** on two consecutive ticks on 7 Aug and stayed open. It survived
+only because the price recovered on its own.
+
+Chain, verified end to end: `compute_fill` rejects any quote older than
+**2s**; the engine reads `option_quotes` rows written by the **60s** T1
+REST poll, not a tick stream; `now` was captured once per cycle and the
+cycle takes tens of seconds to walk the watchlist. Measured over **1,396
+real engine ticks, only 1.9% carried a quote fresh enough to fill.** Both
+of trade 2's stop attempts were rejected `STALE_QUOTE` — and
+`run_exit_tick` returned `..._FILL_FAILED` with no log line and no DB
+row, so nothing recorded that a stop had failed.
+
+The one exit that did fill (trade 6's R1 partial) filled *by accident*:
+its quote was stamped 3.2s **after** the cycle's stale `now`, giving a
+negative age that slipped past the `age > 2000ms` check.
+
+Fixed three ways: exits log a warning and append an **`EXIT_FAILED`**
+event (reject reason + quote age); entries and exits get separate
+staleness allowances (**90s / 300s** — skipping an entry is free,
+skipping an exit means carrying a position past its own stop); and `now`
+is re-read per trade so the age measured is real.
+
+### 14b. The trailing-stop ratchet blocked all profit-taking
+
+`trailing_stop_check` returns a `qty_lots=0` bookkeeping decision and
+`evaluate_exits` was "first match wins" — so **on any tick that made a
+new high, no profit target or R-target could fire.** That is precisely
+when they get crossed.
+
+It cost the only closed trade outright. Trade 4 (Nifty 24750 C): 1R =
+116.17, peak **117.35** — it crossed 1R on exactly one tick, that tick
+also made a new high, the ratchet matched first and returned. Next tick
+113.45. It later stopped out at **-₹271 having been +31%**. Trade 6 hit
+1R at 06:00:47 and only partial-exited at 06:11:06, ten ticks later, once
+it stopped making new highs.
+
+The ratchet is now held back and returned only if nothing else fires.
+It is dropped rather than merged onto the winning exit: `hwm_price` is
+persisted on every path, so the next tick re-derives and logs the move.
+
+### 14c. No conviction floor — first-come-first-served slot filling
+
+`nse_stock` opened **4 of its 5 slots in a single tick** at the open (one
+at confidence **0.1366**), then rejected **12,696** later signals on
+`MAX_CONCURRENT`, some scoring as high as **0.7344**. A slot is scarce:
+taking a weak setup locks out every better one until it closes — the
+exact opposite of the stated "only high-conviction setups" philosophy.
+
+Added `min_confidence` per segment, set near each segment's **own**
+p75–p90 because the distributions differ ~10x (nse_stock 0.35, nse_index
+0.30, us_stock 0.25, us_index 0.20). Sanity-checked against all history:
+21.3% / 17.8% / 8.4% / 0.5% of signals would clear. Below-floor signals
+are still written as rejections — unlike an out-of-hours one, a weak
+score is real training data. **Not fitted, not backtested** — same status
+as `stop_loss_pct` and the R-targets, recalibrate in P4.
+
+> `us_index` at 0.5% (13 signals ever) is effectively "do not trade this
+> segment". Left deliberately: its max observed confidence is 0.2317 and
+> its p95 is 0.0239, so any floor that lets it trade is a floor that
+> trades noise. The real fix is upstream signal quality, not the knob.
+
+### 14d. NSE costs were 25x too small
+
+`premium` handed to the cost model was `price * lots`, omitting the
+contract multiplier, so every premium-based NSE charge (STT, exchange
+txn, SEBI, stamp duty, and the GST computed on them) was levied on
+1/`lot_size` of the real premium. Trade 2 recorded **₹0.43 of fees on a
+₹13,341 premium** against a true ₹10.65. `OrderRequest.lot_size` is now
+**required, not defaulted to 1**, so no future call site can silently
+reintroduce it.
+
+### 14e. Upstox WS: a refusal retried like a blip — NOT fixed, needs a token
+
+401/403 on the *handshake* is not transient, and it was being retried
+every 60s forever — **327 times over five hours** on 7 Aug — while the
+same token kept serving REST market data with HTTP 200. Auth-class
+rejections now back off to a **15 min** cap (verified live: 64s → 128s,
+past the old 60s ceiling).
+
+**The feed itself is still down and this is not a code fix.** Diagnosed:
+`/v2/feed/.../authorize` is **410 Gone**; `/v3/.../authorize` returns
+**200** and issues a URL; connecting to that fresh URL still gets **403**
+(and **401** if the Bearer token is attached), with the recorder stopped
+so nothing was competing for a connection. REST market data with the
+identical token returns 200. So the token is valid for REST and refused
+for the feed — **an account/token action is needed, not a code change.**
+Cost of the outage: quote freshness drops from sub-second to 60s, which
+is what made §14a's 2s threshold catastrophic rather than merely wrong.
+
+### 14f. `logging.basicConfig` was never called
+
+Found while checking §14a's new warning actually reaches the journal. It
+does — but only because WARNING+ escapes via Python's last-resort stderr
+handler. **Every `logger.info` in the codebase went nowhere**, which is
+why the four engine units looked silent in `journalctl` for days while
+evaluating tens of thousands of signals. Configured in `cli.py`; systemd
+already timestamps the journal, so the format carries none.
+
+### 14g. How it was verified
+
+Not just unit tests — both headline failures were **replayed through the
+new code against their own real DB rows** on the VM:
+
+- trade 4 at its recorded 117.35 peak → now `PARTIAL_EXIT_R1 qty=1`
+  (was `STOP_RATCHET qty=0`).
+- trade 2's stop-breach quote → now fills **43 @ 8.72** (was
+  `STALE_QUOTE`).
+- the real `run_exit_tick` EXIT_FAILED path, run against live trade 6
+  inside a savepoint-bound session and rolled back: logged the warning,
+  appended the event with reject reason + quote age, hash chain still
+  verified, **25 events before and after** — zero pollution.
+
+**Worth generalising, again:** §13's lesson repeated with teeth. Every
+fault here was invisible *because the thing that failed had no way to
+report failing*. A stop that cannot fill, an exit that returns silently,
+an info log with no handler, a retry loop with no ceiling — none of them
+error, so none of them page. Prefer a loud failure to a clean return.
