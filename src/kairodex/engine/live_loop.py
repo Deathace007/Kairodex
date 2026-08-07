@@ -36,6 +36,22 @@ from kairodex.streaming.types import StreamMessage
 logger = logging.getLogger(__name__)
 
 EVAL_INTERVAL = datetime.timedelta(seconds=60)
+# `compute_fill`'s own 2s default assumes a live tick stream. This engine
+# does not read one: it reads `option_quotes` rows, which the T1 REST poll
+# writes once every 60s per contract. Measured live 2026-08-07 over 1,396
+# real engine ticks, only 1.9% had a quote younger than 2s — so 98% of
+# every exit attempt was rejected STALE_QUOTE, silently, including real
+# stop-loss breaches (see run_exit_tick's EXIT_FAILED comment).
+#
+# Entries and exits get different allowances on purpose. Skipping an entry
+# costs nothing — there is always another setup — so entries stay strict
+# and only tolerate a little over one poll cycle. Skipping an *exit* means
+# carrying a position past its own stop, which is unbounded risk, so exits
+# tolerate far more: a slightly stale exit price is a small, bounded
+# pricing error, and refusing to exit is not. Past 5 minutes the feed is
+# genuinely broken and inventing a fill would be worse than reporting it.
+ENTRY_MAX_QUOTE_AGE_MS = 90_000
+EXIT_MAX_QUOTE_AGE_MS = 300_000
 # How long to idle between checks while this segment's market is closed.
 # Nothing can change in between: no new quotes arrive, so no signal could
 # score differently and no exit could fill (the fill model rejects on
@@ -67,8 +83,10 @@ async def run_segment(segment: Segment, *, shadow: bool = True) -> None:
     strategy = ReferenceStrategy()
     scorer = ConfluenceScorer()
     cost_model = compute_nse_costs if segment.market is Market.NSE else compute_us_costs
-    broker = SimulatedBroker(cost_model=cost_model)
+    broker = SimulatedBroker(cost_model=cost_model, max_quote_age_ms=ENTRY_MAX_QUOTE_AGE_MS)
+    exit_broker = SimulatedBroker(cost_model=cost_model, max_quote_age_ms=EXIT_MAX_QUOTE_AGE_MS)
     execution: ExecutionPort = ShadowLogger(broker) if shadow else broker
+    exit_execution: ExecutionPort = ShadowLogger(exit_broker) if shadow else exit_broker
     config = get_segment_config(segment)
 
     async with sessionmaker() as session:
@@ -172,8 +190,18 @@ async def run_segment(segment: Segment, *, shadow: bool = True) -> None:
             )
             for trade in open_trades:
                 try:
+                    # Re-read the clock per trade rather than reusing the
+                    # cycle's `now`. A full cycle walks the whole watchlist
+                    # and takes tens of seconds, so by the time exits ran,
+                    # `now` was stale — which made the quote-age check
+                    # measure the wrong interval, and occasionally *negative*
+                    # (a quote written after the cycle started looked like it
+                    # came from the future, and sailed through the staleness
+                    # check for that reason alone). That is how trade 6's one
+                    # successful partial exit filled on 2026-08-07 while
+                    # genuine stop-losses on the same cycle were rejected.
                     exit_outcome = await run_exit_tick(
-                        session, trade=trade, broker=execution, now=now
+                        session, trade=trade, broker=exit_execution, now=clock.now()
                     )
                     if exit_outcome.closed:
                         logger.info("trade %d closed: %s", trade.trade_id, exit_outcome.action)

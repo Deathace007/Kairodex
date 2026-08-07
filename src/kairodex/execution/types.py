@@ -15,6 +15,11 @@ class OrderRequest:
     instrument_id: int
     side: Side
     qty: int  # contracts/lots requested
+    # Contract multiplier. Deliberately required rather than defaulting to
+    # 1: `qty * price` is a lot count times a per-unit price, not money,
+    # and the cost model is charged on money. A default here would silently
+    # restore the 25x NSE cost understatement it exists to prevent.
+    lot_size: int
     order_type: str = "MARKET"
     limit_price: Decimal | None = None
 

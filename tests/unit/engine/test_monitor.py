@@ -213,3 +213,60 @@ def test_evaluate_exits_falls_through_to_profit_target():
     result = evaluate_exits(position, _NOW)
     assert result is not None
     assert result.reason == "PROFIT_TARGET"
+
+
+def test_stop_ratchet_does_not_pre_empt_a_partial_exit_on_the_same_tick():
+    """Regression, live 2026-08-07. A tick that makes a new high fires the
+    trailing-stop ratchet AND may cross an R-target — and the ratchet used
+    to match first and return, so the partial never ran.
+
+    Reproduces real trade 4 (Nifty 24750 C) to its own recorded numbers:
+    entry 89.37, initial stop 62.5725 -> risk/lot 26.7975, so 1R = 116.1675.
+    Its peak mark was 117.35, which is both a new high (hwm was 116.15) and
+    past 1R. That single tick was consumed by the ratchet; the next tick was
+    113.45 and the position later stopped out at -₹271 after being +31%."""
+    position = _position(
+        avg_entry=Decimal("89.37"),
+        stop_price=Decimal("81.305"),
+        initial_stop_price=Decimal("62.5725"),
+        current_mark=Decimal("117.35"),
+        high_water_mark_price=Decimal("117.35"),
+        profit_target=Decimal("178.74"),
+        r_multiple_targets=(1.0, 2.0),
+        partial_exits_taken=frozenset(),
+        qty_lots=1,
+    )
+    # The ratchet genuinely does want to fire on this tick...
+    ratchet = trailing_stop_check(position, trail_pct=0.30)
+    assert ratchet is not None and ratchet.qty_lots == 0
+
+    # ...but the partial exit is what must actually happen.
+    decision = evaluate_exits(position, _NOW)
+    assert decision is not None
+    assert decision.reason == "PARTIAL_EXIT_R1"
+    assert decision.qty_lots > 0
+
+
+def test_stop_ratchet_still_returned_when_nothing_else_fires():
+    """The ratchet must not be lost — only deprioritised. A new high that
+    crosses no target still has to move the stop up."""
+    # hwm 200 -> trailed 140, which is above the standing 90 stop, so a
+    # ratchet is genuinely due. Nothing else may fire: mark 200 is under the
+    # 300 target, and 10R is under the single 50R target.
+    position = _position(
+        current_mark=Decimal(200), high_water_mark_price=Decimal(200),
+        profit_target=Decimal(300), r_multiple_targets=(50.0,),
+    )
+    decision = evaluate_exits(position, _NOW)
+    assert decision is not None
+    assert decision.qty_lots == 0  # ratchet, no exit
+    assert decision.new_stop_price == Decimal(200) * Decimal("0.7")
+
+
+def test_stop_loss_still_wins_over_everything_including_the_ratchet():
+    """Priority order is unchanged for real exits: risk protection first."""
+    position = _position(current_mark=Decimal(50), high_water_mark_price=Decimal(200))
+    decision = evaluate_exits(position, _NOW)
+    assert decision is not None
+    assert decision.reason == "STOP_LOSS"
+    assert decision.qty_lots == position.qty_lots

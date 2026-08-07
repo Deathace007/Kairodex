@@ -53,3 +53,13 @@ def test_config_is_frozen():
 def test_all_four_segments_load_without_error():
     for segment in Segment:
         get_segment_config(segment)
+
+
+def test_every_segment_declares_a_confidence_floor_above_zero():
+    """A missing or zero floor is the pre-2026-08-07 behaviour: slots go to
+    whatever the watchlist iterates over first, and better setups later in
+    the session are locked out on MAX_CONCURRENT. Per-segment because the
+    observed score distributions differ by ~10x between them."""
+    for segment in Segment:
+        config = get_segment_config(segment)
+        assert 0.0 < config.min_confidence < 1.0, segment

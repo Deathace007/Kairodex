@@ -16,3 +16,11 @@ max_drawdown_pct: 0.40
 exposure_cap_pct: 0.40
 min_liquidity_score: 0.3
 reentry_cooldown_minutes: 30
+
+# Minimum confluence score to spend a concurrent slot on. First-pass
+# values, set near each segment's OWN observed p75-p90 (2026-08-07: p75=0.3068 p90=0.5117)
+# — the distributions differ by ~10x between segments, so a single shared
+# number would either never trade the index segments or never filter the
+# stock ones. Not fitted, not backtested: recalibrate in P4 against real
+# outcomes, exactly like stop_loss_pct and the R-targets.
+min_confidence: 0.35

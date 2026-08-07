@@ -33,6 +33,14 @@ class SegmentRiskConfig(BaseModel):
     exposure_cap_pct: float
     min_liquidity_score: float
     reentry_cooldown_minutes: int
+    # Confluence score below which a signal is never worth a slot. Without
+    # it the engine was purely first-come-first-served: it filled every
+    # concurrent slot in the opening tick with whatever the watchlist
+    # happened to iterate over first, then spent the rest of the session
+    # rejecting everything on MAX_CONCURRENT. Live 2026-08-07, nse_stock
+    # opened 4 of its 5 slots in a single tick — one at confidence 0.1366 —
+    # and then rejected 12,696 later signals, some as high as 0.7344.
+    min_confidence: float
 
 
 @lru_cache

@@ -21,7 +21,7 @@ def _quote(**overrides: object) -> QuoteSnapshot:
 
 
 def _order(**overrides: object) -> OrderRequest:
-    base = dict(trade_id=1, instrument_id=1, side=Side.BUY, qty=100)
+    base = dict(trade_id=1, instrument_id=1, side=Side.BUY, qty=100, lot_size=1)
     base.update(overrides)
     return OrderRequest(**base)  # type: ignore[arg-type]
 
@@ -94,3 +94,29 @@ async def test_shadow_logger_computes_identical_fill_to_simulated_broker():
     assert direct.price == via_shadow.price
     assert direct.costs is not None and via_shadow.costs is not None
     assert direct.costs.total == via_shadow.costs.total
+
+
+async def test_cost_model_is_charged_on_money_not_lots():
+    """Regression, live 2026-08-07. `premium` handed to the cost model was
+    `price * lots`, omitting the contract multiplier — so every
+    premium-based NSE charge was levied on 1/lot_size of the real premium.
+
+    Real trade 2: 43 lots of a 25-multiplier HDFCBANK contract at 12.41.
+    True premium is 12.41*43*25 = Rs 13,340.75, and the published rates in
+    costs.py give Rs 10.65 of fees on it (brokerage min(20, 0.03%)=4.00,
+    exchange 0.035%=4.67, SEBI 0.0001%=0.013, stamp 0.003%=0.40, GST 18%
+    on the first three = 1.56). The bug charged the Rs 533.63 that
+    12.41*43 comes to instead, and the live trade recorded Rs 0.4259."""
+    broker = SimulatedBroker(cost_model=compute_nse_costs)
+    result = await broker.execute(
+        _order(side=Side.BUY, qty=43, lot_size=25),
+        _quote(bid=Decimal("12.40"), ask=Decimal("12.42"), bid_sz=10_000, ask_sz=10_000),
+        _NOW,
+        attempt=1,
+    )
+    assert not result.rejected
+    assert result.costs is not None
+    assert result.costs.total == pytest.approx(Decimal("10.65"), abs=Decimal("0.02"))
+    # The specific wrong number this regressed from, stated so a future
+    # reintroduction is unambiguous rather than just "a bit low".
+    assert result.costs.total > Decimal("5")

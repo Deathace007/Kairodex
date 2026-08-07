@@ -142,8 +142,26 @@ def evaluate_exits(
     trail_pct: float = 0.30,
     partial_exit_fraction: float = 0.5,
 ) -> ExitDecision | None:
-    """First match wins, in priority order: stop-loss, trailing stop,
-    time exit, event exit, profit target, R-multiple partial exit."""
+    """First *exit* wins, in priority order: stop-loss, trailing stop,
+    time exit, event exit, profit target, R-multiple partial exit.
+
+    A `STOP_RATCHET` (`qty_lots == 0`) is bookkeeping, not an exit, so it
+    never pre-empts a real one — it is held back and only returned if
+    nothing else fired. Live 2026-08-07 it did pre-empt them, and that
+    lost a winner outright: trade 4 (Nifty 24750 C) crossed its 1R target
+    on exactly one tick, at 117.35 against a 116.17 target, and that same
+    tick made a new high — so the ratchet matched first, returned, and the
+    partial exit never ran. The next tick was back at 113.45 and the trade
+    eventually stopped out at -₹271, having been +31% at that peak. Since
+    a ratchet fires precisely when the mark makes a new high, and a new
+    high is precisely when a profit target or R-multiple gets crossed, the
+    two collided on exactly the ticks where taking profit mattered most.
+
+    The ratchet is dropped (not merged onto the returned exit) when a real
+    exit wins the tick: `hwm_price` is persisted on every path, so the
+    caller's next tick re-derives the same trailed level and logs the
+    STOP_MOVED then. One tick of delay on bookkeeping, versus silently
+    skipping the exit."""
     checks: list[ExitDecision | None] = [
         stop_loss_check(position),
         trailing_stop_check(position, trail_pct=trail_pct),
@@ -152,7 +170,12 @@ def evaluate_exits(
         profit_target_check(position),
         r_multiple_partial_exit_check(position, exit_fraction=partial_exit_fraction),
     ]
+    ratchet: ExitDecision | None = None
     for result in checks:
-        if result is not None:
-            return result
-    return None
+        if result is None:
+            continue
+        if result.qty_lots == 0:
+            ratchet = result
+            continue
+        return result
+    return ratchet

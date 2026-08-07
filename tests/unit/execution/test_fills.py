@@ -120,3 +120,31 @@ def test_zero_oi_does_not_trigger_pct_of_oi_rejection():
 def test_none_oi_skips_the_oi_check():
     result = compute_fill(Side.BUY, 10, _quote(oi=None), _NOW)
     assert not result.rejected
+
+
+def test_exit_tolerance_lets_a_real_stop_breach_fill_that_2s_rejected():
+    """Regression, live 2026-08-07, using trade 2's own recorded book.
+
+    HDFCBANK 750 C marked 8.70 against an 8.75 stop. The quote behind that
+    mark was written at 08:50:10 and the engine tick ran at 08:50:25 — 15s
+    later, because quotes come from a 60s REST poll, not a tick stream. The
+    2s default rejected it STALE_QUOTE, the stop did not execute, and the
+    position stayed open. Nothing about the book was wrong: 114bps spread
+    against a 500bps limit, 7,800 on the bid, 23.9M OI."""
+    quote = QuoteSnapshot(
+        bid=Decimal("8.70"), ask=Decimal("8.80"), bid_sz=7800, ask_sz=5200,
+        quote_ts=datetime.datetime(2026, 8, 7, 8, 50, 10, tzinfo=datetime.UTC),
+        oi=23_923_900, chain_complete=True,
+    )
+    tick = datetime.datetime(2026, 8, 7, 8, 50, 25, tzinfo=datetime.UTC)
+
+    stale = compute_fill(Side.SELL, 43, quote, tick, max_quote_age_ms=2_000)
+    assert stale.rejected and stale.reject_reason == "STALE_QUOTE"
+
+    filled = compute_fill(Side.SELL, 43, quote, tick, max_quote_age_ms=300_000)
+    assert not filled.rejected
+    assert filled.filled_qty == 43
+
+    # Still bounded: a genuinely dead feed must not fabricate a fill.
+    dead = datetime.datetime(2026, 8, 7, 9, 30, 0, tzinfo=datetime.UTC)  # ~40 min later
+    assert compute_fill(Side.SELL, 43, quote, dead, max_quote_age_ms=300_000).rejected

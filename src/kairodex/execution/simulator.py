@@ -93,7 +93,15 @@ class SimulatedBroker:
 
         costs = None
         if self._cost_model is not None and outcome.price is not None:
-            premium = outcome.price * outcome.filled_qty
+            # `filled_qty` is LOTS; premium is money, so it needs the
+            # contract multiplier too. Without `lot_size` every NSE cost —
+            # STT, exchange txn, SEBI fee, stamp duty and the GST computed
+            # on them — was charged on 1/lot_size of the real premium, i.e.
+            # 25x too little on NSE. Live 2026-08-07: trade 2 paid a
+            # recorded ₹0.43 of fees on a ₹13,341 premium. US per-contract
+            # fees were unaffected (they key off `qty`, not premium), but
+            # its SEC fee is premium-based and was equally understated.
+            premium = outcome.price * outcome.filled_qty * order.lot_size
             costs = self._cost_model(order.side, premium, outcome.filled_qty)
 
         remaining = order.qty - outcome.filled_qty

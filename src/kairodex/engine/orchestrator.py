@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
+import logging
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -47,6 +48,8 @@ from kairodex.strategy.contract_selector import ContractCandidate, SelectionResu
 from kairodex.strategy.protocol import Strategy
 from kairodex.strategy.scorer import ConfluenceScorer
 from kairodex.strategy.types import MarketContext
+
+logger = logging.getLogger(__name__)
 
 _DEFAULT_STOP_LOSS_PCT = 0.30  # ponytail: first-pass — a 30%-of-premium
 # stop is a common simple options-buying convention; recalibrate once
@@ -239,6 +242,20 @@ async def run_entry_tick(
     session.add(signal)
     await session.flush()
 
+    # Conviction floor, before any of the work below. A concurrent slot is
+    # a scarce resource: taking a weak setup does not just risk that trade,
+    # it locks out every better one until it closes. Live 2026-08-07 that
+    # is exactly what happened — nse_stock filled 4 of 5 slots in the
+    # opening tick (one at confidence 0.1366) and then rejected 12,696
+    # subsequent signals on MAX_CONCURRENT, some scoring as high as 0.7344.
+    # Rejected here rather than skipped entirely, because a below-threshold
+    # signal is real training data (ARCHITECTURE.md §11) — unlike an
+    # out-of-hours one, it says something about the setup, not the clock.
+    if result.confidence < config.min_confidence:
+        signal.reject_stage, signal.reject_reason = "confidence", "BELOW_MIN_CONFIDENCE"
+        await session.commit()
+        return TickOutcome(signal.signal_id, False, signal.reject_stage, signal.reject_reason)
+
     if feature_ctx.spot is None or not feature_ctx.chain:
         signal.reject_stage, signal.reject_reason = "contract_selection", "NO_CHAIN_DATA"
         await session.commit()
@@ -337,7 +354,8 @@ async def run_entry_tick(
         chain_complete=proposal.chain_complete,
     )
     order_request = OrderRequest(
-        trade_id=0, instrument_id=instrument_id, side=Side.BUY, qty=sizing.lots
+        trade_id=0, instrument_id=instrument_id, side=Side.BUY, qty=sizing.lots,
+        lot_size=lot_size,
     )
     execution = await broker.execute(order_request, quote, now, attempt=1)
 
@@ -609,9 +627,43 @@ async def run_exit_tick(
         instrument_id=trade.instrument_id,
         side=Side.SELL,
         qty=decision.qty_lots,
+        lot_size=trade.lot_size,
     )
     execution = await broker.execute(order_request, quote, now, attempt=1)
     if execution.rejected or execution.filled_qty <= 0:
+        # An exit that cannot fill is a risk event, not a non-event: the
+        # position stays open past whatever level just told it to leave.
+        # This used to return silently — no log line, no DB row, nothing —
+        # and live 2026-08-07 that hid a real stop-loss breach: trade 2
+        # (HDFCBANK 750 C) marked at 8.75 then 8.70 against an 8.75 stop on
+        # two consecutive ticks, both attempts were rejected STALE_QUOTE,
+        # and the position simply stayed open. It survived only because the
+        # price happened to recover. Nothing anywhere recorded that the
+        # stop had failed to execute.
+        #
+        # Logged AND written to the event log, because the event log is
+        # this system's record of truth for a trade's life (Principle 2)
+        # and "we were told to exit and could not" belongs in it.
+        quote_age_s = (now - latest_quote.ts).total_seconds()
+        logger.warning(
+            "trade %d: %s could not fill (%s) — quote %.1fs old, position still open",
+            trade.trade_id,
+            decision.reason,
+            execution.reject_reason,
+            quote_age_s,
+        )
+        await event_log.append_event(
+            session,
+            trade_id=trade.trade_id,
+            event_type="EXIT_FAILED",
+            payload={
+                "attempted": decision.reason,
+                "reject_reason": execution.reject_reason,
+                "qty": decision.qty_lots,
+                "quote_age_s": round(quote_age_s, 1),
+            },
+            ts=now,
+        )
         await session.commit()  # keep the position_mark write even if the exit couldn't fill
         return ExitOutcome(trade.trade_id, f"{decision.reason}_FILL_FAILED", closed=False)
     assert execution.price is not None  # guaranteed once not rejected and filled_qty > 0

@@ -75,6 +75,26 @@ CLOSED_MARKET_POLL_INTERVAL = datetime.timedelta(minutes=5)
 # weekly debt and delays recovery past the next daily reset. Long enough that
 # a blown day costs a handful of probe calls, not tens of thousands.
 QUOTA_BACKOFF = datetime.timedelta(minutes=30)
+
+# WS reconnect ceilings. A dropped connection is usually transient, so the
+# normal cap stays short. A 401/403 on the *handshake* is not transient —
+# it is the vendor refusing this token a feed — and retrying it every
+# minute neither fixes it nor goes unnoticed at the vendor's end. Live
+# 2026-08-07 Upstox refused 327 consecutive handshakes over five hours
+# while the very same token kept serving REST market data with HTTP 200,
+# so the retries were pure noise against a decision already made upstream.
+# Backing off costs tick cadence, not data: the T1 REST poll keeps
+# recording the same contracts throughout.
+_WS_RECONNECT_CAP = 60.0
+_WS_AUTH_REJECT_CAP = 900.0  # 15 min
+
+
+def _is_auth_rejection(exc: Exception) -> bool:
+    """Matched on the HTTP code in the message rather than on
+    `websockets.InvalidStatus`, whose module path and name have both moved
+    between websockets major versions — the code is the stable part."""
+    text = str(exc)
+    return "HTTP 401" in text or "HTTP 403" in text
 WS_FLUSH_INTERVAL = datetime.timedelta(seconds=3)
 WS_FLUSH_SIZE = 200
 BACKFILL_LOOKBACK_DAYS = 5  # how far back to search for the last recorded bar on a cold start
@@ -449,7 +469,8 @@ async def ws_stream_loop(
                     last_error_at=datetime.datetime.now(datetime.UTC),
                 )
             await asyncio.sleep(reconnect_wait)
-            reconnect_wait = min(reconnect_wait * 2, 60.0)
+            cap = _WS_AUTH_REJECT_CAP if _is_auth_rejection(e) else _WS_RECONNECT_CAP
+            reconnect_wait = min(reconnect_wait * 2, cap)
 
 
 # --- Entry point --------------------------------------------------------------
