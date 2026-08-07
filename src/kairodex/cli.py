@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import logging
 
 import typer
 
@@ -19,6 +20,16 @@ from kairodex.store.base import get_sessionmaker
 app = typer.Typer(help="AI-assisted options-buying paper trading platform")
 ingest_app = typer.Typer(help="Market data ingestion")
 app.add_typer(ingest_app, name="ingest")
+
+# Nothing configured logging at all until now, so every `logger.info` in
+# the codebase went nowhere: only WARNING and above ever appeared, and
+# only via Python's last-resort stderr handler. That is why the engine
+# units looked silent in journalctl for days while happily evaluating
+# thousands of signals — `run_segment`'s own "engine starting", "market
+# open/closed" and per-signal decision lines are all info level. The
+# processes run under systemd, which timestamps and routes stderr to the
+# journal itself, so the format here deliberately carries no timestamp.
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
 # ADR 0007: LSE carries no true index instruments (SPX/NDX/RUT return zero
 # contracts) — the US_INDEX segment trades these index-tracking ETF options
