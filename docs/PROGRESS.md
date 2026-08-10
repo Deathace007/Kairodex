@@ -1782,6 +1782,28 @@ cannot fill a lot, and same-day volume only ever grows — so a position
 that was enterable this session is exitable this session. That property
 does not hold across days, which is exactly the regime being abandoned.
 
+**Verified live, two ticks after deploying.** Six US positions closed —
+3 `OVERNIGHT_EXIT`, 3 `STOP_LOSS` — against zero that had ever been able
+to close before. The engine also opened two fresh US trades (28 DIA, 29
+INTC) under the new gates in the same session, so entries and exits are
+both working.
+
+Five legacy positions stayed open, each refused honestly rather than
+faked: NVDA (volume 1, ltp 0.01), QQQ (volume 3), ORCL (19), JPM (34) are
+all below the volume that models a fillable book, and XOM tripped
+`SPREAD_TOO_WIDE`. These are 08-07 entries on contracts that are now
+nearly dead — the intraday rule cannot retroactively rescue positions
+taken under the old regime, and going forward the entry gate prevents the
+situation arising.
+
+**One residual edge, flagged not fixed:** `synthesize_quote`'s spread has
+a tick floor (0.01 below $3), so on a very cheap contract the modelled
+spread exceeds `fills.py`'s 500bps `SPREAD_TOO_WIDE` policy — XOM at ltp
+0.16 models a 625bps spread. A position would have to decay to roughly a
+tenth of its entry price intraday to reach that, which the -30% stop
+should catch first, so this is a narrow case. Revisit if a live exit ever
+gets stuck there.
+
 Worth noting what found it: not a test, and not review. The bug was three
 days old and silent behind `NO_LIQUIDITY_AT_TOP_OF_BOOK` warnings nobody
 was reading. It surfaced because a new *requirement* made a previously
