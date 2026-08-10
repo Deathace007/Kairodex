@@ -1669,6 +1669,14 @@ Measured instead of assumed, in this order:
   reader will eventually forget. The text stays in the journal; the column
   is a status light, not a log.
 
+**Verified live end to end** after deploying: both providers' stale
+`last_error` cleared to NULL on the next healthy update, and a completed
+T1 cycle wrote a real `quota_used_pct` — 5.18%, against the hardcoded
+0.00 it had reported for as long as the column has existed. It also
+moves (5.07% -> 5.18% across a few minutes of live session), which is the
+actual test: a number that never changes is indistinguishable from a
+number that is not being measured.
+
 **Worth generalising, a third time.** §13d: a fault reading green. §14: a
 failure with no way to report failing. This one is the mirror — **a
 recovery that reads red forever** — and it is the same root defect as
