@@ -1397,3 +1397,189 @@ fault here was invisible *because the thing that failed had no way to
 report failing*. A stop that cannot fill, an exit that returns silently,
 an info log with no handler, a retry loop with no ceiling — none of them
 error, so none of them page. Prefer a loud failure to a clean return.
+
+---
+
+## 15. P7 begins — hardening first, on the evidence of 26 trades (2026-08-10)
+
+Prompted by "pull all the live/closed trades for all the segments and
+analyze them; improve the segment-wise algo as per our P7." 26 trades on
+disk (10 closed, 16 open) and ~13,800 signals over the last three days.
+
+**Yes, it is time to start P7 — but P7's two halves have to run in that
+order.** ARCHITECTURE.md §19 scopes P7 as "real strategies per segment,
+backlog features, chaos testing, alert tuning," exiting when "the first
+strategy reaches `PAPER_FULL` through the real gates." Those gates
+(`backtest.promotion.evaluate_track_b`) are closed-trade statistics, and
+the closed-trade record was measuring a broken execution path rather than
+a strategy. Calibrating a new strategy against it would have fitted the
+plumbing. So P7 opens with the hardening half; the strategy half needs a
+clean fortnight of trades underneath it first.
+
+### 15a. Where the money actually went
+
+Ten closed trades, **-Rs 9,462 net** (-19.0% of the Rs 50,000 NSE book;
+`nse_stock` -8,614, `nse_index` -848). The `nse_stock` breaker tripped on
+its daily loss limit at -17.2% and rejected 709 signals afterwards —
+working exactly as configured.
+
+The distribution is the finding, not the total:
+
+| | trades | net |
+|---|---|---|
+| Never showed **any** favourable excursion | 4 | **-Rs 8,740 (92%)** |
+| Worked, then gave it back or was forced out | 4 | -Rs 1,029 |
+| Worked and banked something | 2 | +Rs 311 |
+
+Excursion timing, measured off `position_marks`:
+
+| id | underlying | exit | MFE(all) | MAE | at 90 session-min | net |
+|---|---|---|---|---|---|---|
+| 2 | HDFCBANK | TIME_EXIT | +0.7% | -29.9% | **-13.0%** | -3,554 |
+| 23 | BAJFINANCE | STOP_LOSS | -5.0% | -30.1% | **-15.2%** | -2,686 |
+| 7 | ADANIENT | TIME_EXIT | +2.3% | -25.9% | **+2.3%** | -1,490 |
+| 21 | SBIN | STOP_LOSS | +0.2% | -31.5% | (stopped at 10 min) | -1,010 |
+| 9 | Nifty 24650 C | STOP_LOSS | +14.8% | -21.0% | +2.2% | -411 |
+| 4 | Nifty 24750 C | STOP_LOSS | +31.3% | -22.6% | +8.8% | -271 |
+| 8 | WIPRO | TIME_EXIT | +21.8% | -6.3% | -4.8% | -185 |
+| 3 | BANKNIFTY | TIME_EXIT | +19.1% | -9.4% | +10.5% | -166 |
+| 24 | TATASTEEL | PARTIAL_R1 | +30.0% | -10.0% | +30.0% | +22 |
+| 6 | SUNPHARMA | STOP_LOSS | +42.8% | -21.1% | +14.2% | +289 |
+
+**Every trade that ever reached +10% did so within 82 session-minutes,
+five of six within 16.** The four that never got there had a best-ever
+excursion of +0.7%, +2.3%, +0.2% and -5.0% across their *entire* life,
+then rode to a -30%-of-premium stop or a Monday-morning time exit. At the
+90-minute mark the two groups do not overlap: the failures sat at -15.2%
+to +2.3%, everything that worked at +8.8% or better.
+
+That separation is what §15c's scratch rule trades on. It is an early
+"this isn't it," not a prediction, and it costs the winners nothing.
+
+### 15b. The instrument-identity bug — one contract, two rows
+
+**Found while asking why trade 5 (MARUTI) had been logging
+`TIME_EXIT could not fill (STALE_QUOTE) — quote 431,386s old` once a
+minute, for hours.** 431,386 seconds is five days.
+
+Two `instruments` rows existed for each real NSE option contract:
+
+```
+sync-instruments (T0):  "KOTAKBANK 385 PE 25 AUG 26"    <- Upstox trading_symbol
+store_chain_snapshot:   "KOTAKBANK 385.0 P 2026-08-25"  <- synthesized in ingest.py
+```
+
+Identical `exchange`/`expiry`/`strike`/`option_type` and **identical
+`provider_ids`** (`NSE_FO|115925`) — but the unique constraint keys on
+`symbol`, which differs, so both rows were created. This is §6 #11's
+duplicate-identity problem, flagged for the NIFTY index in P1 and never
+chased down for option legs. **2,987 duplicate groups** exist.
+
+It split each trade's life across two identities. `load_chain` sourced
+candidates from whichever row the chain poll writes quotes to, while
+`_resolve_leg_instrument_id` matched on (underlying, strike, type,
+expiry), got two hits, and took whichever the database returned first.
+The WS feed had been writing to the T0 rows until it was capped and then
+lost its authorisation (§14e) — so from **2026-08-05 15:40** those rows
+went silent while the chain poll kept updating the others.
+
+Consequences, all silent, all live on 2026-08-10:
+
+- **Every open `nse_stock` position was on a dead row.** Trades 5, 22, 25
+  and 26 were being monitored against a quote last seen five days
+  earlier.
+- **Trade 26 (KOTAKBANK) had zero `position_marks` — ever.** Its row had
+  never received a single quote, so `_latest_quote` returned `None` and
+  `run_exit_tick` returned before evaluating anything. It carried **no
+  stop-loss monitoring at all** for the entire session.
+- **The marks were frozen prices restamped with a fresh `ts` every tick.**
+  Trade 5 reported a mark of 181.05 and -Rs 458 unrealized at 15:29 on
+  08-10; that price is from 08-05. Unrealized P&L, `equity_snapshots`,
+  and therefore the breaker's own inputs were fiction for those
+  positions.
+- Trade 22 (ONGC) was *opened* at 09:19 on 08-10 — priced off a live
+  quote, then immediately handed to a dead row.
+
+**Root cause fixed** in `data.ingest.upsert_instrument`: match on the
+provider's own instrument key first, falling back to the natural key. The
+provider key is the identity; `symbol` is a label. Duplicates cannot be
+recreated. `_resolve_leg_instrument_id` additionally orders by
+most-recently-quoted — the money path must not go back to choosing
+arbitrarily if a duplicate ever arrives from another direction.
+
+**Every closed trade was on a live-quoted row**, checked explicitly — so
+§15a's numbers, and the rules derived from them, are sound. The damage is
+confined to the four open NSE positions.
+
+### 15c. The four rule changes, each from the table above
+
+1. **Time exits count session seconds, not wall-clock.**
+   `core.sessions.session_seconds_between` / `session_length_secs`, and
+   `max_holding_sessions` in each segment YAML. The 3-calendar-day guard
+   fired all four TIME_EXITs on 08-10 between **09:17 and 09:19 IST** —
+   positions opened the previous Wednesday/Thursday, four calendar days
+   old but only two sessions old, forced out into the week's widest
+   spreads. All four were losses (-Rs 5,395 between them).
+2. **New `SCRATCH_EXIT`** (`scratch_exit_after_minutes: 90`,
+   `scratch_exit_min_mfe_pct: 0.08`). If the high-water mark has not
+   reached +8% within 90 session-minutes, leave. Uses the HWM, not the
+   current mark, so a position that ran and gave it back belongs to the
+   stop, not to this rule. Ordered last in `evaluate_exits` so it can
+   never pre-empt a real exit.
+3. **New `EXPIRY_EXIT`**, 30 minutes before the expiry session's close.
+   Nothing in the exit rules referenced `expiry` at all; five open
+   positions (MSFT/GOOGL/META/NVDA + QQQ) were holding contracts expiring
+   **that same day**, protected only by the theta guard happening to fire
+   first. Fixed cushion, not a knob — a mechanical margin, not strategy.
+4. **First partial moves 1R -> 0.5R** (`(0.5, 1.0, 2.0)`). With a
+   30%-of-premium stop, 1R means +30% before anything is banked. Only two
+   of six winners ever touched it; all six cleared +14.8%. Trade 9 peaked
+   at +14.8%, had no rung below +30%, and closed at -Rs 411.
+
+Plus **`session_warmup_gate`** (`entry_warmup_minutes: 20`): 11 of the 13
+NSE entries ever taken were opened within 20 minutes of the bell, 5
+within 4 minutes, and they carry essentially all of the realised loss.
+Five of the eighteen launch-set features — ATR, VWAP position, opening
+range, volume-profile POC distance, price acceptance — are intraday by
+construction, so a 09:18 confluence score is largely degenerate inputs
+wearing a number. It also removes the structural half of §14c: without a
+warm-up the engine met every scarce slot at once, in watchlist iteration
+order, before the session had shown anything.
+
+476 tests (11 new), ruff/mypy clean.
+
+### 15d. Deliberately not done
+
+- **`trades.mfe`/`mae`/`r_multiple` are still NULL on every row.** Left
+  alone on purpose: no P7 gate reads them (`mfe_mae_ratio` is a *Track A*
+  metric computed from backtest resolution, not from these columns), and
+  every number in §15a was computed from `position_marks`, which already
+  records every tick. Write them when something actually reads them.
+- **`trades.premium_paid` decrements to 0 as a position closes** — it is
+  "remaining cost basis", not "what was paid", so every closed trade
+  reports 0. Real, but nothing downstream currently misreads it.
+- **The scratch rule is not backfilled onto already-open positions.**
+  Correcting the theta guard's *unit* on live trades is a measurement
+  fix; applying a brand-new exit rule retroactively is not.
+- **`base_risk_pct` untouched.** 8% x 5 concurrent slots is 40% of the
+  book at risk, and the -19.85% drawdown followed from it — but 8% is
+  ARCHITECTURE.md §11's own table, downstream of ADR 0005's explicit
+  capital decision, and `exposure_cap_pct` (0.40) already bounds
+  *concurrent* risk to ~12%. The lever the evidence supports is fewer bad
+  trades, not smaller ones. Revisit with the user, not by drive-by.
+- **US ingestion / Upstox WS** — unchanged since §13d/§14e. The feed still
+  needs a token action, not code.
+
+### 15e. Two live actions still pending (blocked, need approval)
+
+Neither is code; both need a hand on the VM:
+
+1. **Repoint the four corrupted open trades** (5 MARUTI, 22 ONGC, 25 TCS,
+   26 KOTAKBANK) from the abandoned duplicate row to the live-quoted one,
+   and correct `max_holding_secs` from 259200 wall-clock seconds to the
+   session-denominated equivalent. Until this runs, those four positions
+   still have no working stop-loss. Script:
+   `scratchpad/repair.sql` (transactional, prints the mapping before
+   applying).
+2. **`systemctl restart kairodex-engine-{nse_stock,nse_index,us_stock,us_index}`**
+   — the VM is at `caac907` but the running processes are not.
