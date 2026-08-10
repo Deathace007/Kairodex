@@ -1623,3 +1623,56 @@ read NO_ACTION now and should fire 30 minutes before the close (01:00
 IST) — **unless US quotes are still 65h stale from the LSE weekly cap
 (§13d), in which case the exits will correctly fail loud as
 `EXIT_FAILED`/`STALE_QUOTE` rather than fill on fiction.**
+
+### 15f. The LSE "quota burn" was two lying sensors, not a quota burn (2026-08-10)
+
+Investigated because `feed_health.lse` read
+`LSE options() quota exceeded: daily request limit reached (15000/day)`
+at 18:55 IST, minutes before the US session opened — apparently the §13d
+outage again, with four positions expiring that same day and no data to
+exit them. **It was not happening.** Recorded because the way it looked
+real is the reusable part.
+
+Measured instead of assumed, in this order:
+
+1. **Sampled `feed_health` every 3s during the live session.** `connected`
+   steady, `subscribed_count` climbing 591 -> 649, `last_message_at` fresh
+   every 2-3s. 3,209 `us_stock` + 1,268 `us_index` quotes landed in five
+   minutes, and all five contracts expiring that day had quotes seconds
+   old. The feed was healthy the entire time.
+2. **`last_error_at` was `08-07 01:28:18` — three days stale.** Nothing
+   ever cleared `last_error`/`last_error_at`, so the columns mean "the
+   last error ever seen" while every reader treats them as "what is wrong
+   now". The 65h-stale US quotes seen earlier were simply the weekend.
+3. **Called LSE's own `/usage` directly.** The real payload has no
+   `used_pct` and no `used` — it is a set of budgets:
+   `bytes_used_month 774,463,437 / bytes_cap_month 53,687,091,200`,
+   `bytes_used_week 774,463,437 / bytes_cap_week 16,106,127,360`,
+   `exports_this_hour 0 / exports_cap_hour 5`, `calls_per_minute 200`.
+   **Real headroom: 4.8% of the weekly cap.** §13d's remediation worked.
+
+**Both sensors fixed:**
+
+- `lse/client.py::quota()` — `raw.get("used_pct") or raw.get("used")` was
+  always `None` against the real payload, and the `else` branch returned a
+  hardcoded **0.0**. §13d fixed the *failure* path (429 -> 100.0) and left
+  the *success* path doing exactly what `QuotaStatus`'s own docstring
+  forbids: conflating "unknown" with "zero". It now derives the percentage
+  from whichever budget is fullest (the one that will actually stop us —
+  max, not average; `calls_per_minute` excluded, a rate is not a
+  consumable) and degrades to `None`, never 0.0, when nothing parses.
+  5 tests, including the real captured payload.
+- `recorder.py::update_feed_health` — a healthy update now clears
+  `last_error`/`last_error_at`. Cleared at the source rather than compared
+  at read time (`last_error_at > last_message_at`), because there is more
+  than one reader and a comparison every reader must remember is one a
+  reader will eventually forget. The text stays in the journal; the column
+  is a status light, not a log.
+
+**Worth generalising, a third time.** §13d: a fault reading green. §14: a
+failure with no way to report failing. This one is the mirror — **a
+recovery that reads red forever** — and it is the same root defect as
+§13d's, in the same function, on the branch §13d did not touch. A sensor
+whose "healthy" and "unknown" values are the same number is not a sensor.
+When a status field disagrees with the thing it describes, sample the
+thing, not the field.

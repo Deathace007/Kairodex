@@ -212,7 +212,40 @@ class LSEClient:
                 return QuotaStatus(used_pct=100.0, raw={"available": True, "inferred_from": "429"})
             return QuotaStatus(used_pct=None, raw={"available": False})
         used = raw.get("used_pct") or raw.get("used")
-        return QuotaStatus(used_pct=float(used) if used is not None else 0.0, raw=raw)
+        if used is not None:
+            return QuotaStatus(used_pct=float(used), raw=raw)
+
+        # The vendor publishes no single "percent used" — the real payload
+        # (verified live 2026-08-10) is a set of budgets:
+        #
+        #   bytes_used_month / bytes_cap_month     bytes_used_week / bytes_cap_week
+        #   exports_this_hour / exports_cap_hour   calls_per_minute (a rate, not a budget)
+        #
+        # so `raw.get("used_pct") or raw.get("used")` was always None and
+        # this returned a hardcoded 0.0 — "confirmed idle" — no matter what
+        # the account had actually consumed. Measured live: 774 MB against
+        # a 16 GB weekly cap (4.8%) while feed_health reported 0.00%.
+        #
+        # That is the third appearance of one bug. §13d fixed the *failure*
+        # path (a 429 now reports 100.0) and left the *success* path doing
+        # exactly what `QuotaStatus`'s own docstring forbids: conflating
+        # "unknown" with "zero". Unparseable now degrades to None.
+        #
+        # Whichever budget is fullest is the one that will stop us, so the
+        # headroom figure is their max, not an average. `calls_per_minute`
+        # is deliberately excluded — a rate limit is not a consumable.
+        ratios = [
+            100.0 * float(raw[num]) / float(raw[cap])
+            for num, cap in (
+                ("bytes_used_month", "bytes_cap_month"),
+                ("bytes_used_week", "bytes_cap_week"),
+                ("exports_this_hour", "exports_cap_hour"),
+            )
+            if isinstance(raw.get(num), int | float)
+            and isinstance(raw.get(cap), int | float)
+            and float(raw[cap]) > 0
+        ]
+        return QuotaStatus(used_pct=max(ratios) if ratios else None, raw=raw)
 
 
 def _parse_stream_tick(lse_tick: object) -> Tick | None:

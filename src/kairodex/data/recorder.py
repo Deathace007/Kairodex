@@ -145,6 +145,20 @@ async def watchlist_instruments(session: AsyncSession, segment: Segment) -> list
 
 
 async def update_feed_health(session: AsyncSession, provider: str, **fields: object) -> None:
+    """A healthy update clears `last_error`/`last_error_at`.
+
+    Nothing ever cleared them, so the columns meant "the last error ever
+    seen" while every reader — `kairodex status`, the dashboard, and a
+    human at a psql prompt — reads them as "what is wrong right now". On
+    2026-08-10 `feed_health.lse` showed `quota exceeded: daily request
+    limit reached` beside a live, streaming connection; the error was from
+    08-07 and had been fixed for three days. It cost a wrong diagnosis.
+
+    Cleared at the source rather than compared at read time
+    (`last_error_at > last_message_at`) because there is more than one
+    reader and a comparison every one of them has to remember is a
+    comparison one of them will eventually forget. The error text is still
+    in the journal; this column is a status light, not a log."""
     now = datetime.datetime.now(datetime.UTC)
     row = await session.get(FeedHealth, provider)
     if row is None:
@@ -152,6 +166,9 @@ async def update_feed_health(session: AsyncSession, provider: str, **fields: obj
         session.add(row)
     for key, value in fields.items():
         setattr(row, key, value)
+    if fields.get("connected") is True and "last_error" not in fields:
+        row.last_error = None
+        row.last_error_at = None
     row.updated_at = now
     await session.commit()
 
