@@ -1577,16 +1577,49 @@ order, before the session had shown anything.
 - **US ingestion / Upstox WS** — unchanged since §13d/§14e. The feed still
   needs a token action, not code.
 
-### 15e. Two live actions still pending (blocked, need approval)
+### 15e. Deployed and repaired (2026-08-10 18:29 IST)
 
-Neither is code; both need a hand on the VM:
+Both live actions done, in this order while NSE was shut:
 
-1. **Repoint the four corrupted open trades** (5 MARUTI, 22 ONGC, 25 TCS,
-   26 KOTAKBANK) from the abandoned duplicate row to the live-quoted one,
-   and correct `max_holding_secs` from 259200 wall-clock seconds to the
-   session-denominated equivalent. Until this runs, those four positions
-   still have no working stop-loss. Script:
-   transactional, printing the mapping before applying (the SQL is in
-   this session's handover, not checked in — it is a one-off repair).
-2. **`systemctl restart kairodex-engine-{nse_stock,nse_index,us_stock,us_index}`**
-   — the VM is at `caac907` but the running processes are not.
+1. **Four open trades repointed** — 5 (MARUTI) 33105->47587, 22 (ONGC)
+   15812->48106, 25 (TCS) 23439->46508, 26 (KOTAKBANK) 18944->46851 —
+   `orders` rows with them, in one transaction. `max_holding_secs`
+   corrected from 259200 wall-clock seconds to 67500 (3 NSE sessions) /
+   70200 (3 US sessions) on all 16 open trades. All 16 now resolve to a
+   live-quoted instrument.
+2. All four engine units restarted onto `caac907` and confirmed active,
+   idling correctly against a closed market.
+
+**What the repair uncovered is worse than the frozen marks implied.**
+Replaying the real `evaluate_exits` against every open position (read-
+only) shows the four repaired trades are all far through their stops:
+
+| trade | entry | reported mark | **real mark** | decision |
+|---|---|---|---|---|
+| 5 MARUTI | 199.37 | 181.05 (08-05) | **124.40** | STOP_LOSS |
+| 22 ONGC | 2.95 | 3.00 (08-05) | **2.04** | STOP_LOSS |
+| 25 TCS | 35.98 | 29.45 (08-05) | **24.90** | STOP_LOSS |
+| 26 KOTAKBANK | 4.93 | *none, ever* | **2.80** | STOP_LOSS |
+
+Unrealized on those four was being reported as -Rs 944 (with KOTAKBANK
+contributing nothing at all, having no marks). The truth is **-Rs 2,880**
+— `nse_stock` equity was overstated by roughly Rs 1,940, and the breaker,
+the drawdown throttle and `risk_multiplier` were all reading the
+overstatement. MARUTI alone was understated 4x.
+
+All four will stop out at tomorrow's 09:15 IST open — which is precisely
+the opening-bell moment §15c argues is the worst time to be a forced
+seller. Noted rather than worked around: they are already deep through
+their stops, the warm-up gate governs entries only, and there is no
+better moment available to a position that should have closed days ago.
+
+The session-time theta guard correctly does **not** fire on any of them
+(MARUTI is 12.4 session-hours old against 18.75), so the stop is what
+acts — the right rule winning, not two rules racing.
+
+`EXPIRY_EXIT` gets its first real exercise tonight: NVDA, META, GOOGL and
+QQQ all expire 2026-08-10, and the US session opens at 19:00 IST. They
+read NO_ACTION now and should fire 30 minutes before the close (01:00
+IST) — **unless US quotes are still 65h stale from the LSE weekly cap
+(§13d), in which case the exits will correctly fail loud as
+`EXIT_FAILED`/`STALE_QUOTE` rather than fill on fiction.**
