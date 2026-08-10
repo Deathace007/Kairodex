@@ -684,14 +684,30 @@ async def run_exit_tick(
     # stuck open past its own stop-loss. `quote_ts=now` also silently
     # disabled the STALE_QUOTE check on every exit; using the real
     # timestamp restores it.
-    quote = QuoteSnapshot(
-        bid=latest_quote.bid or mark,
-        ask=latest_quote.ask or mark,
-        bid_sz=latest_quote.bid_sz or 0,
-        ask_sz=latest_quote.ask_sz or 0,
-        quote_ts=latest_quote.ts,
-        oi=latest_quote.oi,
-    )
+    quote = _exit_quote(trade.segment, latest_quote, mark)
+    if quote is None:
+        quote_age_s = (now - latest_quote.ts).total_seconds()
+        logger.warning(
+            "trade %d: %s has no modellable book (ltp=%s volume=%s) — position still open",
+            trade.trade_id,
+            decision.reason,
+            mark,
+            latest_quote.volume,
+        )
+        await event_log.append_event(
+            session,
+            trade_id=trade.trade_id,
+            event_type="EXIT_FAILED",
+            payload={
+                "attempted": decision.reason,
+                "reject_reason": "NO_SYNTHETIC_BOOK",
+                "qty": decision.qty_lots,
+                "quote_age_s": round(quote_age_s, 1),
+            },
+            ts=now,
+        )
+        await session.commit()
+        return ExitOutcome(trade.trade_id, f"{decision.reason}_FILL_FAILED", closed=False)
     order_request = OrderRequest(
         trade_id=trade.trade_id,
         instrument_id=trade.instrument_id,
@@ -860,6 +876,60 @@ async def run_exit_tick(
     await session.commit()
     return ExitOutcome(
         trade.trade_id, decision.reason, closed=fully_closed, qty_lots=execution.filled_qty
+    )
+
+
+def _exit_quote(
+    segment: Segment, latest_quote: OptionQuote, mark: Decimal
+) -> QuoteSnapshot | None:
+    """The book to price an exit against — modelled for US, observed for NSE.
+
+    `bid_sz`/`ask_sz` used to fall back to **0** when the vendor published
+    none, and `compute_fill` fills `floor(partial_fill_alpha * size)` = 0
+    at any size below 4. LSE publishes no bid, ask, or sizes at all (§13c),
+    so **every US exit was rejected `NO_LIQUIDITY_AT_TOP_OF_BOOK`, always** —
+    no US position had ever been exitable. §13e built `synthesize_quote`
+    for the entry path and §13c noted the exit path "already degrades
+    gracefully" via `bid=latest_quote.bid or mark`; that fixed the *price*
+    and left the *size* at zero, which can never fill. It surfaced the
+    moment the intraday rule started demanding exits that had to work.
+
+    Symmetry with entries buys a real guarantee under the intraday rule:
+    `_candidates_from_chain` will not offer a contract whose modelled size
+    cannot fill a lot, and same-day volume only ever grows — so a position
+    that was enterable this session is exitable this session.
+
+    Still gated on `Market.US` rather than "synthesize whenever sizes are
+    missing", for §13e's reason: an NSE feed hiccup must never quietly move
+    a real-book segment onto modelled prices."""
+    if segment.market is not Market.US:
+        return QuoteSnapshot(
+            bid=latest_quote.bid or mark,
+            ask=latest_quote.ask or mark,
+            bid_sz=latest_quote.bid_sz or 0,
+            ask_sz=latest_quote.ask_sz or 0,
+            quote_ts=latest_quote.ts,
+            oi=latest_quote.oi,
+        )
+    if latest_quote.bid is not None and latest_quote.ask is not None:
+        return QuoteSnapshot(
+            bid=latest_quote.bid,
+            ask=latest_quote.ask,
+            bid_sz=latest_quote.bid_sz or 0,
+            ask_sz=latest_quote.ask_sz or 0,
+            quote_ts=latest_quote.ts,
+            oi=latest_quote.oi,
+        )
+    modelled = synthesize_quote(mark, latest_quote.volume)
+    if modelled is None:
+        return None
+    return QuoteSnapshot(
+        bid=modelled.bid,
+        ask=modelled.ask,
+        bid_sz=modelled.bid_sz,
+        ask_sz=modelled.ask_sz,
+        quote_ts=latest_quote.ts,
+        oi=latest_quote.oi,
     )
 
 

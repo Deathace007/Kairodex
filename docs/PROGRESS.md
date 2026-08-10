@@ -1742,3 +1742,48 @@ single `now` is mid-session for every segment any more.
 this rule in practice — nothing survives a session, so neither can fire.
 Kept rather than deleted: they are a handful of tested lines and they are
 the backstop if the intraday rule is ever relaxed. 488 tests.
+
+### 15h. No US position had ever been exitable (2026-08-10)
+
+Found within a minute of deploying §15g, because the intraday rule
+started demanding exits that had to actually work. Every US position
+logged, every tick:
+
+```
+trade 17: OVERNIGHT_EXIT could not fill (NO_LIQUIDITY_AT_TOP_OF_BOOK)
+trade 10: STOP_LOSS      could not fill (NO_LIQUIDITY_AT_TOP_OF_BOOK)
+```
+
+`run_exit_tick` built its `QuoteSnapshot` with
+`bid_sz=latest_quote.bid_sz or 0`. **LSE publishes no bid, no ask, and no
+sizes at all** (§13c), so that fallback was always 0 — and
+`execution.fills` fills `floor(partial_fill_alpha * size)`, which is 0 for
+any size below 4. So every US exit attempt, stop-losses included, was
+rejected on every tick since the first US trade opened on 2026-08-07.
+**US positions could be entered and never closed.**
+
+§13e built `synthesize_quote` for the *entry* path only, and §13c
+explicitly recorded that "the exit path already degrades gracefully
+(`bid=latest_quote.bid or mark`)". That observation was half right: it
+fixed the *price* and left the *size* at zero, which can never fill. The
+asymmetry it noted was real and pointed the wrong way.
+
+Fixed with `orchestrator._exit_quote`, which mirrors the entry path: US
+exits are priced against a modelled book from ltp + volume, NSE keeps the
+observed one. Still gated on `Market.US` rather than "synthesize whenever
+sizes are missing" — §13e's rule, so an NSE feed hiccup can never quietly
+move a real-book segment onto modelled prices. When a contract is too thin
+to model honestly, `_exit_quote` returns None and the caller logs
+`EXIT_FAILED`/`NO_SYNTHETIC_BOOK`: reported, never invented.
+
+**The intraday rule turns this into a guarantee rather than a hope.**
+`_candidates_from_chain` already refuses a contract whose modelled size
+cannot fill a lot, and same-day volume only ever grows — so a position
+that was enterable this session is exitable this session. That property
+does not hold across days, which is exactly the regime being abandoned.
+
+Worth noting what found it: not a test, and not review. The bug was three
+days old and silent behind `NO_LIQUIDITY_AT_TOP_OF_BOOK` warnings nobody
+was reading. It surfaced because a new *requirement* made a previously
+tolerable failure intolerable — the same way §14a's stop-loss failures
+surfaced only once someone asked what the closed trades did. 492 tests.
