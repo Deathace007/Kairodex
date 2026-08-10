@@ -90,7 +90,7 @@ def test_size_position_rejects_below_min_size():
         weekly_loss_limit_pct=0.2, max_drawdown_pct=0.3, exposure_cap_pct=0.3,
         min_liquidity_score=0.3, reentry_cooldown_minutes=30,
             min_confidence=0.0,  # irrelevant to sizing; 0.0 = no floor
-        entry_warmup_minutes=0, max_holding_sessions=3,
+        entry_warmup_minutes=0, entry_cutoff_minutes=0, max_holding_sessions=3,
         scratch_exit_after_minutes=90, scratch_exit_min_mfe_pct=0.08,
     )
     # budget = 10000*0.01 = 100; one lot = 200*10 = 2000 -> 0 lots
@@ -114,7 +114,7 @@ def test_size_position_rejects_size_exceeding_ceiling():
         weekly_loss_limit_pct=0.2, max_drawdown_pct=0.3, exposure_cap_pct=0.3,
         min_liquidity_score=0.3, reentry_cooldown_minutes=30,
             min_confidence=0.0,  # irrelevant to sizing; 0.0 = no floor
-        entry_warmup_minutes=0, max_holding_sessions=3,
+        entry_warmup_minutes=0, entry_cutoff_minutes=0, max_holding_sessions=3,
         scratch_exit_after_minutes=90, scratch_exit_min_mfe_pct=0.08,
     )
     result = size_position(
@@ -161,7 +161,7 @@ def test_size_position_capped_by_max_premium_pct():
         weekly_loss_limit_pct=0.2, max_drawdown_pct=0.3, exposure_cap_pct=0.30,
         min_liquidity_score=0.3, reentry_cooldown_minutes=30,
             min_confidence=0.0,  # irrelevant to sizing; 0.0 = no floor
-        entry_warmup_minutes=0, max_holding_sessions=3,
+        entry_warmup_minutes=0, entry_cutoff_minutes=0, max_holding_sessions=3,
         scratch_exit_after_minutes=90, scratch_exit_min_mfe_pct=0.08,
     )
     result = size_position(
@@ -184,7 +184,7 @@ def test_size_position_capped_by_exposure():
         weekly_loss_limit_pct=0.2, max_drawdown_pct=0.3, exposure_cap_pct=0.30,
         min_liquidity_score=0.3, reentry_cooldown_minutes=30,
             min_confidence=0.0,  # irrelevant to sizing; 0.0 = no floor
-        entry_warmup_minutes=0, max_holding_sessions=3,
+        entry_warmup_minutes=0, entry_cutoff_minutes=0, max_holding_sessions=3,
         scratch_exit_after_minutes=90, scratch_exit_min_mfe_pct=0.08,
     )
     result = size_position(

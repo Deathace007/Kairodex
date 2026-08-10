@@ -44,3 +44,10 @@ max_holding_sessions: 3
 # +2.3%, +0.2%, -5.0%) rode to a -30% stop for 92% of all losses.
 scratch_exit_after_minutes: 90
 scratch_exit_min_mfe_pct: 0.08
+
+# No new entries this close to the bell. Everything is intraday (user's
+# call, 2026-08-10: nothing held overnight), so a trade opened with less
+# runway than it needs to work just pays both spreads. Matches the scratch
+# window, from the same evidence: every winner reached +10% within 82
+# session-minutes.
+entry_cutoff_minutes: 90

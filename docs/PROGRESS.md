@@ -1684,3 +1684,61 @@ recovery that reads red forever** — and it is the same root defect as
 whose "healthy" and "unknown" values are the same number is not a sensor.
 When a status field disagrees with the thing it describes, sample the
 thing, not the field.
+
+### 15g. Intraday only — nothing is held overnight (user's call, 2026-08-10)
+
+Requirement, stated plainly: every position is closed by the end of its
+own session, or earlier on its target or stop. Three changes, and the
+third prevents a bug the first two would otherwise have created.
+
+**1. `monitor.session_close_exit_check`** — two ways a position can end up
+carrying, so two checks:
+
+- `EOD_EXIT` — `now` is inside the closing cushion. **15 minutes, not 1
+  or 2.** An exit is a fill request that can be refused (§14a is the whole
+  story of stops that could not fill), the engine ticks once a minute, so
+  15 minutes buys roughly 15 attempts. A tighter cushion trades some of
+  the session's last move for a real chance of still being long at the
+  bell.
+- `OVERNIGHT_EXIT` — the position was opened on an earlier session date
+  and is still open. The cushion check cannot catch this: the engine idles
+  while the market is shut, so if it was down or an exit failed during the
+  final minutes, the next morning's ticks are nowhere near a close and the
+  straggler would be held all the following day.
+
+**2. `session_timing_gate`** (was `session_warmup_gate`) grew a closing
+edge, `entry_cutoff_minutes: 90`. With everything intraday, a position
+opened near the bell is bought and sold for the two spreads — it gets
+force-closed whatever it is doing. 90 minutes is the same number as the
+scratch window and comes from the same measurement: every closed trade
+that ever worked reached +10% within 82 session-minutes, so less than 90
+minutes of runway is less than the evidence says a trade needs. Live
+examples this stops: trade 27 opened 15:09 IST (21 minutes before the
+close), trade 9 at 14:58. The NSE tradable window becomes 09:35-14:00,
+265 of 375 minutes.
+
+**3. The ordering is load-bearing.** `session_close_exit_check` runs
+*ahead of every optional exit*, because `r_multiple_partial_exit_check`
+returns a **fraction** of the position — if it had won a tick inside the
+closing cushion, the remainder would have been carried overnight, the one
+outcome the rule exists to prevent. Pinned by
+`test_eod_exit_outranks_the_partial_exit_that_would_strand_a_remainder`,
+which asserts the partial really would have fired first. Stop-loss and
+trailing stop still outrank it: risk protection stays first, and the
+recorded `exit_reason` must be the one that actually fired. The cost is
+attribution only — a winner closing at 15:20 is labelled `EOD_EXIT` rather
+than `PROFIT_TARGET`; both fully close at the same price.
+
+**Two test fixtures were quietly wrong and this exposed them.** Both
+`test_gates.py` and `test_monitor.py` used `_NOW = 10:00 UTC` — which is
+15:30 IST, the closing bell exactly. Harmless until a rule cared about the
+close, at which point every baseline in both files was an entry or a
+position at the bell. Both moved to 11:30 IST. `test_gates.py`'s
+all-segments baseline also had to start deriving a per-market instant:
+NSE (03:45-10:00 UTC) and US (13:30-20:00 UTC) do not overlap, so no
+single `now` is mid-session for every segment any more.
+
+`max_holding_sessions` and `expiry_exit_check` are both now dominated by
+this rule in practice — nothing survives a session, so neither can fire.
+Kept rather than deleted: they are a handful of tested lines and they are
+the backstop if the intraday rule is ever relaxed. 488 tests.

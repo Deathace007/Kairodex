@@ -28,7 +28,7 @@ from __future__ import annotations
 import datetime
 
 from kairodex.config.segments import SegmentRiskConfig
-from kairodex.core.sessions import session_minutes_since_open
+from kairodex.core.sessions import session_length_secs, session_minutes_since_open
 from kairodex.risk.types import AccountState, ChainResult, GateResult, TradeProposal
 
 
@@ -71,13 +71,13 @@ def session_window_gate(
     return GateResult("session_window", True)
 
 
-def session_warmup_gate(
+def session_timing_gate(
     proposal: TradeProposal,
     account: AccountState,
     config: SegmentRiskConfig,
     now: datetime.datetime,
 ) -> GateResult:
-    """No entries in the opening minutes of a session.
+    """No entries at either edge of the session.
 
     Runs immediately after `session_window_gate` — same idea, finer edge:
     that gate answers "is the exchange open", this one answers "has this
@@ -91,13 +91,27 @@ def session_warmup_gate(
 
     It also removes the structural half of §14c: with no warm-up the
     engine met every scarce slot at once, in watchlist iteration order,
-    before the session had shown anything."""
+    before the session had shown anything.
+
+    **The closing edge follows from the intraday rule** (nothing is held
+    overnight — `monitor.session_close_exit_check`). A position opened
+    with less runway than it needs to work is a position bought and sold
+    for the two spreads: it gets force-closed at the bell whatever it is
+    doing. `entry_cutoff_minutes` is set to the same 90 minutes as the
+    scratch window, and from the same measurement — every closed trade
+    that ever worked reached +10% within 82 session-minutes, so under 90
+    minutes of runway is under the time the evidence says a trade needs.
+    Live examples of what this stops: trade 27 (Nifty) opened at 15:09
+    IST, 21 minutes before the close, and trade 9 at 14:58."""
     minutes_in = session_minutes_since_open(proposal.segment.market, now)
     if minutes_in is None:  # market closed — session_window_gate's business, not this one
-        return GateResult("session_warmup", True)
+        return GateResult("session_timing", True)
     if minutes_in < config.entry_warmup_minutes:
-        return GateResult("session_warmup", False, "SESSION_WARMUP")
-    return GateResult("session_warmup", True)
+        return GateResult("session_timing", False, "SESSION_WARMUP")
+    minutes_left = session_length_secs(proposal.segment.market) / 60 - minutes_in
+    if minutes_left < config.entry_cutoff_minutes:
+        return GateResult("session_timing", False, "SESSION_CLOSING")
+    return GateResult("session_timing", True)
 
 
 def event_blackout_gate(
@@ -256,7 +270,7 @@ GATE_CHAIN = (
     kill_switch_gate,
     breaker_gate,
     session_window_gate,
-    session_warmup_gate,
+    session_timing_gate,
     event_blackout_gate,
     daily_loss_gate,
     weekly_loss_gate,

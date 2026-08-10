@@ -17,12 +17,17 @@ from kairodex.engine.monitor import (
     profit_target_check,
     r_multiple_partial_exit_check,
     scratch_exit_check,
+    session_close_exit_check,
     stop_loss_check,
     time_exit_check,
     trailing_stop_check,
 )
 
-_NOW = datetime.datetime(2026, 8, 5, 10, 0, tzinfo=datetime.UTC)
+# 11:30 IST on a Wednesday — mid-session for NSE. It used to be 10:00 UTC,
+# which is 15:30 IST: the closing bell exactly. Harmless until
+# `session_close_exit_check` existed, at which point every position built
+# from this fixture was sitting inside the intraday rule's cushion.
+_NOW = datetime.datetime(2026, 8, 5, 6, 0, tzinfo=datetime.UTC)
 
 
 def _position(**overrides: object) -> Position:
@@ -404,3 +409,68 @@ def test_expiry_exit_does_not_fire_on_a_later_dated_contract():
 
 def test_expiry_exit_abstains_without_an_expiry():
     assert expiry_exit_check(_position(expiry=None), _NOW) is None
+
+
+# --- session close / intraday rule ------------------------------------------
+
+_NSE_MID = datetime.datetime(2026, 8, 5, 6, 0, tzinfo=datetime.UTC)  # 11:30 IST Wed
+
+
+def test_eod_exit_fires_inside_the_closing_cushion():
+    """NSE closes 15:30 IST = 10:00 UTC; the cushion is 15 minutes, so
+    09:46 UTC (15:16 IST) fires and takes the whole position."""
+    position = _position(segment=Segment.NSE_STOCK, opened_at=_NSE_MID)
+    now = datetime.datetime(2026, 8, 5, 9, 46, tzinfo=datetime.UTC)
+    result = session_close_exit_check(position, now)
+    assert result is not None
+    assert result.reason == "EOD_EXIT"
+    assert result.qty_lots == 10
+
+
+def test_eod_exit_does_not_fire_before_the_cushion():
+    position = _position(segment=Segment.NSE_STOCK, opened_at=_NSE_MID)
+    now = datetime.datetime(2026, 8, 5, 9, 44, tzinfo=datetime.UTC)
+    assert session_close_exit_check(position, now) is None
+
+
+def test_overnight_position_exits_on_the_next_tick_it_sees():
+    """The straggler path. If the engine was down or an exit could not fill
+    during the final minutes, the next morning's ticks are nowhere near a
+    close — so the cushion check alone would hold it all the following day,
+    which is the exact thing the intraday rule forbids."""
+    opened = datetime.datetime(2026, 8, 5, 6, 0, tzinfo=datetime.UTC)  # Wed
+    next_morning = datetime.datetime(2026, 8, 6, 4, 0, tzinfo=datetime.UTC)  # Thu 09:30 IST
+    position = _position(segment=Segment.NSE_STOCK, opened_at=opened)
+    result = session_close_exit_check(position, next_morning)
+    assert result is not None
+    assert result.reason == "OVERNIGHT_EXIT"
+    assert result.qty_lots == 10
+
+
+def test_eod_exit_outranks_the_partial_exit_that_would_strand_a_remainder():
+    """The rule that makes the ordering load-bearing. At 15:16 IST this
+    position is also through its 1R target, and `r_multiple_partial_exit_
+    check` returns HALF the lots — so if it won the tick, five lots would
+    be carried overnight. The whole position has to go."""
+    position = _position(
+        segment=Segment.NSE_STOCK,
+        opened_at=_NSE_MID,
+        current_mark=Decimal(120),  # r = 2.0, clears both R targets
+        high_water_mark_price=Decimal(120),
+    )
+    assert r_multiple_partial_exit_check(position) is not None  # it really would have fired
+    result = evaluate_exits(position, datetime.datetime(2026, 8, 5, 9, 46, tzinfo=datetime.UTC))
+    assert result is not None
+    assert result.reason == "EOD_EXIT"
+    assert result.qty_lots == position.qty_lots  # all of it, not a fraction
+
+
+def test_stop_loss_still_outranks_the_session_close():
+    """Risk protection stays first: the reason recorded must be the one
+    that actually fired, and a stop breach at 15:16 is still a stop."""
+    position = _position(
+        segment=Segment.NSE_STOCK, opened_at=_NSE_MID, current_mark=Decimal(90)
+    )
+    result = evaluate_exits(position, datetime.datetime(2026, 8, 5, 9, 46, tzinfo=datetime.UTC))
+    assert result is not None
+    assert result.reason == "STOP_LOSS"

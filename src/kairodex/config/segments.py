@@ -53,6 +53,13 @@ class SegmentRiskConfig(BaseModel):
     # burst against empty slots (§14c's first-come-first-served shape).
     entry_warmup_minutes: int
 
+    # Minutes before the close after which no new entries are opened.
+    # Everything is intraday (nothing held overnight), so a position
+    # opened near the bell is force-closed before it can work — bought and
+    # sold for the two spreads. Same 90 minutes as the scratch window, and
+    # from the same measurement.
+    entry_cutoff_minutes: int
+
     # Theta guard, in whole trading sessions rather than calendar days —
     # `core.sessions.session_seconds_between` does the conversion.
     max_holding_sessions: float

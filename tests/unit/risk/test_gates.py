@@ -11,10 +11,24 @@ import pytest
 
 from kairodex.config.segments import get_segment_config
 from kairodex.core.enums import Segment, Side
+from kairodex.core.sessions import session_window_utc
 from kairodex.risk.gates import GATE_CHAIN, run_gate_chain
 from kairodex.risk.types import AccountState, TradeProposal
 
-_NOW = datetime.datetime(2026, 8, 5, 10, 0, tzinfo=datetime.UTC)
+# 11:30 IST on a Wednesday — squarely mid-NSE-session. It used to be
+# 10:00 UTC, which is 15:30 IST: the exact closing bell. That was harmless
+# until `session_timing_gate` grew a closing edge, at which point every
+# baseline in this file was an entry attempted at the bell.
+_NOW = datetime.datetime(2026, 8, 5, 6, 0, tzinfo=datetime.UTC)
+
+
+def _mid_session(market) -> datetime.datetime:
+    """A tradable instant for `market` — halfway through its own session.
+    No single instant works for every segment any more: NSE (03:45-10:00
+    UTC) and US (13:30-20:00 UTC in EDT) do not overlap, so a
+    parametrized-over-all-segments test has to ask per market."""
+    open_dt, close_dt = session_window_utc(market, datetime.date(2026, 8, 5))
+    return open_dt + (close_dt - open_dt) / 2
 _CONFIG = get_segment_config(Segment.NSE_STOCK)  # capital=50000, base_risk=0.08, ceiling=0.35,
 # max_premium=0.35, max_concurrent=1, daily_loss=0.16, weekly=0.30, drawdown=0.40, exposure=0.40
 
@@ -227,7 +241,7 @@ def test_gate_order_matches_architecture_doc():
         # "is this a tradable moment" question session_window asks, so it
         # sits immediately after it rather than inventing a stage
         # elsewhere. See session_warmup_gate's docstring.
-        "session_warmup_gate",
+        "session_timing_gate",
         "event_blackout_gate",
         "daily_loss_gate",
         "weekly_loss_gate",
@@ -246,31 +260,49 @@ def test_baseline_passes_for_every_segment_config(segment):
     capital = Decimal(str(config.capital))
     account = _account(segment=segment, equity=capital, high_water_mark=capital)
     proposal = _proposal(segment=segment, premium_per_lot=Decimal("1"), lot_size=1)
-    result = run_gate_chain(proposal, account, config, now=_NOW)
+    result = run_gate_chain(proposal, account, config, now=_mid_session(segment.market))
     assert result.allowed
 
 
-def test_session_warmup_rejects_at_the_opening_bell():
+def test_session_timing_rejects_at_the_opening_bell():
     """09:18 IST = 03:48 UTC, 3 minutes in, against nse_stock's 20-minute
     warm-up. That is the minute five of the thirteen NSE entries ever
     taken were opened at."""
     at_open = datetime.datetime(2026, 8, 5, 3, 48, tzinfo=datetime.UTC)
     result = run_gate_chain(_proposal(), _account(), _CONFIG, now=at_open)
-    assert result.reject_stage == "session_warmup"
+    assert result.reject_stage == "session_timing"
     assert result.reject_reason == "SESSION_WARMUP"
-    assert len(result.evaluated) == 4  # kill, breaker, session, warmup
+    assert len(result.evaluated) == 4  # kill, breaker, session, timing
 
 
-def test_session_warmup_allows_once_the_window_has_passed():
+def test_session_timing_allows_once_the_window_has_passed():
     """09:36 IST = 04:06 UTC, 21 minutes in — past the 20-minute floor."""
     warmed = datetime.datetime(2026, 8, 5, 4, 6, tzinfo=datetime.UTC)
     assert run_gate_chain(_proposal(), _account(), _CONFIG, now=warmed).allowed
 
 
-def test_session_warmup_defers_to_session_window_when_market_is_shut():
+def test_session_timing_defers_to_session_window_when_market_is_shut():
     """Out of hours this gate has no opinion — `session_window_gate` owns
     that rejection, and two gates reporting the same fact under different
     names would make the rejection breakdown lie about why."""
     saturday = datetime.datetime(2026, 8, 8, 5, 0, tzinfo=datetime.UTC)
     result = run_gate_chain(_proposal(), _account(session_open=False), _CONFIG, now=saturday)
     assert result.reject_stage == "session_window"
+
+
+def test_session_timing_rejects_entries_near_the_close():
+    """NSE closes 15:30 IST; the cutoff is 90 minutes, so 14:05 IST
+    (08:35 UTC) has only 85 minutes of runway left. Trade 27 was opened at
+    15:09 and trade 9 at 14:58 — both would be force-closed by the
+    intraday rule before they could work."""
+    late = datetime.datetime(2026, 8, 5, 8, 35, tzinfo=datetime.UTC)
+    result = run_gate_chain(_proposal(), _account(), _CONFIG, now=late)
+    assert result.reject_stage == "session_timing"
+    assert result.reject_reason == "SESSION_CLOSING"
+
+
+def test_session_timing_allows_with_exactly_the_cutoff_runway_left():
+    """14:00 IST (08:30 UTC) leaves exactly 90 minutes — the boundary is
+    inclusive, so this is the last tradable minute."""
+    boundary = datetime.datetime(2026, 8, 5, 8, 30, tzinfo=datetime.UTC)
+    assert run_gate_chain(_proposal(), _account(), _CONFIG, now=boundary).allowed

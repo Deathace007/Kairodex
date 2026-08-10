@@ -1,6 +1,8 @@
 """Position monitor / exit rules (ARCHITECTURE.md §11's controls list:
 "auto stop-loss · trailing stop · partial exits at R-multiples · profit
-targets · time-based exit (theta guard) · event-based exit"), and the
+targets · time-based exit (theta guard) · event-based exit"), plus the
+intraday rule the doc does not name — nothing is held overnight (user's
+call, 2026-08-10), see `session_close_exit_check` — and the
 `Position`/`ExitDecision` types `Strategy.manage()` (§10) was left
 without in the P3 strategy-framework session.
 
@@ -24,7 +26,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 
 from kairodex.core.enums import Segment, Side
-from kairodex.core.sessions import session_window_utc
+from kairodex.core.sessions import local_date_for, session_window_utc
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,6 +175,39 @@ def scratch_exit_check(position: Position) -> ExitDecision | None:
     return None
 
 
+def session_close_exit_check(
+    position: Position, now: datetime.datetime, *, close_before_secs: int = 900
+) -> ExitDecision | None:
+    """Nothing is held overnight (user's call, 2026-08-10). This platform
+    is intraday: a position leaves on its stop, its target, or the bell.
+
+    Two ways a position can end up carrying, so two checks:
+
+    - **`EOD_EXIT`** — `now` is inside the cushion before today's close.
+    - **`OVERNIGHT_EXIT`** — the position was opened on an earlier session
+      date and is somehow still open. The first check cannot catch this:
+      the engine idles while the market is shut, so if it was down or an
+      exit could not fill during the final minutes, the next morning's
+      ticks are nowhere near a close. Without this a straggler would be
+      held all the following day, which is the exact thing being ruled out.
+
+    The cushion is 15 minutes, not 1 or 2. An exit is a fill request that
+    can be refused — §14a is the whole story of stops that could not fill
+    — and the engine ticks once a minute, so 15 minutes buys roughly 15
+    attempts. A tighter cushion would hand back some of the session's last
+    move in exchange for a real chance of still being long at the bell."""
+    if local_date_for(position.segment.market, position.opened_at) != local_date_for(
+        position.segment.market, now
+    ):
+        return ExitDecision("OVERNIGHT_EXIT", position.qty_lots)
+    _, close_dt = session_window_utc(
+        position.segment.market, local_date_for(position.segment.market, now)
+    )
+    if now >= close_dt - datetime.timedelta(seconds=close_before_secs):
+        return ExitDecision("EOD_EXIT", position.qty_lots)
+    return None
+
+
 def expiry_exit_check(
     position: Position, now: datetime.datetime, *, close_before_secs: int = 1800
 ) -> ExitDecision | None:
@@ -214,8 +249,8 @@ def evaluate_exits(
     partial_exit_fraction: float = 0.5,
 ) -> ExitDecision | None:
     """First *exit* wins, in priority order: stop-loss, trailing stop,
-    expiry exit, time exit, event exit, profit target, R-multiple partial
-    exit, scratch exit.
+    session close, expiry exit, time exit, event exit, profit target,
+    R-multiple partial exit, scratch exit.
 
     A `STOP_RATCHET` (`qty_lots == 0`) is bookkeeping, not an exit, so it
     never pre-empts a real one — it is held back and only returned if
@@ -237,6 +272,15 @@ def evaluate_exits(
     checks: list[ExitDecision | None] = [
         stop_loss_check(position),
         trailing_stop_check(position, trail_pct=trail_pct),
+        # Ahead of every optional exit, and that ordering is load-bearing:
+        # `r_multiple_partial_exit_check` returns a *fraction* of the
+        # position, so if it won a tick inside the closing cushion the
+        # remainder would be carried overnight — the one outcome this rule
+        # exists to prevent. It costs some attribution (a winner closing at
+        # 15:20 is labelled EOD_EXIT rather than PROFIT_TARGET); both fully
+        # close at the same price, so the cost is to the breakdown, not the
+        # book.
+        session_close_exit_check(position, now),
         expiry_exit_check(position, now),
         time_exit_check(position, now),
         event_exit_check(position, blackout_active=blackout_active),
