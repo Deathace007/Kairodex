@@ -1809,3 +1809,66 @@ days old and silent behind `NO_LIQUIDITY_AT_TOP_OF_BOOK` warnings nobody
 was reading. It surfaced because a new *requirement* made a previously
 tolerable failure intolerable — the same way §14a's stop-loss failures
 surfaced only once someone asked what the closed trades did. 492 tests.
+
+### 15i. LSE, assessed properly — US P&L is not currently trustworthy (2026-08-10)
+
+Asked plainly ("is LSE giving us a problem?"). Measured, not recalled.
+
+**1. It publishes no order book. At all.** Of **541,234** US option quotes
+recorded in 24h: `bid` present on **0**, `ask` on **0**, `bid_sz` on **0**.
+`ltp` on all 541,234, IV on 329,629. For contrast, NSE/Upstox over the
+same window: 9,800,490 quotes, `bid` on 9,800,399 and `bid_sz` on
+**100%**. This is not a gap to be fixed — it is what the vendor sells.
+Every US fill price this system has ever produced is modelled
+(`synthesize_quote`, `SPREAD_PCT = 4%`, an assumption with nothing to
+calibrate against), and §13c/§13e/§15h are all downstream of this one
+fact.
+
+**2. Only 20.5% of the live US chain is tradeable** — 1,358 of 6,627
+quoted legs carry enough volume to model a fillable book. Four fifths of
+the chain is invisible to the selector.
+
+**3. The `volume` column carries two different meanings**, depending on
+which writer produced the row, and `synthesize_quote` divides by it to
+size the book:
+
+| writer | rows tonight | `volume` means | median |
+|---|---|---|---|
+| WS stream (`snapshot_id` NULL) | 195,608 | that single print's size | 2 |
+| REST chain (`snapshot_id` set) | 345,309 | cumulative daily volume | 10 |
+
+So the top-of-book proxy is fed per-trade sizes on 36% of rows and
+day-cumulative totals on the rest. That is why exits flapped between
+`no modellable book` and filling normally within the same minute.
+
+**4. The REST chain serves frozen prices, and it cost a real trade.**
+QQQ 725 C (trade 20) tonight, same instrument, split by writer:
+
+```
+WS prints  : 2,078 rows,  ltp 0.16 - 1.43,  volume 1 - 750
+REST chain :    52 rows,  ltp 2.1500 EVERY ROW,  volume 25969 EVERY ROW
+```
+
+Fifty-two consecutive polls across the whole evening returned an
+identical price and an identical volume while the live market moved from
+1.43 down to 0.16. **Trade 20 then exited at `avg_exit = 2.1242`**,
+priced off the frozen chain value, and booked **-$197**. Against the
+live prints (~0.18) the real loss is roughly **-$2,120**. The trade is
+recorded about 10x better than it was.
+
+This is §15b's failure shape — a stale price wearing a fresh timestamp —
+except sourced from the vendor rather than from our own duplicate-row
+bug, and it survives every staleness check we have because `ts` is
+genuinely current.
+
+**Consequence: US closed-trade P&L cannot be used for anything**, and
+that includes P7's Track B promotion gates, which are closed-trade
+statistics. NSE is unaffected — Upstox publishes a real book on 100% of
+rows.
+
+**Recommended: halt both US segments** (the per-segment manual breaker
+from §12) until the writer conflict is resolved, rather than keep booking
+fictional fills. The fix is not obvious enough to land inside a live
+session: it needs a decision about which writer is authoritative for a
+mark, and probably that WS prints — not the chain poll — own `ltp` for
+US, with `volume` split into two columns that mean what they say.
