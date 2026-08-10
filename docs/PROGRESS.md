@@ -1,6 +1,6 @@
 # Kairodex — Development Progress
 
-**Last updated:** 2026-08-07
+**Last updated:** 2026-08-10
 **Current phase:** P1 (The Recorder) is done pending the unattended
 5-session check (§7). P2 (Pricing & features) is functionally complete
 (§8). **P3 (Engine & paper execution) is functionally complete and
@@ -77,7 +77,14 @@ re-armed. An independent subagent review found and fixed a live
 connection-leak in the WS handler (found by inspecting real orphaned
 Redis subscribers on the VM) plus 7 more findings. See §12 for the full
 account.
-**Next phase:** P7 (Strategy build-out & hardening).
+**P7 (Strategy build-out & hardening) has started — hardening half
+first** (§15). Twenty-six real trades exposed a duplicate instrument
+identity that had every open NSE position monitoring a five-day-dead
+quote row (one with no stop-loss monitoring at all), and the closed-trade
+record showed 92% of all loss coming from trades that never worked even
+briefly. Root cause fixed, four evidence-derived exit/entry rules added.
+The strategy half waits on a clean fortnight of trades to calibrate
+against. **Two live actions are still pending on the VM — see §15e.**
 
 > Read this file first, every session. Update it whenever a phase
 > completes, a decision changes, or a command/location changes. Deeper
@@ -1579,7 +1586,7 @@ Neither is code; both need a hand on the VM:
    and correct `max_holding_secs` from 259200 wall-clock seconds to the
    session-denominated equivalent. Until this runs, those four positions
    still have no working stop-loss. Script:
-   `scratchpad/repair.sql` (transactional, prints the mapping before
-   applying).
+   transactional, printing the mapping before applying (the SQL is in
+   this session's handover, not checked in — it is a one-off repair).
 2. **`systemctl restart kairodex-engine-{nse_stock,nse_index,us_stock,us_index}`**
    — the VM is at `caac907` but the running processes are not.
