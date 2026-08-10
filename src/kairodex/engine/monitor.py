@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 
 from kairodex.core.enums import Segment, Side
+from kairodex.core.sessions import session_window_utc
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,9 +43,23 @@ class Position:
     current_mark: Decimal
     high_water_mark_price: Decimal  # best mark seen since entry, for the trailing stop
     profit_target: Decimal | None = None
-    r_multiple_targets: tuple[float, ...] = ()  # e.g. (1.0, 2.0) for partial exits
+    r_multiple_targets: tuple[float, ...] = ()  # e.g. (0.5, 1.0, 2.0) for partial exits
     partial_exits_taken: frozenset[float] = field(default_factory=frozenset)
-    max_holding_secs: int | None = None  # theta guard
+    max_holding_secs: int | None = None  # theta guard, in SESSION seconds — see held_session_secs
+    # Open-market seconds held so far, computed by the caller via
+    # `core.sessions.session_seconds_between`. The DB-touching/clock-aware
+    # half stays outside this module, exactly like `current_mark` and
+    # `blackout_active`. `None` means "not supplied" and every rule that
+    # needs it abstains rather than falling back to wall-clock, which is
+    # the measure that was wrong in the first place.
+    held_session_secs: float | None = None
+    expiry: datetime.date | None = None  # the contract's own expiry date
+    # Scratch rule: if the position has not shown `scratch_min_mfe_pct` of
+    # favourable excursion within `scratch_after_secs` of session time,
+    # it is not working — leave at whatever it is worth rather than
+    # waiting for the full stop. See `scratch_exit_check`.
+    scratch_after_secs: int | None = None
+    scratch_min_mfe_pct: float = 0.08
 
     @property
     def r_multiple(self) -> float | None:
@@ -116,11 +131,67 @@ def r_multiple_partial_exit_check(
 
 
 def time_exit_check(position: Position, now: datetime.datetime) -> ExitDecision | None:
-    if position.max_holding_secs is None:
+    """Theta guard, measured in *session* seconds (`held_session_secs`),
+    not wall-clock. The wall-clock version fired all four of 2026-08-10's
+    TIME_EXITs at Monday's opening bell on positions opened the previous
+    Wednesday/Thursday — see `core.sessions.session_seconds_between`."""
+    if position.max_holding_secs is None or position.held_session_secs is None:
         return None
-    held_secs = (now - position.opened_at).total_seconds()
-    if held_secs >= position.max_holding_secs:
+    if position.held_session_secs >= position.max_holding_secs:
         return ExitDecision("TIME_EXIT", position.qty_lots)
+    return None
+
+
+def scratch_exit_check(position: Position) -> ExitDecision | None:
+    """Leave a position that has had time to work and hasn't.
+
+    Measured, not assumed. Across the first ten closed trades every one
+    that ever reached +10% did so within 82 minutes of session time, and
+    five of the six did it within 16. The four that never got there
+    (HDFCBANK, ADANIENT, SBIN, BAJFINANCE) had a best-ever excursion of
+    +0.7%, +2.3%, +0.2% and -5.0% over their *entire* holding period, and
+    between them account for -Rs 8,740 of the -Rs 9,462 total: 92% of the
+    losses came from trades that never worked even briefly, then rode all
+    the way to a -30%-of-premium stop or a Monday-morning time exit.
+
+    At the marks recorded 90 session-minutes in, those same trades were at
+    -13.0%, +2.3%, -4.8% and -15.2% — while every trade that did work was
+    at +8.8% or better at the same point. That separation is what the rule
+    exploits: it is a cheap, early "this isn't it" rather than a
+    prediction, and it costs nothing on the winners.
+
+    Uses the high-water mark, not the current mark, so a position that
+    ran to +20% and came back is left to the stop and the trailing stop —
+    this rule is only about never having worked at all."""
+    if position.scratch_after_secs is None or position.held_session_secs is None:
+        return None
+    if position.held_session_secs < position.scratch_after_secs:
+        return None
+    threshold = position.avg_entry * Decimal(str(1 + position.scratch_min_mfe_pct))
+    if position.high_water_mark_price < threshold:
+        return ExitDecision("SCRATCH_EXIT", position.qty_lots)
+    return None
+
+
+def expiry_exit_check(
+    position: Position, now: datetime.datetime, *, close_before_secs: int = 1800
+) -> ExitDecision | None:
+    """Never carry a long option into its own expiry. Nothing in the exit
+    rules referenced `expiry` at all, so the only thing that ever stood
+    between a position and expiring worthless was the theta guard
+    happening to fire first. On 2026-08-10 four open us_stock positions
+    and one us_index position were holding contracts expiring that same
+    day purely on that coincidence.
+
+    `close_before_secs` is the cushion ahead of the expiry session's
+    close — a fixed 30 minutes rather than a config knob, because it is a
+    mechanical "don't be the last one out" margin, not a strategy
+    parameter anyone would tune per segment."""
+    if position.expiry is None:
+        return None
+    _, close_dt = session_window_utc(position.segment.market, position.expiry)
+    if now >= close_dt - datetime.timedelta(seconds=close_before_secs):
+        return ExitDecision("EXPIRY_EXIT", position.qty_lots)
     return None
 
 
@@ -143,7 +214,8 @@ def evaluate_exits(
     partial_exit_fraction: float = 0.5,
 ) -> ExitDecision | None:
     """First *exit* wins, in priority order: stop-loss, trailing stop,
-    time exit, event exit, profit target, R-multiple partial exit.
+    expiry exit, time exit, event exit, profit target, R-multiple partial
+    exit, scratch exit.
 
     A `STOP_RATCHET` (`qty_lots == 0`) is bookkeeping, not an exit, so it
     never pre-empts a real one — it is held back and only returned if
@@ -165,10 +237,16 @@ def evaluate_exits(
     checks: list[ExitDecision | None] = [
         stop_loss_check(position),
         trailing_stop_check(position, trail_pct=trail_pct),
+        expiry_exit_check(position, now),
         time_exit_check(position, now),
         event_exit_check(position, blackout_active=blackout_active),
         profit_target_check(position),
         r_multiple_partial_exit_check(position, exit_fraction=partial_exit_fraction),
+        # Last: a position at or past a profit/R target has demonstrably
+        # worked, so it can never also be a scratch — but ordering it
+        # after them makes that true by construction rather than by
+        # arithmetic that could drift if the thresholds are retuned.
+        scratch_exit_check(position),
     ]
     ratchet: ExitDecision | None = None
     for result in checks:

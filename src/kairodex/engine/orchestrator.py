@@ -27,11 +27,12 @@ import logging
 from dataclasses import dataclass
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from kairodex.config.segments import SegmentRiskConfig
 from kairodex.core.enums import Market, Segment, Side
+from kairodex.core.sessions import session_length_secs, session_seconds_between
 from kairodex.data.types import ChainSnapshot, Tick
 from kairodex.engine import event_log
 from kairodex.engine.monitor import Position, evaluate_exits
@@ -58,8 +59,20 @@ _DEFAULT_MAX_QUOTE_AGE_MS = 2000
 _DEFAULT_PROFIT_TARGET_PCT = 1.0  # ponytail: exit at 2x entry premium
 # (100% gain) — first-pass, same status as the stop-loss/target-delta
 # constants above: a common options-buying convention, not backtested yet.
-_DEFAULT_R_MULTIPLE_TARGETS = (1.0, 2.0)  # ponytail: partial exits at 1R/2R
-_DEFAULT_MAX_HOLDING_SECS = 3 * 24 * 3600  # ponytail: 3-day theta guard
+# Partial exits at 0.5R/1R/2R. 1R was the first rung until 2026-08-10,
+# which with a 30%-of-premium stop means +30% of premium before anything
+# is banked — and the first ten closed trades say that is too far out to
+# reach. Every trade that worked topped out between +14.8% and +42.8%
+# (median ~25%), so only two of six ever touched +30%, while all six
+# cleared +14.8%. A 0.5R rung banks half the position at roughly the
+# median winner's own peak instead of watching most of them round-trip:
+# trade 9 (Nifty 24650 C) reached +14.8%, had no rung below +30% to hit,
+# and closed at -Rs 411.
+_DEFAULT_R_MULTIPLE_TARGETS = (0.5, 1.0, 2.0)
+# Theta guard in SESSION seconds now, not wall-clock — the per-segment
+# `max_holding_sessions` knob converts. Kept as the fallback for a trade
+# row written before that config existed.
+_DEFAULT_MAX_HOLDING_SECS = 3 * 6 * 3600
 
 
 @dataclass(frozen=True, slots=True)
@@ -375,6 +388,7 @@ async def run_entry_tick(
         stop_distance=stop_distance,
         execution=execution,
         now=now,
+        config=config,
         spot=feature_ctx.spot,
         values=values,
         synthetic_quote=synthetic_quotes,
@@ -387,14 +401,39 @@ async def run_entry_tick(
 async def _resolve_leg_instrument_id(
     session: AsyncSession, underlying: Instrument, candidate: ContractCandidate
 ) -> int | None:
+    """The (underlying, strike, type, expiry) key is not unique in
+    `instruments` — two rows for one real contract were reachable, and
+    this used to take whichever one the database handed back first. That
+    silently split the trade's life across two identities: the candidate
+    was priced off the row the chain poll writes quotes to, and the trade
+    was then opened against the other one, which had had no quote since
+    2026-08-05 — so `_latest_quote` returned a five-day-old price or
+    nothing at all, and stop-losses could not fire. Every open nse_stock
+    position on 2026-08-10 was in that state.
+
+    `data.ingest.upsert_instrument` now matches on the provider key, so
+    the duplicates cannot be recreated. This orders by most-recently-
+    quoted anyway: the same money path must not go back to picking
+    arbitrarily if a duplicate ever reappears from some other direction,
+    and "the row the feed is actually writing to" is the only defensible
+    tiebreak."""
+    last_quote = (
+        select(OptionQuote.instrument_id, func.max(OptionQuote.ts).label("last_ts"))
+        .group_by(OptionQuote.instrument_id)
+        .subquery()
+    )
     row = await session.scalar(
-        select(Instrument).where(
+        select(Instrument)
+        .outerjoin(last_quote, last_quote.c.instrument_id == Instrument.instrument_id)
+        .where(
             Instrument.exchange == underlying.exchange,
             Instrument.underlying_symbol == underlying.symbol,
             Instrument.strike == candidate.strike,
             Instrument.option_type == candidate.option_type,
             Instrument.expiry == candidate.expiry,
         )
+        .order_by(last_quote.c.last_ts.desc().nullslast())
+        .limit(1)
     )
     return row.instrument_id if row is not None else None
 
@@ -411,6 +450,7 @@ async def _record_fill(
     stop_distance: Decimal,
     execution: ExecutionResult,
     now: datetime.datetime,
+    config: SegmentRiskConfig,
     spot: float | None,
     values: dict[str, float],
     synthetic_quote: bool = False,
@@ -460,7 +500,15 @@ async def _record_fill(
             # engine even though monitor.py fully implements and tests them.
             "profit_target": str(profit_target),
             "r_multiple_targets": list(_DEFAULT_R_MULTIPLE_TARGETS),
-            "max_holding_secs": _DEFAULT_MAX_HOLDING_SECS,
+            # Session seconds, not wall-clock: `max_holding_sessions` x
+            # the length of one regular session for this market. A
+            # 3-calendar-day guard gave a Thursday entry two sessions and
+            # then forced it out at Monday's opening bell.
+            "max_holding_secs": int(
+                config.max_holding_sessions * session_length_secs(segment.market)
+            ),
+            "scratch_after_secs": config.scratch_exit_after_minutes * 60,
+            "scratch_min_mfe_pct": config.scratch_exit_min_mfe_pct,
         },
     )
     session.add(trade)
@@ -557,6 +605,24 @@ async def run_exit_tick(
         if isinstance(partial_exits_taken_raw, list)
         else frozenset()
     )
+    scratch_after_raw = risk_params.get("scratch_after_secs")
+    scratch_after_secs = (
+        int(scratch_after_raw) if isinstance(scratch_after_raw, int | float) else None
+    )
+    scratch_min_mfe_raw = risk_params.get("scratch_min_mfe_pct", 0.08)
+    scratch_min_mfe_pct = (
+        float(scratch_min_mfe_raw) if isinstance(scratch_min_mfe_raw, int | float) else 0.08
+    )
+    # Both time-based rules measure open-market seconds, not wall-clock —
+    # see core.sessions.session_seconds_between for what that fixed.
+    held_session_secs = session_seconds_between(trade.segment.market, trade.opened_at, now)
+    # The traded contract's own expiry, so a position can never be carried
+    # into it. `expiry_exit_check` abstains when this is None rather than
+    # guessing, and a missing instrument row is already impossible here —
+    # `trade.instrument_id` is an FK.
+    expiry = await session.scalar(
+        select(Instrument.expiry).where(Instrument.instrument_id == trade.instrument_id)
+    )
 
     position = Position(
         trade_id=trade.trade_id,
@@ -576,6 +642,10 @@ async def run_exit_tick(
         r_multiple_targets=r_multiple_targets,
         partial_exits_taken=partial_exits_taken,
         max_holding_secs=max_holding_secs,
+        held_session_secs=held_session_secs,
+        expiry=expiry,
+        scratch_after_secs=scratch_after_secs,
+        scratch_min_mfe_pct=scratch_min_mfe_pct,
     )
 
     unrealized = (mark - trade.avg_entry) * trade.qty_lots * trade.lot_size

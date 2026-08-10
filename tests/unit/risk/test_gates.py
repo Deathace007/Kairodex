@@ -95,7 +95,7 @@ def test_daily_loss_limit_reached():
     account = _account(daily_pnl=Decimal(-9000))
     result = run_gate_chain(_proposal(), account, _CONFIG, now=_NOW)
     assert result.reject_stage == "daily_loss"
-    assert len(result.evaluated) == 5  # kill, breaker, session, event_blackout, daily_loss
+    assert len(result.evaluated) == 6  # kill, breaker, session, warmup, event_blackout, daily_loss
 
 
 def test_daily_loss_at_exact_limit_denies():
@@ -116,7 +116,7 @@ def test_weekly_loss_limit_reached():
     account = _account(weekly_pnl=Decimal(-16000))
     result = run_gate_chain(_proposal(), account, _CONFIG, now=_NOW)
     assert result.reject_stage == "weekly_loss"
-    assert len(result.evaluated) == 6
+    assert len(result.evaluated) == 7
 
 
 def test_drawdown_throttle():
@@ -124,14 +124,14 @@ def test_drawdown_throttle():
     account = _account(equity=Decimal(25000), high_water_mark=Decimal(50000))
     result = run_gate_chain(_proposal(), account, _CONFIG, now=_NOW)
     assert result.reject_stage == "drawdown_throttle"
-    assert len(result.evaluated) == 7
+    assert len(result.evaluated) == 8
 
 
 def test_max_concurrent_reached():
     account = _account(open_positions_count=5)  # == max_concurrent for NSE_STOCK (5)
     result = run_gate_chain(_proposal(), account, _CONFIG, now=_NOW)
     assert result.reject_stage == "max_concurrent"
-    assert len(result.evaluated) == 8
+    assert len(result.evaluated) == 9
 
 
 def test_exposure_cap_exceeded():
@@ -140,7 +140,7 @@ def test_exposure_cap_exceeded():
     account = _account(total_exposure=Decimal(19000))
     result = run_gate_chain(_proposal(), account, _CONFIG, now=_NOW)
     assert result.reject_stage == "exposure"
-    assert len(result.evaluated) == 9
+    assert len(result.evaluated) == 10
 
 
 def test_correlation_cluster_same_underlying_already_open():
@@ -148,7 +148,7 @@ def test_correlation_cluster_same_underlying_already_open():
     result = run_gate_chain(_proposal(), account, _CONFIG, now=_NOW)
     assert result.reject_stage == "correlation_cluster"
     assert result.reject_reason == "ALREADY_OPEN_ON_UNDERLYING"
-    assert len(result.evaluated) == 10
+    assert len(result.evaluated) == 11
 
 
 def test_correlation_cluster_reentry_cooldown():
@@ -171,7 +171,7 @@ def test_liquidity_unknown_fails_closed():
     result = run_gate_chain(_proposal(liquidity_score=None), _account(), _CONFIG, now=_NOW)
     assert result.reject_stage == "liquidity"
     assert result.reject_reason == "LIQUIDITY_UNKNOWN"
-    assert len(result.evaluated) == 11
+    assert len(result.evaluated) == 12
 
 
 def test_liquidity_too_low():
@@ -196,7 +196,7 @@ def test_capital_available_exceeds_max_premium_pct():
     result = run_gate_chain(proposal, _account(), _CONFIG, now=_NOW)
     assert result.reject_stage == "capital_available"
     assert result.reject_reason == "EXCEEDS_MAX_PREMIUM_PCT"
-    assert len(result.evaluated) == 12  # every gate ran
+    assert len(result.evaluated) == 13  # every gate ran
 
 
 def test_capital_available_unreachable_once_exposure_gate_has_passed():
@@ -223,6 +223,11 @@ def test_gate_order_matches_architecture_doc():
         "kill_switch_gate",
         "breaker_gate",
         "session_window_gate",
+        # Not in the doc's numbered order — a finer edge on the same
+        # "is this a tradable moment" question session_window asks, so it
+        # sits immediately after it rather than inventing a stage
+        # elsewhere. See session_warmup_gate's docstring.
+        "session_warmup_gate",
         "event_blackout_gate",
         "daily_loss_gate",
         "weekly_loss_gate",
@@ -243,3 +248,29 @@ def test_baseline_passes_for_every_segment_config(segment):
     proposal = _proposal(segment=segment, premium_per_lot=Decimal("1"), lot_size=1)
     result = run_gate_chain(proposal, account, config, now=_NOW)
     assert result.allowed
+
+
+def test_session_warmup_rejects_at_the_opening_bell():
+    """09:18 IST = 03:48 UTC, 3 minutes in, against nse_stock's 20-minute
+    warm-up. That is the minute five of the thirteen NSE entries ever
+    taken were opened at."""
+    at_open = datetime.datetime(2026, 8, 5, 3, 48, tzinfo=datetime.UTC)
+    result = run_gate_chain(_proposal(), _account(), _CONFIG, now=at_open)
+    assert result.reject_stage == "session_warmup"
+    assert result.reject_reason == "SESSION_WARMUP"
+    assert len(result.evaluated) == 4  # kill, breaker, session, warmup
+
+
+def test_session_warmup_allows_once_the_window_has_passed():
+    """09:36 IST = 04:06 UTC, 21 minutes in — past the 20-minute floor."""
+    warmed = datetime.datetime(2026, 8, 5, 4, 6, tzinfo=datetime.UTC)
+    assert run_gate_chain(_proposal(), _account(), _CONFIG, now=warmed).allowed
+
+
+def test_session_warmup_defers_to_session_window_when_market_is_shut():
+    """Out of hours this gate has no opinion — `session_window_gate` owns
+    that rejection, and two gates reporting the same fact under different
+    names would make the rejection breakdown lie about why."""
+    saturday = datetime.datetime(2026, 8, 8, 5, 0, tzinfo=datetime.UTC)
+    result = run_gate_chain(_proposal(), _account(session_open=False), _CONFIG, now=saturday)
+    assert result.reject_stage == "session_window"

@@ -42,6 +42,32 @@ class SegmentRiskConfig(BaseModel):
     # and then rejected 12,696 later signals, some as high as 0.7344.
     min_confidence: float
 
+    # Minutes into the session before this segment may open anything.
+    # Live 2026-08-05..10, 11 of 13 NSE entries were taken in the first
+    # 20 minutes of the session and 5 in the first 4 — and those opening
+    # entries are where the losses are. It is not bad luck: ATR, VWAP,
+    # opening-range position, volume-profile POC and price acceptance all
+    # need intraday history that does not exist yet at 09:18, so the
+    # confluence score at the bell is built largely from degenerate
+    # inputs. Waiting also stops the whole watchlist being judged in one
+    # burst against empty slots (§14c's first-come-first-served shape).
+    entry_warmup_minutes: int
+
+    # Theta guard, in whole trading sessions rather than calendar days —
+    # `core.sessions.session_seconds_between` does the conversion.
+    max_holding_sessions: float
+
+    # Scratch rule (monitor.scratch_exit_check): a position that has not
+    # shown `scratch_exit_min_mfe_pct` favourable excursion within
+    # `scratch_exit_after_minutes` of session time is closed rather than
+    # left to run to its full stop. Both derived from the first ten closed
+    # trades' own excursion timing — see that function's docstring for the
+    # numbers. Per-segment because the observed time-to-work differs by
+    # market, and tunable because these are the two knobs most worth
+    # recalibrating once there are more closed trades to fit against.
+    scratch_exit_after_minutes: int
+    scratch_exit_min_mfe_pct: float
+
 
 @lru_cache
 def get_segment_config(segment: Segment) -> SegmentRiskConfig:

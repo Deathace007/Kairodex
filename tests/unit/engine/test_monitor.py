@@ -7,13 +7,16 @@ from decimal import Decimal
 
 import pytest
 
-from kairodex.core.enums import Segment, Side
+from kairodex.core.enums import Market, Segment, Side
+from kairodex.core.sessions import session_length_secs, session_seconds_between
 from kairodex.engine.monitor import (
     Position,
     evaluate_exits,
     event_exit_check,
+    expiry_exit_check,
     profit_target_check,
     r_multiple_partial_exit_check,
+    scratch_exit_check,
     stop_loss_check,
     time_exit_check,
     trailing_stop_check,
@@ -39,6 +42,10 @@ def _position(**overrides: object) -> Position:
         high_water_mark_price=Decimal(100),
         profit_target=Decimal(130),
         r_multiple_targets=(1.0, 2.0),
+        # Time rules measure open-market seconds, supplied by the caller.
+        # _NOW is 10:00 UTC on a Wednesday = mid-session for both markets,
+        # so wall-clock and session time coincide over these short spans.
+        held_session_secs=0.0,
     )
     return dataclasses.replace(base, **overrides)  # type: ignore[arg-type]
 
@@ -164,15 +171,39 @@ def test_partial_exit_none_when_all_targets_taken():
 
 
 def test_time_exit_fires_at_exact_limit():
-    position = _position(max_holding_secs=3600)
+    position = _position(max_holding_secs=3600, held_session_secs=3600)
     result = time_exit_check(position, _NOW + datetime.timedelta(seconds=3600))
     assert result is not None
     assert result.reason == "TIME_EXIT"
 
 
 def test_time_exit_does_not_fire_before_limit():
-    position = _position(max_holding_secs=3600)
+    position = _position(max_holding_secs=3600, held_session_secs=3599)
     assert time_exit_check(position, _NOW + datetime.timedelta(seconds=3599)) is None
+
+
+def test_time_exit_counts_session_time_not_wall_clock():
+    """The regression that produced all four of 2026-08-10's TIME_EXITs at
+    Monday's opening bell: positions opened the previous week were four
+    calendar days old against a 3-day guard, but had seen only two
+    sessions. Held over a weekend, wall-clock is far past the limit while
+    session time is not — and only session time may fire the exit."""
+    opened = datetime.datetime(2026, 8, 6, 10, 0, tzinfo=datetime.UTC)  # Thursday
+    monday = datetime.datetime(2026, 8, 10, 4, 0, tzinfo=datetime.UTC)  # 09:30 IST Monday
+    assert (monday - opened).total_seconds() > 3 * 24 * 3600  # 4 calendar days
+    position = _position(
+        opened_at=opened,
+        max_holding_secs=int(3 * session_length_secs(Market.NSE)),
+        held_session_secs=session_seconds_between(Market.NSE, opened, monday),
+    )
+    assert time_exit_check(position, monday) is None
+
+
+def test_time_exit_abstains_when_session_time_not_supplied():
+    """Fails closed toward *not* exiting: without a session-time
+    measurement the rule has nothing to test, and silently falling back to
+    wall-clock is the exact bug this replaced."""
+    assert time_exit_check(_position(max_holding_secs=1, held_session_secs=None), _NOW) is None
 
 
 def test_time_exit_none_when_not_configured():
@@ -270,3 +301,106 @@ def test_stop_loss_still_wins_over_everything_including_the_ratchet():
     assert decision is not None
     assert decision.reason == "STOP_LOSS"
     assert decision.qty_lots == position.qty_lots
+
+
+# --- scratch exit -----------------------------------------------------------
+
+
+def test_scratch_exit_fires_when_position_never_worked():
+    """The measured case, from trade 7 (ADANIENT 3100 C): 90 session-minutes
+    in, best-ever excursion +2.3% against an 8% bar. Left alone it ran to a
+    -25.9% time exit for -Rs 1,490."""
+    position = _position(
+        avg_entry=Decimal(100),
+        high_water_mark_price=Decimal("102.3"),
+        current_mark=Decimal("102.3"),
+        held_session_secs=5400,
+        scratch_after_secs=5400,
+    )
+    result = scratch_exit_check(position)
+    assert result is not None
+    assert result.reason == "SCRATCH_EXIT"
+    assert result.qty_lots == 10  # the whole position, not a fraction
+
+
+def test_scratch_exit_spares_a_position_that_did_work():
+    """Trade 3 (BANKNIFTY) was +10.5% at the same 90-minute mark. Every
+    closed trade that ever reached +10% was above +8.8% here, so the bar
+    separates the two groups cleanly on the real data."""
+    position = _position(
+        avg_entry=Decimal(100),
+        high_water_mark_price=Decimal("110.5"),
+        held_session_secs=5400,
+        scratch_after_secs=5400,
+    )
+    assert scratch_exit_check(position) is None
+
+
+def test_scratch_exit_uses_high_water_mark_not_current_mark():
+    """A position that ran to +20% and gave it back has worked; it belongs
+    to the stop and the trailing stop, not to this rule."""
+    position = _position(
+        avg_entry=Decimal(100),
+        high_water_mark_price=Decimal(120),
+        current_mark=Decimal(99),
+        held_session_secs=5400,
+        scratch_after_secs=5400,
+    )
+    assert scratch_exit_check(position) is None
+
+
+def test_scratch_exit_waits_for_the_full_window():
+    position = _position(
+        avg_entry=Decimal(100),
+        high_water_mark_price=Decimal(100),
+        held_session_secs=5399,
+        scratch_after_secs=5400,
+    )
+    assert scratch_exit_check(position) is None
+
+
+def test_scratch_exit_never_pre_empts_a_real_exit():
+    """Priority: a position simultaneously through its stop and past the
+    scratch window exits as a STOP_LOSS — the reason recorded has to be the
+    one that actually fired, since exit_reason drives every breakdown."""
+    position = _position(
+        avg_entry=Decimal(100),
+        current_mark=Decimal(90),
+        high_water_mark_price=Decimal(100),
+        held_session_secs=5400,
+        scratch_after_secs=5400,
+    )
+    result = evaluate_exits(position, _NOW)
+    assert result is not None
+    assert result.reason == "STOP_LOSS"
+
+
+# --- expiry exit ------------------------------------------------------------
+
+
+def test_expiry_exit_fires_inside_the_cushion():
+    """NSE close is 15:30 IST = 10:00 UTC; the default cushion is 30 min,
+    so 09:35 UTC on expiry day fires."""
+    expiry = datetime.date(2026, 8, 11)
+    position = _position(expiry=expiry)
+    now = datetime.datetime(2026, 8, 11, 9, 35, tzinfo=datetime.UTC)
+    result = expiry_exit_check(position, now)
+    assert result is not None
+    assert result.reason == "EXPIRY_EXIT"
+    assert result.qty_lots == 10
+
+
+def test_expiry_exit_does_not_fire_earlier_in_the_expiry_session():
+    position = _position(expiry=datetime.date(2026, 8, 11))
+    now = datetime.datetime(2026, 8, 11, 9, 25, tzinfo=datetime.UTC)
+    assert expiry_exit_check(position, now) is None
+
+
+def test_expiry_exit_does_not_fire_on_a_later_dated_contract():
+    position = _position(expiry=datetime.date(2026, 8, 25))
+    now = datetime.datetime(2026, 8, 11, 9, 55, tzinfo=datetime.UTC)
+    assert expiry_exit_check(position, now) is None
+
+
+def test_expiry_exit_abstains_without_an_expiry():
+    assert expiry_exit_check(_position(expiry=None), _NOW) is None

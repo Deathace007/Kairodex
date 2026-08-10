@@ -28,6 +28,7 @@ from __future__ import annotations
 import datetime
 
 from kairodex.config.segments import SegmentRiskConfig
+from kairodex.core.sessions import session_minutes_since_open
 from kairodex.risk.types import AccountState, ChainResult, GateResult, TradeProposal
 
 
@@ -68,6 +69,35 @@ def session_window_gate(
     if not account.session_open:
         return GateResult("session_window", False, "OUTSIDE_SESSION_WINDOW")
     return GateResult("session_window", True)
+
+
+def session_warmup_gate(
+    proposal: TradeProposal,
+    account: AccountState,
+    config: SegmentRiskConfig,
+    now: datetime.datetime,
+) -> GateResult:
+    """No entries in the opening minutes of a session.
+
+    Runs immediately after `session_window_gate` — same idea, finer edge:
+    that gate answers "is the exchange open", this one answers "has this
+    session produced enough of itself to score against". Live 2026-08-05
+    to 08-10, 11 of the 13 NSE entries ever taken were opened within 20
+    minutes of the bell (5 within 4 minutes), and they carry essentially
+    all of the realised loss. Five of the eighteen launch-set features —
+    ATR, VWAP position, opening-range position, volume-profile POC
+    distance, price acceptance — are intraday by construction, so a 09:18
+    confluence score is mostly noise wearing a number.
+
+    It also removes the structural half of §14c: with no warm-up the
+    engine met every scarce slot at once, in watchlist iteration order,
+    before the session had shown anything."""
+    minutes_in = session_minutes_since_open(proposal.segment.market, now)
+    if minutes_in is None:  # market closed — session_window_gate's business, not this one
+        return GateResult("session_warmup", True)
+    if minutes_in < config.entry_warmup_minutes:
+        return GateResult("session_warmup", False, "SESSION_WARMUP")
+    return GateResult("session_warmup", True)
 
 
 def event_blackout_gate(
@@ -226,6 +256,7 @@ GATE_CHAIN = (
     kill_switch_gate,
     breaker_gate,
     session_window_gate,
+    session_warmup_gate,
     event_blackout_gate,
     daily_loss_gate,
     weekly_loss_gate,

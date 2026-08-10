@@ -21,18 +21,55 @@ from kairodex.store.models import Instrument, OptionQuote, UnderlyingBar
 
 
 async def upsert_instrument(session: AsyncSession, rec: InstrumentRecord, provider: str) -> int:
-    """Upsert by the natural key (exchange, symbol, expiry, strike,
-    option_type) and return the instrument_id. Merges provider_ids so the
-    same contract seen from two vendors resolves to one row."""
-    existing = await session.scalar(
-        select(Instrument).where(
-            Instrument.exchange == rec.exchange,
-            Instrument.symbol == rec.symbol,
-            Instrument.expiry == rec.expiry,
-            Instrument.strike == rec.strike,
-            Instrument.option_type == rec.option_type,
+    """Upsert one instrument and return its instrument_id.
+
+    Matched on the **provider's own instrument key** first, falling back
+    to the (exchange, symbol, expiry, strike, option_type) natural key
+    that backs the unique constraint. The provider key is the real
+    identity; `symbol` is a label, and two code paths spelled the same
+    contract differently:
+
+        sync-instruments (T0):  "KOTAKBANK 385 PE 25 AUG 26"   <- Upstox trading_symbol
+        store_chain_snapshot:   "KOTAKBANK 385.0 P 2026-08-25" <- synthesized below
+
+    Same exchange, expiry, strike, option_type, same `provider_ids`
+    (`NSE_FO|115925`) — different `symbol`, so the unique constraint saw
+    two contracts and both rows were created. That is the duplicate
+    identity §6 #11 flagged for the NIFTY index and never chased down for
+    options.
+
+    It broke live trading silently and completely. The chain path wrote
+    quotes to its row while `_resolve_leg_instrument_id` matched on
+    (underlying, strike, type, expiry), got two hits, and took an
+    arbitrary one — so the engine priced an entry off row A and then
+    monitored row B, which had had no quote since 2026-08-05. On
+    2026-08-10 every open nse_stock position was in that state: trade 5
+    (MARUTI) had been retrying a TIME_EXIT against a five-day-old quote
+    once a minute for hours, trade 26 (KOTAKBANK) had zero marks and
+    therefore no stop-loss monitoring at all, and the marks feeding
+    unrealized P&L, equity and the breaker were frozen prices.
+
+    Merging on the provider key also keeps the original intent — the same
+    contract seen from two vendors resolves to one row."""
+    provider_key = rec.provider_ids.get(provider)
+    existing = None
+    if provider_key is not None:
+        existing = await session.scalar(
+            select(Instrument).where(
+                Instrument.exchange == rec.exchange,
+                Instrument.provider_ids[provider].astext == provider_key,
+            )
         )
-    )
+    if existing is None:
+        existing = await session.scalar(
+            select(Instrument).where(
+                Instrument.exchange == rec.exchange,
+                Instrument.symbol == rec.symbol,
+                Instrument.expiry == rec.expiry,
+                Instrument.strike == rec.strike,
+                Instrument.option_type == rec.option_type,
+            )
+        )
     now = datetime.datetime.now(datetime.UTC)
     if existing is not None:
         existing.provider_ids = {**existing.provider_ids, **rec.provider_ids}

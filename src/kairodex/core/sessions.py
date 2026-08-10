@@ -59,6 +59,64 @@ def session_window_utc(
     )
 
 
+def session_length_secs(market: Market) -> float:
+    """Length of one regular session in seconds — the unit
+    `max_holding_sessions` is denominated in. A fixed local-time span
+    (NSE 6h15m, US 6h30m), so no date is needed: DST shifts *when* the
+    session happens, never how long it lasts."""
+    open_t, close_t = _NSE_SESSION if market is Market.NSE else _US_SESSION
+    epoch = datetime.date(2000, 1, 3)
+    return (
+        datetime.datetime.combine(epoch, close_t) - datetime.datetime.combine(epoch, open_t)
+    ).total_seconds()
+
+
+def session_seconds_between(
+    market: Market, start: datetime.datetime, end: datetime.datetime
+) -> float:
+    """Seconds of *open market* between two instants — weekends and
+    overnight gaps excluded.
+
+    Wall-clock age and market age are wildly different things for a
+    position, and the engine measured the wrong one. `max_holding_secs`
+    was a plain `(now - opened_at)` against a 3-calendar-day guard, so a
+    Thursday entry died at Monday's open having seen two sessions, and
+    every one of the four TIME_EXITs on 2026-08-10 fired between 09:17
+    and 09:19 IST — the widest-spread, gappiest minutes of the week, and
+    the worst possible moment to be a forced seller. All four were
+    losses (trades 2, 3, 7, 8; -Rs 5,395 between them).
+
+    Counted by walking calendar dates rather than integrating, because
+    the windows are per-local-date (DST moves the US one) and a position
+    is never held long enough for the loop to matter. Holidays are the
+    same known gap as everywhere else in this module — a holiday counts
+    as a session here, which errs toward exiting early, not late."""
+    if end <= start:
+        return 0.0
+    total = 0.0
+    day = local_date_for(market, start)
+    last_day = local_date_for(market, end)
+    while day <= last_day:
+        if day.weekday() < 5:
+            open_dt, close_dt = session_window_utc(market, day)
+            overlap_start = max(open_dt, start)
+            overlap_end = min(close_dt, end)
+            if overlap_end > overlap_start:
+                total += (overlap_end - overlap_start).total_seconds()
+        day += datetime.timedelta(days=1)
+    return total
+
+
+def session_minutes_since_open(market: Market, now: datetime.datetime) -> float | None:
+    """How far into today's session `now` is, in minutes. `None` when the
+    market is closed — callers treat that as "not a tradable moment"
+    rather than as zero."""
+    if not is_session_open_now(market, now):
+        return None
+    open_dt, _ = session_window_utc(market, local_date_for(market, now))
+    return (now - open_dt).total_seconds() / 60
+
+
 def is_session_open_now(market: Market, now: datetime.datetime) -> bool:
     """Is `now` (any tz-aware instant) inside the market's regular
     session, today in the market's own local date. Used both to gate

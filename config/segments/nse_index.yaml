@@ -18,3 +18,23 @@ reentry_cooldown_minutes: 30
 # stock ones. Not fitted, not backtested: recalibrate in P4 against real
 # outcomes, exactly like stop_loss_pct and the R-targets.
 min_confidence: 0.30
+
+# --- P7 hardening (2026-08-10), all derived from the first ten closed
+# trades and the 33k signals behind them. See PROGRESS.md §15.
+
+# No entries in the opening minutes: 11 of 13 NSE entries ever taken fell
+# in the first 20 minutes, and they are where the losses are — the
+# intraday features they score on (ATR, VWAP, opening range, volume
+# profile, price acceptance) have no session history to read yet.
+entry_warmup_minutes: 20
+
+# Theta guard in trading sessions, not calendar days. The old 3-calendar-
+# day guard killed four positions at Monday's 09:17-09:19 opening bell
+# having given them only two real sessions.
+max_holding_sessions: 3
+
+# Every closed trade that ever reached +10% did so within 82 session-
+# minutes; the four that never worked at all (best excursion +0.7%,
+# +2.3%, +0.2%, -5.0%) rode to a -30% stop for 92% of all losses.
+scratch_exit_after_minutes: 90
+scratch_exit_min_mfe_pct: 0.08
