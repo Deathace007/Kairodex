@@ -1872,3 +1872,66 @@ fictional fills. The fix is not obvious enough to land inside a live
 session: it needs a decision about which writer is authoritative for a
 mark, and probably that WS prints — not the chain poll — own `ltp` for
 US, with `volume` split into two columns that mean what they say.
+
+### 15j. Full reset — both segments, user's explicit call (2026-08-11)
+
+Requirement, stated plainly: clear every open NSE position (they were not
+intraday — still open from before §15g shipped) and reset both NSE and
+US entirely, so performance is judged fresh against everything fixed in
+§15a-15i rather than mixed in with the trades that measured the broken
+plumbing.
+
+Asked before touching anything, since "reset" forked into materially
+different actions (administrative close vs. waiting for the market's own
+real fill; keep history with a cutoff marker vs. delete it). User's
+answer, all three questions: **delete everything, both segments, reset
+capital too.**
+
+**Backed up first** — `pg_dump` of every affected table to
+`/root/backups/pre_reset_2026-08-11.sql` on the VM (838KB, 3,541 lines)
+before deleting anything, despite the explicit instruction. Costs nothing
+and keeps an irreversible action recoverable.
+
+**Deleted, in FK order** (children first): `trade_events` (2,771),
+`fills` (61), `position_marks` (10,618), `orders` (61), `trades` (32),
+`equity_snapshots` (9,448), `risk_state` (4). All zero afterward.
+`signals` deliberately left untouched (54,175 rows) — it is the rejected-
+signal record, not P&L, and nothing about "reset the performance" asked
+for the evaluation history to go.
+
+**Capital resets by construction, not by writing a number.**
+`risk.accounting.update_equity_and_risk_state` recomputes `cash`/`equity`/
+`high_water_mark` fresh from `trades`/`position_marks` on every tick — an
+empty `trades` table means `realized = 0`, `equity = config.capital`
+(₹50,000 / $50,000 per segment), and a missing previous `equity_snapshots`
+row means `high_water_mark` starts at `capital` rather than inheriting
+yesterday's peak. Clearing `equity_snapshots`/`risk_state` themselves (not
+FK'd to `trades`, so not touched by the cascade) just makes that visible
+immediately instead of at the next tick.
+
+**Worth being explicit about:** this ran via the `kairodex` superuser
+role, the same one P3's live security test used to *prove* tampering is
+detectable (`event_log.verify_chain` correctly returning `False` after an
+admin-level edit — see §9). `trade_events` is deliberately revoked from
+`kairodex_app`, the role the live engine itself runs as, specifically so
+the app can never rewrite its own history. That guarantee protects
+against silent tampering by the running system, not against an explicit,
+authorized reset by the person who owns the paper-trading experiment —
+but it means this class of action can only be done the way it just was:
+by hand, off the app's own credentials, with a paper trail. It is not
+something the engine could ever do to itself.
+
+**Engines restarted** on the empty book — all 4 active. Both markets are
+currently closed (NSE opens 09:15 IST, US tonight 19:00 IST), and
+`update_equity_and_risk_state` only runs inside the session-open branch of
+`live_loop.run_segment` — so `equity_snapshots`/`risk_state` will read
+empty until each market's first tick, not immediately. `risk.loader`'s
+`AccountState` builder already defaults cleanly against an empty table
+(same pattern as every other DB-touching loader in this codebase), so
+nothing is broken in the interim — the dashboard will show a gap rather
+than a wrong number until 09:15.
+
+**From this point, every trade in the system was opened under §15a-15i's
+fixes** — the identity bug, the session-time exits, the scratch rule, the
+warm-up/cutoff gates, the intraday-only rule, and the US exit-quote fix.
+Today's NSE session (2026-08-11) is the first clean measurement.
