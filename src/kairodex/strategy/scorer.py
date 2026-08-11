@@ -14,6 +14,19 @@ from kairodex.strategy.types import DetectorFamily, Evidence
 
 _DEFAULT_MIN_FAMILIES = 2
 
+# A family must hold a real opinion to be counted as agreeing — not merely a
+# non-zero one. At the original 0.0, a family reading +0.002 on a [-1, 1] scale
+# was a full confluence vote, indistinguishable from one reading +0.98: the
+# family COUNT decides direction, the scores only set confidence afterwards.
+# Measured consequence over 18,977 real nse_stock signals: 100.0% of them
+# produced a direction. A confluence rule that never abstains is not a filter.
+# 0.20 from the same replay (PROGRESS.md §16) — nse_stock 100% -> 43.3% of
+# evaluations signalling, nse_index 67.6% -> 21.0%. It also retires
+# relative_strength on nse_index by construction rather than by special case:
+# an index measured against itself reads |0.002| there, so it now abstains
+# instead of casting a noise vote.
+_DEFAULT_AGREEMENT_THRESHOLD = 0.20
+
 
 @dataclass(frozen=True, slots=True)
 class ConfluenceResult:
@@ -25,7 +38,10 @@ class ConfluenceResult:
 
 class ConfluenceScorer:
     def __init__(
-        self, *, min_families: int = _DEFAULT_MIN_FAMILIES, agreement_threshold: float = 0.0
+        self,
+        *,
+        min_families: int = _DEFAULT_MIN_FAMILIES,
+        agreement_threshold: float = _DEFAULT_AGREEMENT_THRESHOLD,
     ) -> None:
         if min_families < 1:
             raise ValueError(f"min_families must be >= 1, got {min_families}")

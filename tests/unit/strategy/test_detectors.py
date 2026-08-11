@@ -11,6 +11,7 @@ from kairodex.strategy.detectors.flow import oi_price_flow_detector
 from kairodex.strategy.detectors.relative_strength import relative_strength_detector
 from kairodex.strategy.detectors.structure import trend_structure_detector
 from kairodex.strategy.detectors.volatility import iv_skew_detector
+from kairodex.strategy.scorer import _DEFAULT_AGREEMENT_THRESHOLD
 from kairodex.strategy.types import DetectorFamily, MarketContext
 
 _T0 = datetime.datetime(2026, 8, 5, 9, 15, tzinfo=datetime.UTC)
@@ -30,11 +31,21 @@ def _ctx(features: dict[str, float], bars: list[Bar] | None = None) -> MarketCon
 
 
 def test_trend_structure_hand_computed():
-    """trend_state_strength=0.05, scale=0.05 -> tanh(1) = 0.7615942."""
-    evidence = trend_structure_detector(_ctx({"trend_state_strength": 0.05}))
+    """trend_state_strength=0.0018, scale=0.0018 -> tanh(1) = 0.7615942."""
+    evidence = trend_structure_detector(_ctx({"trend_state_strength": 0.0018}))
     assert evidence is not None
     assert evidence.family == DetectorFamily.STRUCTURE
     assert evidence.score == pytest.approx(math.tanh(1.0), abs=1e-9)
+
+
+def test_trend_structure_reads_a_real_live_value_as_a_real_opinion():
+    """Regression for §16: the 0.05 scale made the whole live distribution
+    unusable. |trend_state_strength| p50 over 20,399 real NSE signals was
+    0.0006 — which scored 0.012, indistinguishable from no signal, yet still
+    cast a full confluence vote. It must now clear the scorer's 0.20 floor."""
+    evidence = trend_structure_detector(_ctx({"trend_state_strength": 0.0006}))
+    assert evidence is not None
+    assert evidence.score > _DEFAULT_AGREEMENT_THRESHOLD
 
 
 def test_trend_structure_negative_is_bearish():

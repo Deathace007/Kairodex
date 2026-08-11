@@ -17,13 +17,16 @@ exposure_cap_pct: 0.40
 min_liquidity_score: 0.3
 reentry_cooldown_minutes: 30
 
-# Minimum confluence score to spend a concurrent slot on. First-pass
-# values, set near each segment's OWN observed p75-p90 (2026-08-07: p75=0.3068 p90=0.5117)
-# — the distributions differ by ~10x between segments, so a single shared
-# number would either never trade the index segments or never filter the
-# stock ones. Not fitted, not backtested: recalibrate in P4 against real
-# outcomes, exactly like stop_loss_pct and the R-targets.
-min_confidence: 0.35
+# Minimum confluence score to spend a concurrent slot on, set at this
+# segment's OWN p75. RECALIBRATED 2026-08-11 (was 0.35) — mandatory, not
+# optional: §16's trend_structure rescale and the 0.20 agreement threshold
+# both move the confidence distribution, so the old 0.35 (p75 of the OLD
+# distribution) would have passed nearly everything. New p75 = 0.7117,
+# measured by replaying all 18,977 real nse_stock signals through the new
+# scorer. Still a percentile of a live distribution, NOT an outcome-fitted
+# number — no closed trade under the current ruleset exists yet to fit against
+# (all 15 prior NSE trades are pre-hardening; 14 would now be gate-rejected).
+min_confidence: 0.71
 
 # --- P7 hardening (2026-08-10), all derived from the first ten closed
 # trades and the 33k signals behind them. See PROGRESS.md §15.
