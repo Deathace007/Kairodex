@@ -1,6 +1,6 @@
 # Kairodex — Development Progress
 
-**Last updated:** 2026-08-10
+**Last updated:** 2026-08-11
 **Current phase:** P1 (The Recorder) is done pending the unattended
 5-session check (§7). P2 (Pricing & features) is functionally complete
 (§8). **P3 (Engine & paper execution) is functionally complete and
@@ -1935,3 +1935,169 @@ than a wrong number until 09:15.
 fixes** — the identity bug, the session-time exits, the scratch rule, the
 warm-up/cutoff gates, the intraday-only rule, and the US exit-quote fix.
 Today's NSE session (2026-08-11) is the first clean measurement.
+
+---
+
+## 16. P7's strategy half — the NSE detectors, calibrated (2026-08-11)
+
+Prompted by "focus on hardening the algo for both NSE segments so when
+the market will open we will have improved algo." Shipped and deployed
+before the 09:15 IST bell; both NSE engines restarted onto it at 08:41.
+
+**§15j's reset did not have to block this.** The blocker §15 named was
+calibrating against *closed trades*, and that is still impossible — see
+§16d. But `signals` was deliberately left intact through the reset
+(54,175 rows, 20,399 of them NSE), and `signals.evidence` carries **every
+detector's score on every evaluation**. That is a calibration surface of
+20,399 real observations that needs no trade, no fill, and no P&L. It was
+sitting in the database the whole time.
+
+### 16a. The scorer was not discriminating at all
+
+One measurement makes the case:
+
+> **100.0% of all 18,977 real `nse_stock` evaluations produced a
+> direction.** Not 99%. Every single one.
+
+A confluence rule that never abstains is not a filter. Two independent
+causes, both found by replaying the stored evidence.
+
+**1. `trend_structure`'s scale was ~27x too large.** Its `ponytail:`
+comment assumed `|trend_state_strength| ~0.001-0.15` and set
+`_SCALE = 0.05`. Inverting `tanh` over all 20,399 evidences gives the
+real live distribution — and both NSE segments agree closely:
+
+| segment | p50 | p75 | p90 |
+|---|---|---|---|
+| nse_stock | 0.00061 | 0.00137 | 0.00188 |
+| nse_index | 0.00066 | 0.00142 | 0.00165 |
+
+The top of the assumed range was ~80x high. Every reading therefore
+scored `|0.016|` on a [-1, 1] scale — mean 0.017, p90 0.038, nothing
+saturated. **The STRUCTURE family cast a full confluence vote while
+contributing essentially nothing to confidence**, because direction is
+decided by family *count* and confidence only by the scores afterwards.
+Now `_SCALE = 0.0018`, its own p90, which is the same `p90 -> tanh(1)`
+convention `relative_strength` already followed (`_SCALE = 0.03` against
+its measured p90 of 0.022 — the one detector whose scale was right, and
+the only one with a healthy distribution: p50 0.323, 0% saturated).
+
+**2. `agreement_threshold` was 0.0**, so a family reading `+0.002`
+counted as agreeing with one reading `+0.98`. Now **0.20**: a family must
+hold a real opinion to be counted, not merely a non-zero one.
+
+Replaying all 20,399 signals through both fixes:
+
+| segment | evaluations signalling, before | after |
+|---|---|---|
+| nse_stock | **100.0%** | 43.3% |
+| nse_index | 67.6% | 21.0% |
+
+The threshold also **retires `relative_strength` on `nse_index` by
+construction rather than by special case** — an index measured against
+its own benchmark reads p50 `|0.002|` there (vs. 0.323 on `nse_stock`),
+so it now abstains instead of casting a noise vote. No `if segment ==`
+anywhere; the floor does it.
+
+### 16b. `min_confidence` had to move with it, and that is not optional
+
+Both NSE values were the p75 of the **old** confidence distribution. The
+rescale moves that distribution, so leaving them would have passed nearly
+everything — a stricter scorer wired to a now-trivial gate. Recomputed at
+the p75 of the **replayed** distribution:
+
+| segment | was | now | new p50 / p75 / p90 |
+|---|---|---|---|
+| nse_stock | 0.35 | **0.71** | 0.628 / 0.712 / 0.789 |
+| nse_index | 0.30 | **0.32** | 0.306 / 0.317 / 0.326 |
+
+The two are no longer ~10x apart. Most of that old gap *was*
+`trend_structure`'s broken scale. What remains (0.32 vs 0.71) is real:
+`nse_index` now has only two live families, so its confluence mean is
+structurally lower.
+
+Still a percentile of a live distribution, **not an outcome-fitted
+number** — the honest ceiling on everything in this section.
+
+### 16c. Not fixed: `oi_price_flow` has never once fired
+
+`avg_detectors = 3.00` exactly, across all 20,399 NSE signals; the FLOW
+family appears in **zero** of them. So `min_families = 2` has always been
+2-of-**3**, never 2-of-4 — and until today one of those three was noise,
+making it effectively 2-of-2 with a tiebreaker. `oi_change` is presumably
+never populated in the live feature path, but the root cause is not yet
+found, and a detector that has never run is not something to fix by
+guessing 20 minutes before a session. Flagged, deliberately not touched.
+
+Also left: `iv_skew_sentiment` is not mis-scaled but **heavy-tailed** —
+27.5% of readings score `<0.01` and 33.2% saturate at `>0.99`, from the
+same `_SCALE = 5.0`. That is a shape problem in the underlying feature
+(put IV - call IV, presumably one leg occasionally garbage), not a
+constant to retune. Needs the feature looked at, not the detector.
+
+### 16d. What this is not
+
+**It is not calibrated against outcomes, because it cannot be yet.**
+Restoring `/root/backups/pre_reset_2026-08-11.sql` into a scratch DB and
+replaying the current gates over its 15 NSE trades:
+
+| verdict under today's rules | trades | net |
+|---|---|---|
+| REJECT — warm-up (before 09:35) | 12 | -Rs 9,051 |
+| REJECT — cutoff (after 14:00) | 2 | -Rs 411 |
+| **ALLOWED** | **1** | — |
+
+**14 of 15 would never have been taken.** The single survivor is trade 26
+(KOTAKBANK, 09:57) — §15b's dead-row trade, which received no quote ever
+and never closed. Effective NSE sample under the current ruleset: **zero
+closed trades.** Every rupee of the -Rs 9,462 was earned in the first
+nine minutes of a session the engine no longer trades, under exits since
+rewritten. §15's "wait for a clean fortnight" still stands for anything
+outcome-fitted; this section deliberately fits only to *distributions*,
+which is why it could run today.
+
+### 16e. The backup silently lost two tables
+
+Found while restoring it. `pg_dump` reported success, wrote 838KB, and
+contained **zero rows** for `position_marks` (10,618) and
+`equity_snapshots` (9,448) — the only two of the seven reset tables that
+are **TimescaleDB hypertables**. Their rows live in `_timescaledb_internal`
+chunks, which a `-t`-scoped dump never visits; the parent table dumps as
+an empty `COPY`. §15j's row counts came from `SELECT count(*)` before the
+delete, not from the dump. Those 20,066 rows are gone.
+
+**Use `COPY (SELECT * FROM x) TO ...` for hypertables** — it reads
+through the parent and cannot miss chunks.
+
+**Partly recovered anyway, from the event log.** The trailing stop sits
+at `hwm x 0.70` and every ratchet writes a `STOP_MOVED` event, so
+`HWM = new_stop_price / 0.70` — and `trade_events` (2,771 rows) did
+survive. That reproduces §15a's MFE column **exactly on all 8 checkable
+trades** (+42.8, +31.3, +21.8, +19.1, +14.8, +2.3, +0.7, +0.2%). MAE is
+not recoverable — the stop never ratchets down, so nothing records the
+low.
+
+**Worth generalising, a fourth time.** §13d: a fault reading green. §14:
+a failure with no way to report failing. §15f: a recovery reading red
+forever. This one is a **success that was partly a no-op** — and it is
+the same defect once more: the thing reporting the outcome was not the
+thing doing the work.
+
+### 16f. Status
+
+492 tests (1 new), ruff/mypy clean. One **pre-existing, unrelated**
+failure: `test_expiry_cache.py::test_bars_refresh_when_the_newest_is_
+older_than_max_age` asserts `end > date.today()` and fails on any run
+dated 2026-08-11 — it fails identically on the parent commit (verified by
+stashing), is US/LSE-scoped, and is untouched by this work.
+
+**US was deliberately not restarted.** The scorer and detector changes are
+global, but only the NSE `min_confidence` values were recalibrated — so a
+US engine restarted onto this commit would run the stricter scorer against
+a gate set against the *old* distribution, i.e. looser than before. The
+running US processes hold the old code in memory and are unaffected, but
+**any restart or reboot before 19:00 IST puts them on the new scorer with
+stale gates.** Either halt both US segments (§15i already recommended it,
+for the unrelated and stronger reason that their fills are modelled off a
+vendor with no order book) or recalibrate their `min_confidence` the same
+way. Not decided here.
