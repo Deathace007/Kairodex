@@ -177,9 +177,35 @@ systemctl restart kairodex-ingest-nse         # e.g. after a code deploy — see
 docker exec kairodex-timescaledb-1 psql -U kairodex -d kairodex -c "SELECT count(*) FROM instruments;"
 ```
 
-**Deploying a code change to the live recorder:** `git pull origin main` alone does *not*
-pick up a running process's code — `systemctl restart kairodex-ingest-{nse,us,jobs}`
-after every pull that touches `kairodex/data/` or `kairodex/jobs`.
+**Deploying a code change:** `git pull origin main` alone does *not* pick up a
+running process's code. This note used to name only the recorder units, and
+that omission bit on 2026-08-12 (§18f): `kairodex-api` ran for six days across
+three config-schema changes and served a stale risk config the whole time.
+**The full unit list, and what each one cares about:**
+
+| unit(s) | restart after a pull touching |
+|---|---|
+| `kairodex-ingest-{nse,us}` | `kairodex/data/` |
+| `kairodex-jobs` | `kairodex/jobs` |
+| `kairodex-engine-{nse_stock,nse_index,us_stock,us_index}` | `kairodex/{engine,strategy,risk,execution,features,pricing}/`, `config/segments/*.yaml` |
+| `kairodex-api` | `kairodex/{api,analytics,export,store,streaming}/`, **`config/segments/*.yaml`** |
+| `kairodex-frontend` | `frontend/` |
+
+`config/segments/*.yaml` appears twice on purpose: `config.segments.
+get_segment_config` is `@lru_cache`d, so a YAML edit reaches **no** running
+process until that process restarts.
+
+```bash
+# the blunt, always-correct version — every unit, safe while markets are shut
+systemctl restart kairodex-{ingest-nse,ingest-us,jobs,api,frontend}
+systemctl restart kairodex-engine-{nse_stock,nse_index,us_stock,us_index}
+```
+
+Check what is actually running before assuming — start times do not lie:
+```bash
+for u in $(systemctl list-units 'kairodex-*' --no-legend --no-pager | awk '{print $1}'); do
+  printf "%-40s %s\n" "$u" "$(systemctl show "$u" -p ExecMainStartTimestamp --value)"; done
+```
 
 NIFTY expiries are Tuesdays, not obvious guesses — `ingest run`/`poll_chain_once` resolve them live via `list_expiries()` (Upstox: `GET /v2/option/contract`; LSE: `options()` with no expiry filter), not a guess or a hardcoded date.
 
@@ -2537,3 +2563,58 @@ was never done.
 
 `kairodex-ingest-{nse,us}` were also restarted, so §14e-bis's feed_health
 liveness fix is finally running rather than merely committed.
+
+### 18f. "Is everything on live?" — it wasn't, and the API had been lying for six days
+
+Asked plainly at the end of the session. Checked instead of asserted, by
+reading every unit's `ExecMainStartTimestamp` against the commits that
+touch what it imports. Three of nine units were not on current code, and
+one of them mattered.
+
+**`kairodex-api` had been running since 2026-08-06 23:56** — through
+§15's four exit/entry rules, §15g's intraday rule, §16's recalibration
+and §17c's re-siting. A transitive-import check (walking `ast` over
+`kairodex.api`'s import graph) found exactly one changed module it
+actually depends on: `kairodex.config.segments`.
+
+`GET /api/segments/nse_stock/risk` returned **HTTP 200** with a `config`
+block containing no `min_confidence`, no `entry_warmup_minutes`, no
+`entry_cutoff_minutes`, no `scratch_exit_*`, no `max_holding_sessions` —
+the pre-§15 schema, served as current for two days. It did not error
+because `SegmentRiskConfig` is `ConfigDict(frozen=True)` with no
+`extra="forbid"`, so the old model silently drops YAML keys it has never
+heard of, and `get_segment_config` is `@lru_cache`d so the process never
+re-read the file. Restarted; the endpoint now reports `min_confidence`
+0.60/0.61 and every P7 field.
+
+**This is the same defect a fifth time** — §13d a fault reading green,
+§14 a failure with no way to report failing, §15f a recovery reading red
+forever, §16e a success that was partly a no-op, and now **a read API
+confidently serving configuration that no process has used since
+2026-08-10.** The invariant underneath all five: *the thing reporting the
+state was not the thing holding the state.*
+
+Root cause was documentation, not code: §3's deploy note named only the
+recorder units, so every session since P6 has restarted `ingest` and
+`engine` and never thought about `api`. §3 now carries the full unit ->
+watched-paths table, a blunt restart-everything command, and the
+start-time audit loop that found this.
+
+**Deliberately not fixed:** `SegmentRiskConfig` still accepts unknown
+YAML keys. Switching it to `extra="forbid"` would have turned this silent
+drift into a loud startup failure — which is the right behaviour — but it
+also means any future config field lands as a crash on every not-yet-
+restarted process rather than a degraded one, and that is a call to make
+deliberately rather than at the end of a session. Flagged here so it is
+a decision rather than an oversight.
+
+**Final live state, verified:**
+
+| unit | code | note |
+|---|---|---|
+| `engine-nse_stock` / `engine-nse_index` | `b461465` (18:37 IST) | FLOW live, gates 0.60/0.61, ARMED |
+| `engine-us_stock` / `engine-us_index` | pre-`0643e72` | deliberately stale — **breaker TRIPPED**, cannot trade |
+| `ingest-nse` / `ingest-us` | current (18:15 IST) | §14e-bis feed_health fix running |
+| `api` | current (18:5x IST) | config block correct again |
+| `frontend` | 08-07 | no `frontend/` commits since; current by inspection |
+| `jobs` | current | untouched by any of today's work |
