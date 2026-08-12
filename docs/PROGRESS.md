@@ -1,6 +1,6 @@
 # Kairodex — Development Progress
 
-**Last updated:** 2026-08-11
+**Last updated:** 2026-08-12
 **Current phase:** P1 (The Recorder) is done pending the unattended
 5-session check (§7). P2 (Pricing & features) is functionally complete
 (§8). **P3 (Engine & paper execution) is functionally complete and
@@ -83,8 +83,16 @@ identity that had every open NSE position monitoring a five-day-dead
 quote row (one with no stop-loss monitoring at all), and the closed-trade
 record showed 92% of all loss coming from trades that never worked even
 briefly. Root cause fixed, four evidence-derived exit/entry rules added.
-The strategy half waits on a clean fortnight of trades to calibrate
-against. **Two live actions are still pending on the VM — see §15e.**
+**§17 is the first clean session under all of it** — 5 closed NSE trades,
++Rs 1,591, nothing from the hardening misfiring. It also fixed a
+re-entry cooldown that only counted losses (a winning close let the
+engine buy the same underlying back on the next tick, which cost Rs 6,023
+in one session), and finally populated `signals.forward_outcome` — 21,128
+NSE signals resolved against their own forward bars. **That measurement
+says the confluence scorer's confidence is anti-predictive**: every
+confidence filter makes the forward outcome worse than the unfiltered
+baseline. See §17d before tuning any threshold. **A US restart hazard is
+armed — see §17g.**
 
 > Read this file first, every session. Update it whenever a phase
 > completes, a decision changes, or a command/location changes. Deeper
@@ -2181,3 +2189,219 @@ stale gates.** Either halt both US segments (§15i already recommended it,
 for the unrelated and stronger reason that their fills are modelled off a
 vendor with no order book) or recalibrate their `min_confidence` the same
 way. Not decided here.
+
+---
+
+## 17. The first clean session, and the scorer fails its first real test (2026-08-12)
+
+Prompted by "analyze todays closed trades on NSE and see how we move
+forward for P7 in hardening the segments and their algos." Five closed
+NSE trades — the first ones ever taken entirely under §15a-16's rules,
+since §15j reset the book and §16 shipped before the 08-11 bell.
+
+**+Rs 1,591 net** (`nse_stock` +235 / +0.47%, `nse_index` +1,356 /
++2.7%). Both breakers ARMED throughout.
+
+| id | underlying | contract | open→close IST | MFE | MAE | exit | net |
+|---|---|---|---|---|---|---|---|
+| 60 | BANKNIFTY | 58200 CE | 09:47→14:49 | +15.1% | -12.6% | PARTIAL_R0.5 | +1,356 |
+| 61 | INFY | 1175 P | 10:11→15:16 | +43.4% | -0.6% | EOD_EXIT | +2,239 |
+| 62 | TCS | 2340 P | 10:57→12:00 | **+105.8%** | +17.6% | PROFIT_TARGET | +4,020 |
+| 63 | TCS | 2280 P | 12:01→12:38 | **-6.2%** | -31.8% | STOP_LOSS | -4,343 |
+| 64 | TCS | 2300 P | 13:09→14:40 | +0.7% | -17.7% | SCRATCH_EXIT | -1,680 |
+
+### 17a. The hardening itself held
+
+Nothing from §15-16 misfired. Earliest entry 09:47 against a 09:35
+warm-up boundary; everything flat by 15:16 with no carry; all five trades
+carried continuous `position_marks` from within a minute of entry, so
+§15b's dead-row failure is genuinely gone. The scratch rule earned its
+keep on trade 64 — MFE +0.7% at 90 session-minutes, out at -17.7% instead
+of riding to the -30% stop.
+
+The rejection mix is the part worth keeping: 869 `BELOW_MIN_CONFIDENCE`,
+92 `ALREADY_OPEN_ON_UNDERLYING`, 74 `EXPOSURE_CAP_EXCEEDED`, 47
+`SESSION_CLOSING`/`WARMUP`, 19 `REENTRY_COOLDOWN_ACTIVE` — and exactly
+**3 plumbing rejections** (1 `STALE_QUOTE`, 2 `NO_TRADE_MIN_SIZE`) out of
+1,117 evaluations. A 0.4% take rate is selectivity; the thing to watch is
+whether rejections are decisions or breakage, and today they were
+decisions.
+
+### 17b. A winning close was a free pass to re-enter — fixed
+
+Trade 62 closed **+Rs 4,020 at 12:00:08**. Trade 63 opened on the same
+underlying, same direction, one strike lower, at **12:01:08** — the very
+next tick — and lost -Rs 4,343. Trade 64 then opened at 13:09:13, sixty-
+three seconds after the cooldown from 63's loss expired, and lost another
+-Rs 1,680.
+
+**TCS net -Rs 2,003, having been +Rs 4,020 up.** Without the two re-
+entries the day is +Rs 6,258 on `nse_stock` rather than +Rs 235.
+
+`risk/loader.py` built the cooldown map from `Trade.net_pnl < 0`, so only
+losses populated it. The gate worked exactly as written — 63's loss did
+produce a clean 30-minute block — but as written it was a revenge-trading
+guard, and the risk actually being managed is re-entering a move you just
+exited, which does not care which side of zero the exit landed on.
+
+Fixed: `last_loss_ts_by_underlying` → `last_close_ts_by_underlying`, the
+`net_pnl` filter dropped. **Live-verified on the VM** by building a real
+`AccountState`: INFY, BANKNIFTY, ICICIBANK and BAJFINANCE — all winners,
+all previously absent — now appear in the map.
+
+Not fixed, and worth naming: this alone would not have saved the day.
+TCS kept scoring 0.79-0.94 continuously until 14:00, so the engine would
+very likely have re-entered at 12:31 when the cooldown lapsed. A per-
+underlying per-session entry cap is the other half, and it is a knob with
+no evidence behind it yet, so it was left alone.
+
+### 17c. §16b's calibration did not survive contact with live data
+
+Both NSE `min_confidence` values were fitted at the p75 of a *replayed*
+distribution. Two real sessions under the new scorer say the replay was
+wrong about both segments:
+
+| segment | gate was | live p50 | live p75 | gate actually sat at | now |
+|---|---|---|---|---|---|
+| nse_stock | 0.71 | 0.4269 | 0.6041 | ~p85 | **0.60** |
+| nse_index | 0.32 | 0.6043 | 0.6117 | ~p2 | **0.61** |
+
+`nse_index`'s gate was **inert** — 5 confidence rejections out of 106
+evaluations on 08-12, with the exposure cap doing all the real filtering.
+§16b's specific prediction that `nse_index` sits structurally lower than
+`nse_stock` because only two families stay live there is also wrong live:
+the two p75s are now within 0.008 of each other.
+
+Re-sited both. The p75 convention exists so selectivity stays fixed while
+the scorer drifts — which means re-measuring weekly against live signals,
+not fitting once. **§17d then undermined the convention itself**, see
+below.
+
+### 17d. `signals.forward_outcome` now exists — and says confidence is worse than useless
+
+The column ARCHITECTURE.md §5.4 describes as "filled in later: did the
+move happen?" had **never been written: 0 of 63,335 rows.** It is the one
+calibration surface that needs no fills, no P&L and no closed-trade
+volume, and it was sitting empty while §15/§16 both recorded "wait for a
+clean fortnight" as the blocker.
+
+New `backtest/backfill.py` + `kairodex backtest backfill-outcomes`,
+reusing Track A's `resolve.resolve_forward_outcome` **verbatim** — the
+same stop/target walk in ATR units, over each live signal's own
+underlying 1-minute bars. Two rules that are not obvious and are pinned
+by tests: forward bars are truncated at the signal's own session date
+(the engine is intraday-only, §15g, so a 15:20 signal must be scored on
+the ten minutes it actually had), and a truncated window that hit neither
+stop nor target is left **NULL rather than scored as flat**, which would
+otherwise systematically label every late-session signal as a
+non-event.
+
+Backfilled: **21,128 NSE signals** (19,729 `nse_stock` + 1,399
+`nse_index`; 445 unresolved, 1,196 without 1m history).
+
+**First sanity check, and it validates the resolver.** With a 1-ATR stop
+and a 2-ATR target and ties resolving to the stop, a driftless random
+walk hits its target **33.3%** of the time. Across all 19,729 `nse_stock`
+signals the observed rate is **31.8%**. The instrument reads the
+no-edge baseline correctly, which is what makes the next table mean
+something.
+
+| `nse_stock` band | n | sessions | avg return (ATR) | target hit |
+|---|---|---|---|---|
+| all signals | 19,729 | 5 | -0.046 | **31.8%** |
+| conf >= 0.60 (the new gate) | 1,502 | 5 | -0.115 | **29.5%** |
+| conf >= 0.71 (the old gate) | 741 | 5 | -0.279 | **24.0%** |
+| conf >= 0.80 | 247 | 4 | -0.393 | **20.2%** |
+| conf >= 0.90 | 102 | 3 | -0.235 | **25.5%** |
+
+**Every confidence filter makes the forward outcome worse, monotonically
+to 0.80.** Filtering on confidence is not a weak edge; it is a negative
+one. The unfiltered population is already at the no-edge baseline, and
+the gate selects away from it.
+
+Split by scorer era, the effect appears independently in both — old
+scorer conf>=0.8: 22.7% target on n=97; new scorer conf>=0.8: 18.7% on
+n=150 — so it is not an artifact of §16's rescale.
+
+The mechanism was already visible in the trade record before the backfill
+confirmed it. Trade 63 entered on `trend_structure -0.965`, i.e. `tanh`
+all but saturated, one minute after trade 62 took profit on the same
+move at -0.813. Confidence is monotone in *extension*, so the scorer is
+structurally most certain exactly where an intraday move is most
+stretched. **It is an extension meter, not an edge estimate**, and §16b's
+p75 convention was fitting a gate to select the top quarter of that
+meter.
+
+Deciles across the full range are flat (30.5%-34.0%, no trend), so the
+damage is concentrated in the tail rather than being a smooth inversion.
+
+**What this does NOT license.** Five sessions, 20 underlyings, and
+signals re-evaluated every ~90 seconds share nearly all of their forward
+window — 19,729 rows is nothing like 19,729 independent observations, and
+the >=0.80 band spans only 4 sessions. This is enough to stop trusting
+confidence, not enough to invert it. Inverting a noisy signal is how you
+fit noise twice.
+
+`nse_index` is untouched by this conclusion: n=29 above the new gate
+across 2 sessions is not a measurement.
+
+### 17e. Accordingly, the gates re-sited in §17c are provisional
+
+The `nse_stock` move (0.71 → 0.60) happens to travel in the direction
+§17d supports (-0.279 → -0.115) but for the wrong reason — it was a
+percentile convention, not an outcome fit. The `nse_index` move (0.32 →
+0.61) is a *tightening* toward the region that §17d finds harmful on the
+other segment, on n=29 of its own evidence. Both stand for now because a
+gate sited at a live percentile is still better than one sited at a
+replayed percentile, but the honest state is: **the quantity these gates
+filter on has no demonstrated predictive value.**
+
+The next real question is not where to put the threshold. It is whether
+`ConfluenceScorer`'s output should gate entries at all, and what an
+extension-damped detector (score peaking mid-move rather than at the
+extreme) does to the same table.
+
+### 17f. Deliberately not done
+
+- **Winner clipping.** The R-ladder sold **12 of trade 62's 13 lots in
+  its first 7 minutes** (rungs at +18%/+34%/+65%) and the last lot ran to
+  +106%. But the same ladder beat holding-to-EOD by Rs 206 on trade 61.
+  Mixed evidence on two trades; not a tuning target yet.
+- **The trailing stop cannot protect a profit below +43%.** It trails 30%
+  under the high-water mark, so trade 61 — which peaked at +43.4% — had a
+  trailed stop of 19.88 against a 19.81 entry, i.e. breakeven, and gave
+  back half at EOD. Real defect in shape, needs more than five trades to
+  size.
+- **`nse_index`'s `max_concurrent: 2` is arithmetically unreachable.**
+  BANKNIFTY premium was Rs 9,139/lot against `exposure_cap_pct` 0.30 x
+  Rs 50,000 = Rs 15,000, so one position blocks the segment (74
+  rejections). Cost nothing today; the config claims capacity it cannot
+  have.
+- **A per-underlying per-session entry cap** — the other half of §17b,
+  see there.
+
+### 17g. Status, and one hazard this session armed
+
+498 tests (5 new), ruff/mypy clean, both locally and on the VM.
+`test_expiry_cache.py`'s §16f failure is gone — it was date-dependent and
+only failed on 08-11. Commit `e240c36`; NSE engines restarted onto it at
+16:40 IST against a closed market.
+
+**That commit also swept in two unrelated changes that were sitting
+uncommitted in the working tree at session start** — `recorder.py`'s
+feed_health liveness fix and §14e/§14e-bis's write-up (a `git add -A`
+that should have been selective). Both are wanted and correct; the commit
+message just does not mention them. **The ingest units were NOT restarted,
+so the feed_health fix is on disk but not running** — restart
+`kairodex-ingest-{nse,us}` to pick it up.
+
+**The §16f US hazard is now armed rather than latent.** US engines still
+hold pre-`0643e72` code in memory and were deliberately not restarted,
+but the VM's checkout has moved twice since. `Restart=always` means a
+crash or reboot now brings them up on the new scorer against
+`min_confidence` 0.25/0.20 — gates fitted to the old distribution, i.e.
+wide open. Live US p50 confidence under the *old* scorer is 0.151; the
+new scorer shifted both NSE segments' distributions sharply upward.
+Still undecided, and now with a deadline attached: halt both US segments
+(§15i's recommendation, for the independent and stronger reason that LSE
+publishes no order book at all) or recalibrate their gates.
