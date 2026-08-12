@@ -81,40 +81,63 @@ def test_iv_skew_negative_skew_is_bullish():
     assert evidence.score == pytest.approx(math.tanh(1.0), abs=1e-9)
 
 
+# The price leg is measured over OI_LOOKBACK (30m), matching the OI leg —
+# so every flow fixture needs a bar at or before last.ts - 30m.
+_FLOW_SPAN = 30
+_PLUS_1PCT = math.tanh(0.01 / 0.0038)  # a +1% 30-minute move, at the measured scale
+
+
 def test_flow_long_buildup_full_conviction():
-    """Price 100 -> 101 (+1%), OI up -> long buildup, full conviction.
-    score = tanh(0.01/0.01) * 1.0 = tanh(1) = 0.7615942."""
-    bars = [_bar(0, 100.0), _bar(1, 101.0)]
+    """Price 100 -> 101 (+1% over the 30m window), OI up -> long buildup,
+    full conviction. score = tanh(0.01/0.0038) * 1.0."""
+    bars = [_bar(0, 100.0), _bar(_FLOW_SPAN, 101.0)]
     evidence = oi_price_flow_detector(_ctx({"oi_change": 0.10}, bars=bars))
     assert evidence is not None
     assert evidence.family == DetectorFamily.FLOW
-    assert evidence.score == pytest.approx(math.tanh(1.0), abs=1e-9)
+    assert evidence.score == pytest.approx(_PLUS_1PCT, abs=1e-9)
 
 
 def test_flow_short_covering_half_conviction():
-    """Price up but OI down -> short covering, half conviction.
-    score = tanh(1) * 0.5."""
-    bars = [_bar(0, 100.0), _bar(1, 101.0)]
+    """Price up but OI down -> short covering, half conviction."""
+    bars = [_bar(0, 100.0), _bar(_FLOW_SPAN, 101.0)]
     evidence = oi_price_flow_detector(_ctx({"oi_change": -0.10}, bars=bars))
     assert evidence is not None
-    assert evidence.score == pytest.approx(math.tanh(1.0) * 0.5, abs=1e-9)
+    assert evidence.score == pytest.approx(_PLUS_1PCT * 0.5, abs=1e-9)
 
 
 def test_flow_short_buildup_is_bearish_full_conviction():
     """Price down, OI up -> short buildup -> bearish, full conviction."""
-    bars = [_bar(0, 100.0), _bar(1, 99.0)]
+    bars = [_bar(0, 100.0), _bar(_FLOW_SPAN, 99.0)]
     evidence = oi_price_flow_detector(_ctx({"oi_change": 0.10}, bars=bars))
     assert evidence is not None
-    assert evidence.score == pytest.approx(math.tanh(-0.01 / 0.01), abs=1e-9)
+    assert evidence.score == pytest.approx(math.tanh(-0.01 / 0.0038), abs=1e-9)
 
 
 def test_flow_long_unwinding_is_bearish_half_conviction():
-    """Price down, OI down -> long unwinding -> bearish, half conviction.
-    score = tanh(-1) * 0.5."""
-    bars = [_bar(0, 100.0), _bar(1, 99.0)]
+    """Price down, OI down -> long unwinding -> bearish, half conviction."""
+    bars = [_bar(0, 100.0), _bar(_FLOW_SPAN, 99.0)]
     evidence = oi_price_flow_detector(_ctx({"oi_change": -0.10}, bars=bars))
     assert evidence is not None
-    assert evidence.score == pytest.approx(math.tanh(-1.0) * 0.5, abs=1e-9)
+    assert evidence.score == pytest.approx(math.tanh(-0.01 / 0.0038) * 0.5, abs=1e-9)
+
+
+def test_flow_measures_price_over_the_oi_window_not_the_whole_bar_array():
+    """The live bar window is 5 DAYS of 1m bars (features/loader.py), and
+    until 2026-08-12 this detector spanned all of it — pairing a five-day
+    price move with a one-tick OI change, and saturating tanh on nearly
+    every evaluation. Only the last 30 minutes may count: the leading bar
+    here is a huge move that must be ignored entirely."""
+    bars = [_bar(0, 10.0), _bar(_FLOW_SPAN, 100.0), _bar(2 * _FLOW_SPAN, 101.0)]
+    evidence = oi_price_flow_detector(_ctx({"oi_change": 0.10}, bars=bars))
+    assert evidence is not None
+    assert evidence.score == pytest.approx(_PLUS_1PCT, abs=1e-9)
+
+
+def test_flow_abstains_when_history_is_shorter_than_the_oi_window():
+    """Early in a session there is no 30-minute prior — abstain rather
+    than silently compare against whatever the oldest bar happens to be."""
+    bars = [_bar(0, 100.0), _bar(_FLOW_SPAN - 1, 101.0)]
+    assert oi_price_flow_detector(_ctx({"oi_change": 0.1}, bars=bars)) is None
 
 
 def test_flow_none_with_insufficient_bars():
@@ -122,10 +145,10 @@ def test_flow_none_with_insufficient_bars():
 
 
 def test_flow_none_without_oi_change():
-    bars = [_bar(0, 100.0), _bar(1, 101.0)]
+    bars = [_bar(0, 100.0), _bar(_FLOW_SPAN, 101.0)]
     assert oi_price_flow_detector(_ctx({}, bars=bars)) is None
 
 
 def test_flow_none_when_price_unchanged():
-    bars = [_bar(0, 100.0), _bar(1, 100.0)]
+    bars = [_bar(0, 100.0), _bar(_FLOW_SPAN, 100.0)]
     assert oi_price_flow_detector(_ctx({"oi_change": 0.1}, bars=bars)) is None

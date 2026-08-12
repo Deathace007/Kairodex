@@ -28,6 +28,7 @@ from kairodex.risk.loader import build_account_state
 from kairodex.store.base import get_sessionmaker
 from kairodex.store.models import PositionMark, RiskState, Trade
 from kairodex.store.models import Strategy as StrategyRow
+from kairodex.strategy.detectors import flow
 from kairodex.strategy.protocol import ReferenceStrategy
 from kairodex.strategy.scorer import ConfluenceScorer
 from kairodex.streaming.bus import publish
@@ -170,6 +171,17 @@ async def run_segment(segment: Segment, *, shadow: bool = True) -> None:
                         account=account,
                         broker=execution,
                         now=now,
+                        # Without this the FLOW family had never fired ONCE —
+                        # `prior_as_of=None` means `prior_chain=[]`, which makes
+                        # the `oi_change` feature return None, which makes
+                        # `oi_price_flow_detector` return None. Across 20,399
+                        # real NSE signals `avg_detectors` was exactly 3.00 and
+                        # FLOW appeared in zero of them, so `min_families: 2`
+                        # has always been 2-of-3, never 2-of-4. Same shape as
+                        # the `index_bars` gap that had `relative_strength`
+                        # permanently dead (see run_entry_tick's own comment):
+                        # a `build_context` parameter nothing ever supplied.
+                        prior_as_of=now - flow.OI_LOOKBACK,
                     )
                     if outcome is not None and outcome.taken:
                         account = await build_account_state(session, segment, now)

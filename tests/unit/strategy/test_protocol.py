@@ -21,8 +21,11 @@ def _bar(minutes: int, close: float) -> Bar:
     return Bar(ts=ts, open=c, high=c, low=c, close=c, volume=1000)
 
 
+_FLOW_SPAN = 30  # oi_price_flow measures price over its own 30m OI window
+
+
 def test_strongly_bullish_features_produce_a_buy_signal():
-    bars = [_bar(0, 100.0), _bar(1, 102.0)]  # +2% move
+    bars = [_bar(0, 100.0), _bar(_FLOW_SPAN, 102.0)]  # +2% over the flow window
     features = {
         "trend_state_strength": 0.10,  # strong uptrend
         "oi_change": 0.20,  # buildup, agrees with the up-move -> full conviction
@@ -44,7 +47,7 @@ def test_strongly_bullish_features_produce_a_buy_signal():
 
 
 def test_conflicting_features_produce_no_signal():
-    bars = [_bar(0, 100.0), _bar(1, 101.0)]
+    bars = [_bar(0, 100.0), _bar(_FLOW_SPAN, 101.0)]
     features = {
         "trend_state_strength": 0.10,  # bullish
         "oi_change": -0.20,  # covering, weak bullish
