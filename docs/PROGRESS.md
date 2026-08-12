@@ -2405,3 +2405,135 @@ new scorer shifted both NSE segments' distributions sharply upward.
 Still undecided, and now with a deadline attached: halt both US segments
 (§15i's recommendation, for the independent and stronger reason that LSE
 publishes no order book at all) or recalibrate their gates.
+
+---
+
+## 18. P7-A — the FLOW family had never fired once (2026-08-12, evening)
+
+§16c flagged it and deliberately did not chase it: `avg_detectors = 3.00`
+exactly across all 20,399 NSE signals, with the FLOW family appearing in
+**zero** of them, so `min_families: 2` has always been 2-of-**3**, never
+2-of-4. §17 picked it as the first strategy-half task on the reasoning
+that adding a genuine fourth family beats retuning three that §17d
+measured at the no-edge baseline.
+
+### 18a. Root cause: a parameter nothing supplied
+
+```
+live_loop.run_segment  ->  run_entry_tick(...)          # no prior_as_of
+run_entry_tick         ->  build_context(prior_as_of=None)
+build_context          ->  prior_chain = []
+oi_change feature      ->  None          (needs ctx.prior_chain)
+oi_price_flow_detector ->  None          (returns early on oi_change is None)
+```
+
+Every tick, since the engine was built. This is **exactly** the shape of
+the `index_bars` gap that had `relative_strength_detector` permanently
+dead — a `build_context` parameter that nothing anywhere passed — and
+`run_entry_tick`'s own comment describes that earlier instance three
+lines above the call that had this one. Two detectors of four have now
+been found dead by the same mechanism.
+
+**Generalisable, and worth stating as a rule:** an optional parameter on
+a context builder is a silent-failure surface. Both dead detectors
+degraded to `None` politely, were counted as "not applicable" by
+`compute_all`, and produced no warning anywhere. The reason it took
+20,399 signals to notice is that `avg_detectors = 3.00` had to be
+computed deliberately — nothing in the system treats "a registered
+detector has never once fired" as an error. It should.
+
+### 18b. Plumbing it alone would have shipped a bad detector
+
+Two independent problems, both measured against **15,739 real NSE chain
+snapshots** rather than assumed:
+
+1. **The price leg spanned the entire `underlying_bars` window** — 5 days
+   of 1m bars per `features/loader.py` — against `_PRICE_SCALE = 0.01`.
+   A 5-day NSE move is routinely 2-5%, so `tanh` would have saturated at
+   ±1.0 on nearly every evaluation: a family casting a full confluence
+   vote on a degenerate number, which is precisely the `trend_structure`
+   pathology §16a diagnosed. The convention in the detector's own
+   docstring compares OI and price over the *same* interval, and the code
+   never did.
+2. **The OI leg's sign is a coin flip at short horizons.** The detector
+   reads only `oi_change > 0` (buildup vs. unwind, conviction 1.0 vs
+   0.5), so only the sign matters — and chain-total OI change is 53.5%
+   positive at 1 minute. It separates as the window widens:
+
+   | horizon | % OI change positive | \|price change\| p90 |
+   |---|---|---|
+   | 1m | 53.5% | 0.00075 |
+   | 5m | 56.4% | 0.00161 |
+   | 15m | 58.1% | 0.00266 |
+   | 30m | 59.3% | 0.00376 |
+
+**Fix:** `OI_LOOKBACK = 30 minutes`, shared by both legs (`live_loop`
+passes the matching `prior_as_of`, and the detector slices its price
+window to the same span), and `_PRICE_SCALE = 0.0038` — the measured p90
+of that window, the same `p90 -> tanh(1)` convention §16a established and
+`relative_strength` already follows.
+
+### 18c. Checked for edge BEFORE enabling it
+
+Using the forward-outcome loop built earlier the same day (§17d) — which
+is the point of having built it. Scoring every minute of both live
+sessions under the fixed design and resolving the underlying's next 90
+minutes:
+
+| band | n | avg forward move | correct direction |
+|---|---|---|---|
+| all | 10,277 | +0.017% | **47.0%** |
+| \|score\| >= 0.5 | 1,938 | +0.115% | **52.3%** |
+| \|score\| >= 0.9 | 295 | +0.405% | **62.0%** |
+| OI buildup (conviction 1.0) | 6,710 | +0.035% | 48.8% |
+| OI unwind (conviction 0.5) | 3,567 | -0.018% | 43.7% |
+
+**Monotone in score — the opposite of the confluence confidence §17d
+condemned.** The buildup/unwind split is also correctly signed, so the
+1.0-vs-0.5 conviction weighting the module docstring asserts is real
+rather than decorative.
+
+Same caveat as §17d and it is not a small one: **two sessions**, and
+minute-spaced rows share nearly all of their forward window, so the 295
+rows in the top band are a handful of independent episodes, not 295
+observations. This is enough to justify enabling a dead detector. It is
+not enough to build position sizing on.
+
+### 18d. Live-verified, and what it changes
+
+Smoke-tested against real recorded data at three instants across
+2026-08-12 for TCS/INFY/RELIANCE: **`detectors=4` on all nine**, against
+the 3.00 that had been invariant for 20,399 signals. Scores span
+-1.0000 to +0.8531 with a healthy spread — one saturation (TCS 11:00,
+during the move that made trade 62 +106%), not a constant. The new family
+visibly does real work: at 14:30 it moves TCS from a 3-family consensus
+to no direction at all.
+
+NSE engines restarted onto `b461465` at 18:37 IST against a closed
+market. 500 tests, ruff/mypy clean.
+
+**`min_confidence` will drift again, and this time it is expected rather
+than discovered.** Confidence is the weighted mean of `|score|` over the
+*agreeing* families, so a fourth family with modest scores (median
+`|score|` ~0.15-0.30) both establishes direction more often and pulls the
+mean down. §17c's freshly re-sited 0.60/0.61 are therefore measured
+against a three-family distribution that no longer exists. **Re-measure
+both after 2026-08-13's close** — the same weekly cadence the config
+comments already commit to. One session of mis-sited gates on a paper
+book is the acceptable, known cost of getting a real distribution;
+§17c is the proof that predicting it offline does not work.
+
+### 18e. The US hazard is now closed, by halting rather than by tuning
+
+Both US segments were **breaker-TRIPPED** this evening (user-approved),
+`MANUAL_HALT`, on §15i's standing recommendation — LSE publishes no order
+book on any of 541,234 recorded quotes, so every US fill is modelled
+against an assumption with nothing to calibrate it. That also disposes of
+§16f/§17g's restart hazard as a side effect: a tripped breaker refuses
+entries regardless of which scorer the process loads, so the US engines
+coming up on new code with old-distribution gates can no longer produce a
+trade. The hazard is closed by the halt, not by the recalibration that
+was never done.
+
+`kairodex-ingest-{nse,us}` were also restarted, so §14e-bis's feed_health
+liveness fix is finally running rather than merely committed.
