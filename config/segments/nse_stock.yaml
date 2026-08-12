@@ -18,15 +18,23 @@ min_liquidity_score: 0.3
 reentry_cooldown_minutes: 30
 
 # Minimum confluence score to spend a concurrent slot on, set at this
-# segment's OWN p75. RECALIBRATED 2026-08-11 (was 0.35) — mandatory, not
-# optional: §16's trend_structure rescale and the 0.20 agreement threshold
-# both move the confidence distribution, so the old 0.35 (p75 of the OLD
-# distribution) would have passed nearly everything. New p75 = 0.7117,
-# measured by replaying all 18,977 real nse_stock signals through the new
-# scorer. Still a percentile of a live distribution, NOT an outcome-fitted
-# number — no closed trade under the current ruleset exists yet to fit against
-# (all 15 prior NSE trades are pre-hardening; 14 would now be gate-rejected).
-min_confidence: 0.71
+# segment's OWN p75.
+#
+# RE-SITED 2026-08-12 (was 0.71) against the LIVE post-deploy distribution
+# instead of the replayed one. §16b fitted 0.7117 by replaying stored
+# `signals.evidence` through the new scorer — the best surface available on
+# 08-11, and it did not survive contact: two real sessions under the new
+# scorer (n=2,256) measure p50 0.4269 / p75 0.6041 / p90 0.7357, so 0.71 was
+# sitting at roughly the 85th percentile, materially stricter than the p75
+# the number was supposed to be. Now 0.60.
+#
+# The point of the p75 convention is that selectivity stays fixed while the
+# scorer drifts, so this gets re-measured against live signals weekly rather
+# than fitted once. Note the direction of this particular move: it LOOSENS
+# the gate. That is the convention being applied honestly, not evidence that
+# more flow is better — whether confidence predicts anything at all is the
+# open question `backtest.backfill` exists to answer (PROGRESS.md §17).
+min_confidence: 0.60
 
 # --- P7 hardening (2026-08-10), all derived from the first ten closed
 # trades and the 33k signals behind them. See PROGRESS.md §15.

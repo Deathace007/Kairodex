@@ -248,6 +248,43 @@ async def _fetch_history(market: Market, start: datetime.date, end: datetime.dat
         await client.aclose()
 
 
+@backtest_app.command("backfill-outcomes")
+def backfill_outcomes_cmd(
+    segment: Segment = typer.Option(..., help="nse_stock, nse_index, us_stock, or us_index"),
+    since: str = typer.Option(..., help="YYYY-MM-DD — only signals at/after this date"),
+    horizon: int = typer.Option(90, help="forward 1m bars to resolve over (engine's own 90)"),
+    overwrite: bool = typer.Option(False, help="re-resolve rows that already have an outcome"),
+) -> None:
+    """Fill `signals.forward_outcome` for live signals by walking each
+    one's underlying forward over its own 1m bars — see
+    `backtest/backfill.py` for what this measures and, importantly, what
+    it does not (direction resolution in ATR units, never option P&L)."""
+    start = datetime.datetime.combine(
+        datetime.date.fromisoformat(since), datetime.time.min, tzinfo=datetime.UTC
+    )
+    asyncio.run(_backfill_outcomes(segment, start, horizon, overwrite))
+
+
+async def _backfill_outcomes(
+    segment: Segment, since: datetime.datetime, horizon: int, overwrite: bool
+) -> None:
+    from kairodex.backtest.backfill import backfill_forward_outcomes
+
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        stats = await backfill_forward_outcomes(
+            session,
+            segment=segment,
+            since=since,
+            max_holding_bars=horizon,
+            overwrite=overwrite,
+        )
+    typer.echo(
+        f"{segment.value}: scanned={stats.scanned} written={stats.written} "
+        f"unresolved={stats.unresolved} no_bars={stats.no_bars} no_atr={stats.no_atr}"
+    )
+
+
 @backtest_app.command("run")
 def backtest_run_cmd(
     segment: Segment = typer.Option(..., help="nse_stock, nse_index, us_stock, or us_index"),

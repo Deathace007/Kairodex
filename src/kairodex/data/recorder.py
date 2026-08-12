@@ -470,13 +470,21 @@ async def ws_stream_loop(
             if pending:
                 n = await write_option_quotes_batch(session, pending)
                 logger.debug("flushed %d ticks for %s", n, provider)
-            await update_feed_health(
-                session,
-                provider,
-                connected=connected,
-                last_message_at=datetime.datetime.now(datetime.UTC),
-                subscribed_count=len(instrument_ids),
-            )
+            # `last_message_at` moves only when a tick actually arrived, and
+            # `subscribed_count` drops to 0 while disconnected. Both used to
+            # be written unconditionally on every flush, which is the
+            # false-positive §1 gotcha #10 warned about: through five days of
+            # the WS handshake being refused outright, the dashboard still
+            # read "last message 2m ago" beside 1237 subscribed instruments,
+            # because the heartbeat fired regardless of whether any data
+            # flowed. A liveness column that ticks on a timer isn't liveness.
+            fields: dict[str, object] = {
+                "connected": connected,
+                "subscribed_count": len(instrument_ids) if connected else 0,
+            }
+            if pending:
+                fields["last_message_at"] = datetime.datetime.now(datetime.UTC)
+            await update_feed_health(session, provider, **fields)
 
     async def periodic_flush() -> None:
         # Runs as an independent task against its own session, purely so a

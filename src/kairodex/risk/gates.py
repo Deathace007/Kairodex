@@ -208,13 +208,23 @@ def correlation_cluster_gate(
     underlying-vs-underlying). Also enforces the anti-revenge rule (§11's
     controls list, not in the doc's numbered gate order — see module
     docstring for why it lives here): no re-entry on the same underlying
-    within `reentry_cooldown_minutes` of a loss on it."""
+    within `reentry_cooldown_minutes` of *any* close on it.
+
+    That used to read "of a loss on it", and the asymmetry cost real
+    money on 2026-08-12. Trade 62 (TCS 2340 P) closed +Rs 4,020 at its
+    profit target at 12:00:08; trade 63 (TCS 2280 P, same underlying,
+    same direction) opened at 12:01:08 -- the very next tick, because a
+    winning close populated nothing and so blocked nothing -- and lost
+    -Rs 4,343. The risk being managed here is re-entering a move you
+    just exited, and that risk does not care which side of zero the exit
+    landed on. The loss-only version was a revenge-trading guard, which
+    is a strictly smaller idea than the one this gate needs to be."""
     if proposal.underlying_symbol in account.open_underlyings:
         return GateResult("correlation_cluster", False, "ALREADY_OPEN_ON_UNDERLYING")
-    last_loss = account.last_loss_ts_by_underlying.get(proposal.underlying_symbol)
-    if last_loss is not None:
+    last_close = account.last_close_ts_by_underlying.get(proposal.underlying_symbol)
+    if last_close is not None:
         cooldown = datetime.timedelta(minutes=config.reentry_cooldown_minutes)
-        if now - last_loss < cooldown:
+        if now - last_close < cooldown:
             return GateResult("correlation_cluster", False, "REENTRY_COOLDOWN_ACTIVE")
     return GateResult("correlation_cluster", True)
 

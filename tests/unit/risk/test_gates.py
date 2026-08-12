@@ -48,7 +48,7 @@ def _account(**overrides: object) -> AccountState:
         open_positions_count=0,
         open_underlyings=frozenset(),
         total_exposure=Decimal(0),
-        last_loss_ts_by_underlying={},
+        last_close_ts_by_underlying={},
         session_open=True,
     )
     return dataclasses.replace(base, **overrides)  # type: ignore[arg-type]
@@ -166,9 +166,22 @@ def test_correlation_cluster_same_underlying_already_open():
 
 
 def test_correlation_cluster_reentry_cooldown():
-    """cooldown = 30 minutes; a loss 10 minutes ago is still within it."""
+    """cooldown = 30 minutes; a close 10 minutes ago is still within it."""
     ten_min_ago = _NOW - datetime.timedelta(minutes=10)
-    account = _account(last_loss_ts_by_underlying={"RELIANCE": ten_min_ago})
+    account = _account(last_close_ts_by_underlying={"RELIANCE": ten_min_ago})
+    result = run_gate_chain(_proposal(), account, _CONFIG, now=_NOW)
+    assert result.reject_stage == "correlation_cluster"
+    assert result.reject_reason == "REENTRY_COOLDOWN_ACTIVE"
+
+
+def test_reentry_cooldown_applies_after_a_WINNING_close_too():
+    """The 2026-08-12 TCS sequence, in miniature: trade 62 closed at its
+    profit target at 12:00:08 and trade 63 opened on the same underlying
+    at 12:01:08, because the cooldown map was populated from losses only.
+    A minute after a *winning* close must be refused exactly like a
+    minute after a losing one — see `correlation_cluster_gate`."""
+    one_min_ago = _NOW - datetime.timedelta(minutes=1)
+    account = _account(last_close_ts_by_underlying={"RELIANCE": one_min_ago})
     result = run_gate_chain(_proposal(), account, _CONFIG, now=_NOW)
     assert result.reject_stage == "correlation_cluster"
     assert result.reject_reason == "REENTRY_COOLDOWN_ACTIVE"
@@ -176,7 +189,7 @@ def test_correlation_cluster_reentry_cooldown():
 
 def test_correlation_cluster_cooldown_expired_passes():
     thirty_one_min_ago = _NOW - datetime.timedelta(minutes=31)
-    account = _account(last_loss_ts_by_underlying={"RELIANCE": thirty_one_min_ago})
+    account = _account(last_close_ts_by_underlying={"RELIANCE": thirty_one_min_ago})
     result = run_gate_chain(_proposal(), account, _CONFIG, now=_NOW)
     assert result.allowed
 

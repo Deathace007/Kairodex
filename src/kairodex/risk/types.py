@@ -53,7 +53,10 @@ class AccountState:
     open_positions_count: int
     open_underlyings: frozenset[str]
     total_exposure: Decimal  # sum of premium committed across open positions
-    last_loss_ts_by_underlying: dict[str, datetime.datetime] = field(default_factory=dict)
+    # Keyed on the last *close* on that underlying, win or lose. It was
+    # losses-only until 2026-08-12, which made a profitable exit a free
+    # pass to re-enter the same name on the very next tick — see gates.py.
+    last_close_ts_by_underlying: dict[str, datetime.datetime] = field(default_factory=dict)
     session_open: bool = True  # ARCHITECTURE.md §11's "session/time window" — see gates.py
 
 

@@ -12,14 +12,24 @@ min_liquidity_score: 0.3
 reentry_cooldown_minutes: 30
 
 # Minimum confluence score to spend a concurrent slot on, set at this
-# segment's OWN p75. RECALIBRATED 2026-08-11 (was 0.30) — see nse_stock.yaml
-# for why the rescale forces this. New p75 = 0.3167 from replaying all 1,422
-# real nse_index signals. The two segments' numbers are no longer ~10x apart
-# because the old gap was mostly trend_structure's broken scale; what remains
-# (0.32 vs 0.71) is real — nse_index has only two live families now that
-# relative_strength correctly abstains on an index measured against itself,
-# so its confluence mean is structurally lower than nse_stock's.
-min_confidence: 0.32
+# segment's OWN p75.
+#
+# RE-SITED 2026-08-12 (was 0.32) against the LIVE post-deploy distribution —
+# see nse_stock.yaml for the general reason. This segment is the worse miss
+# of the two: §16b's replay predicted p75 = 0.3167, but two real sessions
+# (n=114) measure p50 0.6043 / p75 0.6117, so 0.32 sat near the SECOND
+# percentile and the gate was effectively inert — 5 confidence rejections
+# out of 106 evaluations on 08-12, with the exposure cap doing all the real
+# filtering. Now 0.61.
+#
+# §16b's reasoning that nse_index is structurally lower than nse_stock
+# because only two families stay live here does not hold up live: the two
+# segments' p75s are now within 0.008 of each other. That prediction came
+# from the replay, and the replay was wrong about both segments.
+#
+# n=114 is two sessions of one index. Re-measure weekly; treat this as
+# provisional in a way the nse_stock number is not.
+min_confidence: 0.61
 
 # --- P7 hardening (2026-08-10), all derived from the first ten closed
 # trades and the 33k signals behind them. See PROGRESS.md §15.

@@ -1376,6 +1376,86 @@ for the feed — **an account/token action is needed, not a code change.**
 Cost of the outage: quote freshness drops from sub-second to 60s, which
 is what made §14a's 2s threshold catastrophic rather than merely wrong.
 
+**Re-diagnosed 12 Aug (still down, day 6).** Every remaining
+implementation-side cause Upstox support names for this 403 is now ruled
+out by direct test, so the ball is definitively not in our court:
+
+| Hypothesis | Test | Result |
+|---|---|---|
+| Single-use URL reused | fresh `authorize` per attempt | **403** |
+| Missing/mismatched handshake headers | bare / `Bearer` / `+Api-Version: 3.0` | **403** all three |
+| Wrong connect path | direct `wss://api.upstox.com/v3/feed/market-data-feed` | **403** |
+| VM's IP blocked | same handshake from a second, unrelated IP | **403** |
+| IPv6 egress vs. IPv4 whitelist | forced `-4` | **403** |
+| Token expired | valid to **2027-05-02**; REST 200 | not it |
+| Concurrent-connection limit | fresh probe between retry windows | **403** |
+
+A **bogus** `code`, and the feeder URL with **no query params at all**,
+both return the *identical* empty-bodied 403 as our real code. That was
+first read here as proof the feeder never evaluates our code at all —
+**it isn't.** Unknown paths on `wsfeeder-api.upstox.com` return **404**
+and only the feeds path returns 403, so the edge is routing and
+authenticating normally; a uniform opaque 403 for both a bogus
+credential and a valid-but-unentitled one is ordinary auth-gate
+behaviour, not an outage signature.
+
+**Resolved 12 Aug 11:50 IST: the token was regenerated, and the 403 did
+not move.** That was the one test available that separates "broken on
+Upstox's side" from "this token isn't entitled", and it came back
+negative. The fresh token serves REST fine (92 consecutive 200s, zero
+401s) and gets `authorize` 200 — then 403 at the feeder, exactly as the
+old one did. So the refusal is **not token-level**: two independent
+tokens, both REST-valid, both refused at the feed, from two IPs.
+
+That leaves an Upstox-side fault or an **account-level** feed entitlement
+that regeneration doesn't touch. Both require Upstox; neither is
+reachable from this codebase.
+
+The earlier "**401** if the Bearer token is attached" above was an
+artifact of that test reusing an already-spent single-use URL; with a
+fresh URL, attaching the Bearer gives 403 like everything else.
+
+Two things that look like the cause and are **not**, so they don't get
+chased again:
+- `/v2/user/profile` returns **UDAPI1221** ("permitted only from the
+  static IP configured in your account"). That is *expected* and
+  unrelated — Upstox documents account APIs (User, Orders, Portfolio) as
+  static-IP-gated for an Analytics Token, while market data **and
+  Websocket** are explicitly listed as *not* requiring it.
+- Analytics Tokens do support WS — Upstox staff confirmed this on the
+  community forum in response to an identical report.
+
+One other user reports the same 403 across three separate IPs starting
+**4 Aug**, unanswered by Upstox — suggestive of a server-side cause, but
+it's a single forum post and their start date doesn't match ours, so
+it's not evidence to lean on.
+
+Token regeneration is now **done and ruled out** (above). **The only
+remaining action is an Upstox support ticket**, quoting the ruled-out
+table plus the two-token result — every cause reachable from our side
+has been eliminated by direct test. Ask specifically whether the v3
+market-data-feed entitlement is enabled on the *account*, since that is
+the one thing a token regeneration would not have refreshed.
+
+### 14e-bis. The dashboard lied about it for five days — fixed
+
+Through all of the above, `feed_health.upstox` read `last message 2m
+ago` beside `1237` subscribed instruments, on a feed whose handshake was
+being refused outright. `ws_stream_loop`'s `flush()` stamped
+`last_message_at=now()` and `subscribed_count=len(instrument_ids)` on
+*every* flush — including the `flush(connected=False)` in its teardown —
+so the columns tracked "when did the loop last run" and "how many did we
+resolve, ever", not "when did data last arrive". `instrument_ids` never
+resets across reconnects, so 1237 was a fossil of the last session that
+actually streamed.
+
+This is precisely the false positive §1 gotcha #10 flagged after the
+2000-key incident ("prefer deriving liveness from an actual message
+counter, not a timer that always fires") — the lesson was written down
+but the code was never changed. Now `last_message_at` moves only when a
+flush carries real ticks, and `subscribed_count` reports 0 while
+disconnected. Fixed in the shared `flush()`, so LSE gets it too.
+
 ### 14f. `logging.basicConfig` was never called
 
 Found while checking §14a's new warning actually reaches the journal. It

@@ -109,31 +109,35 @@ async def build_account_state(
         open_underlyings = frozenset(rows)
     total_exposure = sum((t.premium_paid for t in open_trades), start=Decimal(0))
 
-    closed_losses = list(
+    # Every close, win or lose. This filtered on `Trade.net_pnl < 0` until
+    # 2026-08-12, so a profitable exit left the re-entry cooldown empty and
+    # the engine could buy the same underlying back on the next tick — which
+    # it did, turning a +Rs 4,020 TCS winner into -Rs 2,003 across three
+    # trades in one session. See `gates.correlation_cluster_gate`.
+    closed_trades = list(
         await session.scalars(
             select(Trade)
             .where(
                 Trade.segment == segment,
                 Trade.run_id.is_(None),
                 Trade.closed_at.is_not(None),
-                Trade.net_pnl < 0,
             )
             .order_by(Trade.closed_at.desc())
         )
     )
-    last_loss_ts_by_underlying: dict[str, datetime.datetime] = {}
-    if closed_losses:
-        underlying_ids = {t.underlying_id for t in closed_losses}
+    last_close_ts_by_underlying: dict[str, datetime.datetime] = {}
+    if closed_trades:
+        underlying_ids = {t.underlying_id for t in closed_trades}
         symbol_rows = await session.execute(
             select(Instrument.instrument_id, Instrument.symbol).where(
                 Instrument.instrument_id.in_(underlying_ids)
             )
         )
         symbol_by_id: dict[int, str] = {row[0]: row[1] for row in symbol_rows}
-        for t in closed_losses:  # already sorted newest-first; first write per symbol wins
+        for t in closed_trades:  # already sorted newest-first; first write per symbol wins
             symbol = symbol_by_id.get(t.underlying_id)
-            if symbol is not None and symbol not in last_loss_ts_by_underlying:
-                last_loss_ts_by_underlying[symbol] = t.closed_at  # type: ignore[assignment]
+            if symbol is not None and symbol not in last_close_ts_by_underlying:
+                last_close_ts_by_underlying[symbol] = t.closed_at  # type: ignore[assignment]
 
     session_open = await is_session_open(session, segment.market, now)
 
@@ -151,6 +155,6 @@ async def build_account_state(
         open_positions_count=len(open_trades),
         open_underlyings=open_underlyings,
         total_exposure=total_exposure,
-        last_loss_ts_by_underlying=last_loss_ts_by_underlying,
+        last_close_ts_by_underlying=last_close_ts_by_underlying,
         session_open=session_open,
     )
