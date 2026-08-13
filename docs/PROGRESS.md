@@ -1,6 +1,6 @@
 # Kairodex — Development Progress
 
-**Last updated:** 2026-08-12
+**Last updated:** 2026-08-14
 **Current phase:** P1 (The Recorder) is done pending the unattended
 5-session check (§7). P2 (Pricing & features) is functionally complete
 (§8). **P3 (Engine & paper execution) is functionally complete and
@@ -91,8 +91,23 @@ in one session), and finally populated `signals.forward_outcome` — 21,128
 NSE signals resolved against their own forward bars. **That measurement
 says the confluence scorer's confidence is anti-predictive**: every
 confidence filter makes the forward outcome worse than the unfiltered
-baseline. See §17d before tuning any threshold. **A US restart hazard is
-armed — see §17g.**
+baseline. See §17d before tuning any threshold.
+
+**§19 (P7-B) is the current frontier, and it changes what to work on.**
+Confidence being anti-predictive is now confirmed **out-of-sample**, and
+it is not the confluence aggregation — *each detector is individually
+inverted at its own extremes*. `oi_price_flow` did not reproduce §18c's
+edge once scored on the same metric as everything else, and the one
+literature-backed replacement hypothesis (intraday momentum) was tested
+and rejected before any code was written. **No detector in this system
+has demonstrated positive edge.** Three changes shipped on the exit side
+instead, where the evidence is real: stop 30%->20%, partial rungs
+(0.5,1,2)R -> (2,)R, scratch 90->45 min — one coupled decision, since R
+*is* the stop distance. `min_confidence` is retired as a quality filter
+and relabelled a volume throttle; the weekly p75 re-siting ritual is
+over. **Read §19b and §19c before proposing any scorer work.**
+The US restart hazard §17g armed was closed by §18e's halt, not by
+tuning; §19a adds a second, independent reason `us_index` cannot trade.
 
 > Read this file first, every session. Update it whenever a phase
 > completes, a decision changes, or a command/location changes. Deeper
@@ -2618,3 +2633,233 @@ a decision rather than an oversight.
 | `api` | current (18:5x IST) | config block correct again |
 | `frontend` | 08-07 | no `frontend/` commits since; current by inspection |
 | `jobs` | current | untouched by any of today's work |
+
+---
+
+## 19. P7-B — exits set from outcomes, and the scorer condemned (2026-08-14)
+
+Prompted by "analyze why US takes no trades" and "what should we do to
+harden both NSE segments." Both answers turned out to be the opposite of
+what the symptoms suggested.
+
+### 19a. US: nothing is broken, the halt is doing its job
+
+Both segments read `breaker_status = TRIPPED`, `MANUAL_HALT`, since
+§18e. On 08-13 that produced 1,072 `BREAKER_TRIPPED` rejections on
+`us_stock`. There is no bug to fix on the entry path.
+
+The halt's *reason* re-verified today rather than recalled — §15i's
+numbers have not moved:
+
+| writer | rows / 24h | bid | ask | bid_sz | ltp |
+|---|---|---|---|---|---|
+| LSE REST chain | 1,323,891 | **0** | **0** | **0** | all |
+| LSE WS stream | 1,310,240 | **0** | **0** | **0** | all |
+| Upstox NSE (same window) | 7,528,971 | 7,528,913 | 7,528,913 | 7,528,970 | all |
+
+The `volume` double-meaning is also unchanged (REST median 11 =
+cumulative daily; WS median 3 = that print), and `synthesize_quote`
+still divides by it. **The fix is in the data layer, not the strategy**,
+and it is the precondition for unhalting.
+
+**New, and not previously recorded: `us_index`'s gate is unreachable.**
+`min_confidence: 0.20` against 9,137 signals whose maximum confidence
+ever recorded is **0.2317** — 161 rows (1.8%) clear it, 3 trades in the
+segment's entire history. The gate sits near p98 of its own
+distribution. §17g predicted a restart would leave US gates "wide open";
+for `us_index` the new scorer moved the distribution *down* and the gate
+is now nearly closed. Left alone (the segment is halted), flagged for
+whenever US is next touched.
+
+### 19b. The scorer is anti-predictive, confirmed out-of-sample
+
+§17d measured this on 19,729 `nse_stock` signals. It now reproduces on
+the independent 08-13 session (n=1,019, backfilled this session — 08-13
+was entirely unscored, the whole first session with FLOW live):
+
+| conf band | n | target hit | avg return (ATR) |
+|---|---|---|---|
+| 0.20-0.40 | 437 | 30.2% | -0.094 |
+| 0.40-0.60 | 387 | 30.2% | -0.093 |
+| 0.60-0.80 | 169 | **23.1%** | -0.308 |
+| >= 0.80 | 7 | **14.3%** | -0.571 |
+
+**And it is not the aggregation — each detector is individually
+inverted**, joining stored per-detector `evidence` against
+`forward_outcome` (baseline 33.3%):
+
+| detector | \|s\|<0.2 | \|s\|>=0.2 | \|s\|>=0.5 | \|s\|>=0.9 |
+|---|---|---|---|---|
+| `relative_strength` | 33.4% | 31.6% | 30.4% | **22.8%** |
+| `trend_structure` | 31.9% | 31.3% | 30.0% | **24.5%** |
+| `iv_skew_sentiment` | 32.3% | 30.4% | 30.5% | 31.5% |
+
+`relative_strength` sits *exactly* on the no-edge baseline when it has
+no opinion and falls to 22.8% when most certain. `iv_skew_sentiment` is
+flat everywhere — no information at any score level.
+
+### 19c. FLOW did not reproduce — §18c's metric was the problem
+
+§18c enabled `oi_price_flow` after measuring it monotone positive
+(47.0% -> 62.0% "correct direction"). On the first full session with it
+live, scored the way every other detector is scored:
+
+| \|flow score\| | n | target hit | avg return (ATR) |
+|---|---|---|---|
+| < 0.2 | 120 | 28.3% | -0.150 |
+| >= 0.2 | 644 | 28.9% | -0.134 |
+| >= 0.5 | 200 | 30.0% | -0.100 |
+| >= 0.9 | 31 | 29.0% | -0.129 |
+
+Flat, and below baseline everywhere. §18c measured *direction
+correctness over 90 minutes*; everything else is judged on *target-hit
+at 2-ATR with a 1-ATR stop*. Different metric, encouraging answer, no
+reproduction.
+
+**Rule, and it is the real lesson of this session: measure a candidate
+on the same metric the incumbents are judged on, or the comparison is
+not one.** One session is not enough to condemn FLOW; it is enough to
+stop calling it the family to build on.
+
+### 19d. Three changes shipped, from 24 closed trades
+
+Every trade closed since §15j's reset, replayed through a model of the
+real exit ladder. **The replay reproduces all 24 live exit reasons and
+lands within 11% of the real book** (-3,002 vs -2,709 actual), which is
+what makes it usable for comparing variants; it prices exits at recorded
+LTP rather than through the fill model, hence the gap.
+
+The book itself: **-Rs 2,709 over 24 trades**, 33% win rate, 1.58 payoff
+ratio against the 39% win rate that ratio needs. Short of breakeven by
+structure.
+
+**1. Exit ladder — stop 30%->20%, rungs (0.5,1,2)R -> (2,)R, scratch
+90->45 min.** These are ONE decision: `R` is the stop distance, so the
+rungs move with the stop. Rung reach across the 24: only 8 ever touched
++15% (the old first rung), 3 touched +30%, 1 touched +60% — the ladder
+halved the position on exactly the third of trades carrying the book
+while losers exited full size.
+
+Sweeney excursion analysis puts the stop where the populations actually
+separate:
+
+| measure | winners (8) median / worst | losers (16) median / worst |
+|---|---|---|
+| drawdown by 30 min | -0.8% / **-9.2%** | -7.0% / -26.6% |
+| peak reached | +26.5% / +12.2% | +3.4% / -6.2% |
+
+No winner drew down past -9.2% in its first 30 session-minutes. The 30%
+stop cut only 2 of 16 losers.
+
+Replay: **-3,002 -> +7,311**, and still **+4,026 better with both
+dominant winners deleted** — which the naive "remove the ladder" variant
+is not (that one is +8,388 headline, 87% from one trade, and fails
+leave-one-out). All sixteen cells of the surrounding stop x scratch grid
+beat the live config, so it is a plateau rather than a fit.
+
+The scratch rule was measured before being touched: removing it entirely
+gives -8,614 against -3,002, so it is worth **+Rs 5,612 as it stood**.
+It fires late, not wrongly — its +8% threshold against a median MFE of
++8.0% was a coin flip.
+
+**2. `iv_skew_sentiment` unwired** (§19b's flat row). Module and tests
+untouched — the defect is the feature (§16c's heavy tail), not the
+detector. Leaves 2-of-3 on `nse_stock`. On `nse_index` it is **2-of-2**:
+`relative_strength` reads above the 0.20 agreement threshold on **0 of
+30** recorded evaluations there, and `iv_skew` was voting on 29 of 30,
+so that segment's confluence had been carried mostly by the detector
+with no information. It will trade markedly less; intended.
+
+**3. `min_confidence` re-sited once and reframed.** `nse_stock`
+0.60 -> **0.51**, purely to hold the old 20.4% pass rate after (2)
+shifted the distribution (p75 0.5609 -> 0.5115). Both YAMLs now describe
+it as a **volume throttle, not a quality filter**, with §19b's evidence
+inline. `nse_index` deliberately **not** re-sited: 30 rows cannot site a
+gate, and 0.61 atop a 2-of-2 requirement is the conservative direction.
+
+**The weekly p75 re-siting ritual is retired.** It was fitting a
+threshold to a meter that points the wrong way.
+
+### 19e. Intraday momentum tested, and rejected
+
+The one literature-backed candidate for a replacement detector (Gao,
+Han, Li & Zhou, *JFE* 2018 — first half-hour predicts last half-hour).
+Tested on existing data **before** writing any detector, per §19c's
+rule. Session-return-so-far in ATR units vs. the traded side:
+
+| stance | \|mom\|<0.5 | >=0.5 | >=1.5 | >=3 ATR |
+|---|---|---|---|---|
+| WITH the session move | 35.0% | 31.0% | 30.9% | **29.8%** |
+| AGAINST it | 34.4% | 33.6% | 33.6% | 31.3% |
+
+Trading *with* the move is worse than *against* it at every band, and
+both decay with extension. The apparently-promising low-extension cell
+does not survive a per-session split — the only session with real n
+reads **28.0% on n=268**, and the aggregate was propped up by three
+sessions of n=39-63.
+
+**No detector was built.** What survives is one consistent negative:
+high extension is below baseline in all four sessions. That is a filter
+candidate, not an edge source — and removing it returns the population
+to ~33% baseline, which for an options *buyer* is still a loss after
+theta and spread.
+
+**The honest state after this session: no detector in this system has
+demonstrated positive edge.** Exits and cost control are the only levers
+currently backed by evidence.
+
+### 19f. A dead detector now reports itself
+
+§18a said "nothing in the system treats a registered detector having
+never fired as an error. It should." `kairodex status` now prints
+per-detector appearance counts from `signals.evidence` over 24h and
+names any that never fired.
+
+**Built twice, because the first version was wrong and running it
+against real data is what showed it.** A count-based check reported both
+US segments as "3/3 firing" while `oi_price_flow` was absent from all
+6,737 of their signals — those engines are on pre-FLOW code, so they run
+a different three: same cardinality, wrong set, reported clean. It now
+compares *names*, held in `ReferenceStrategy.detector_names` and pinned
+by a test that evaluates the real strategy and asserts the declared set
+is exactly what fires.
+
+`wired_detectors` is passed in by the CLI rather than imported, because
+`api.routers.health` also calls `build_report` and the "API is glue"
+contract forbids `kairodex.api -> kairodex.strategy -> kairodex.engine`.
+Importing it put the whole engine behind a health endpoint;
+import-linter caught it, which is the contract working.
+
+### 19g. `trades.mfe`/`mae`/`r_multiple` are dead columns, deliberately
+
+Flagged as a defect, then verified as not one: **nothing writes them and
+nothing reads them.** `analytics.loader` derives MFE/MAE at query time
+from `position_marks.unrealized` so an open trade's excursion is always
+what monitoring actually saw; `r_multiple` is a `TradeRecord` property;
+and the promotion gates read `mfe_mae_ratio` off Track A metrics, not
+these columns. Documented on the model rather than dropped — reading
+`trades` directly and finding them empty looks exactly like a bug, which
+is how this got raised.
+
+Also checked and **not** changed: §17f called `nse_index`'s
+`max_concurrent: 2` arithmetically unreachable. That is BANKNIFTY-
+specific (Rs 9,139/lot against a Rs 15,000 exposure cap); Nifty 50 at
+~Rs 2,144/lot fits twice over. Nothing to fix.
+
+### 19h. Status
+
+503 tests (4 new), ruff/mypy/import-linter clean. The one failure
+(`test_expiry_cache`) is the known date-dependent US/LSE one — verified
+failing identically on the parent commit.
+
+Deployed against a closed market, 00:19 IST. `engine-nse_stock`,
+`engine-nse_index` and **`kairodex-api`** restarted — the API because
+`config/segments/*.yaml` is `@lru_cache`d and §18f is exactly what
+skipping it costs. Verified: `GET /api/segments/nse_stock/risk` returns
+`min_confidence: 0.51`, `scratch_exit_after_minutes: 45`.
+
+**Not yet observed live.** Everything above is measured on recorded
+data; the first session under these rules is 2026-08-14. Watch two
+things: whether `nse_index` goes silent under 2-of-2 (expected, not a
+bug — a full silent week is the signal to re-measure), and whether the
+2R rung is ever reached at all.
