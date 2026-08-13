@@ -101,17 +101,18 @@ def _fmt_age(ts: datetime.datetime | None, now: datetime.datetime) -> str:
     return f"{seconds / 3600:.1f}h ago"
 
 
-async def build_report(session: AsyncSession, *, wired_detectors: int | None = None) -> str:
+async def build_report(
+    session: AsyncSession, *, wired_detectors: frozenset[str] | None = None
+) -> str:
     """`wired_detectors` is passed IN rather than read from
     `kairodex.strategy` here, and that is a layering constraint, not a
     style preference: `kairodex.api.routers.health` calls this function,
     and the "API is glue, not business logic" import contract forbids
     `kairodex.api` from reaching `kairodex.strategy`/`kairodex.engine`.
-    Importing the strategy here to count its detectors put the whole
-    engine behind a health endpoint and import-linter rejected it, which
-    is the contract doing its job. The CLI supplies the number; callers
-    that leave it `None` get the per-detector counts without the
-    is-one-dead verdict.
+    Importing the strategy here put the whole engine behind a health
+    endpoint and import-linter rejected it, which is the contract doing
+    its job. The CLI supplies the set; callers that leave it `None` get
+    the per-detector counts without the is-one-dead verdict.
     """
     now = datetime.datetime.now(datetime.UTC)
     since = now - datetime.timedelta(hours=24)
@@ -142,19 +143,26 @@ async def build_report(session: AsyncSession, *, wired_detectors: int | None = N
         lines.append("")
 
     coverage = await detector_coverage(session, since)
-    header = "detectors (24h)" if wired_detectors is None else (
-        f"detectors (24h, {wired_detectors} wired)"
+    wired = wired_detectors
+    lines.append(
+        "detectors (24h)" if wired is None else f"detectors (24h, {len(wired)} wired)"
     )
-    lines.append(header)
     if not coverage:
         lines.append("  no signals with evidence in the last 24h")
     for segment in sorted(coverage):
         seen = coverage[segment]
-        flag = ""
-        if wired_detectors is not None and len(seen) < wired_detectors:
-            flag = "  <<< A WIRED DETECTOR NEVER FIRED"
-        count = f"{len(seen)}/{wired_detectors}" if wired_detectors is not None else str(len(seen))
-        lines.append(f"  {segment}: {count} firing{flag}")
+        verdict = f"{len(seen)} firing"
+        if wired is not None:
+            missing = sorted(wired - seen.keys())
+            extra = sorted(seen.keys() - wired)
+            verdict = f"{len(wired & seen.keys())}/{len(wired)} firing"
+            if missing:
+                verdict += f"  <<< NEVER FIRED: {', '.join(missing)}"
+            if extra:
+                # Not an error on its own: a strategy change inside the
+                # lookback window leaves the old set in older rows.
+                verdict += f"  (unwired, from older rows: {', '.join(extra)})"
+        lines.append(f"  {segment}: {verdict}")
         for detector in sorted(seen):
             lines.append(f"      {detector:<22} {seen[detector]:>7} signals")
     lines.append("")

@@ -81,6 +81,21 @@ _REFERENCE_DETECTORS: tuple[Detector, ...] = (
 _REFERENCE_REQUIRED_FEATURES = frozenset(
     {"trend_state_strength", "oi_change", "relative_strength_vs_index"}
 )
+# The `Evidence.detector` label each wired detector emits. Declared here
+# rather than derived because each label is a module-private constant in
+# its own detector module, reachable only by actually calling the thing.
+# `test_protocol.py::test_declared_detector_names_match_what_fires` runs
+# them and asserts this set is exactly right, so it cannot drift.
+#
+# `kairodex status` compares this against the labels actually present in
+# `signals.evidence` to report dead detectors. Counting alone is not
+# enough and that was measured, not assumed: on 2026-08-14 both US
+# segments reported "3/3 firing" while `oi_price_flow` was absent from
+# all 6,737 of their signals — the engines are on pre-FLOW-fix code, so
+# they run a different three, and a count-based check called that clean.
+_REFERENCE_DETECTOR_NAMES = frozenset(
+    {"trend_structure", "oi_price_flow", "relative_strength"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +111,7 @@ class ReferenceStrategy:
     id: str = "reference_v1"
     detectors: tuple[Detector, ...] = field(default=_REFERENCE_DETECTORS)
     required_features: frozenset[str] = field(default=_REFERENCE_REQUIRED_FEATURES)
+    detector_names: frozenset[str] = field(default=_REFERENCE_DETECTOR_NAMES)
 
     def evaluate(self, ctx: MarketContext) -> list[Evidence]:
         evidence = []

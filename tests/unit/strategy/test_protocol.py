@@ -78,6 +78,28 @@ def test_conflicting_features_produce_no_signal():
     assert result.confidence == 0.0
 
 
+def test_declared_detector_names_match_what_fires():
+    """`ReferenceStrategy.detector_names` is a hand-written set — each
+    real label is a module-private constant inside its own detector
+    module, reachable only by calling the detector. `kairodex status`
+    compares that set against `signals.evidence` to report a detector
+    that never fired, so if the set drifts, the health check silently
+    starts looking for a name nothing emits. This makes it impossible."""
+    bars = [_bar(0, 100.0), _bar(_FLOW_SPAN, 102.0)]
+    ctx = MarketContext(
+        feature_ctx=FeatureContext(as_of=_T0, segment=Segment.NSE_INDEX, underlying_bars=bars),
+        features={
+            "trend_state_strength": 0.10,
+            "oi_change": 0.20,
+            "relative_strength_vs_index": 0.05,
+        },
+    )
+    strategy = ReferenceStrategy()
+    emitted = {e.detector for e in strategy.evaluate(ctx)}
+    assert emitted == strategy.detector_names
+    assert len(strategy.detector_names) == len(strategy.detectors)
+
+
 def test_missing_features_yield_fewer_evidence_items_not_a_crash():
     ctx = MarketContext(
         feature_ctx=FeatureContext(as_of=_T0, segment=Segment.NSE_INDEX, underlying_bars=[]),
