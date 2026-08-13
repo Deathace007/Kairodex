@@ -520,10 +520,15 @@ def status_cmd() -> None:
 
 async def _status() -> None:
     from kairodex.status import build_report
+    from kairodex.strategy.protocol import ReferenceStrategy
 
     sessionmaker = get_sessionmaker()
     async with sessionmaker() as session:
-        typer.echo(await build_report(session))
+        typer.echo(
+            await build_report(
+                session, wired_detectors=len(ReferenceStrategy().detectors)
+            )
+        )
 
 
 @app.command("jobs")

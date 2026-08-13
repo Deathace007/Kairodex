@@ -400,6 +400,25 @@ class Trade(Base):
     fees: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
     gross_pnl: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
     net_pnl: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
+    # ALWAYS NULL, deliberately — nothing in this codebase writes these
+    # three, and nothing reads them either (verified 2026-08-14). They are
+    # not a gap waiting to be filled:
+    #
+    #   - `mfe`/`mae` are derived at query time by
+    #     `analytics.loader._load_mfe_mae`, as max/min of
+    #     `position_marks.unrealized`, so an OPEN trade's excursion is
+    #     always exactly what monitoring actually saw rather than a
+    #     running approximation the engine has to remember to update. See
+    #     `analytics.types.TradeRecord`'s docstring for the reasoning.
+    #   - `r_multiple` is likewise a property on `TradeRecord`, computed
+    #     from avg_exit/avg_entry/initial_stop_price — a pure price ratio,
+    #     so partial exits changing quantity cannot distort it.
+    #   - the promotion gates read `mfe_mae_ratio` off Track A backtest
+    #     metrics, NOT off these columns.
+    #
+    # Kept rather than dropped because a migration on a live hypertable-
+    # adjacent table buys nothing here. Left documented because reading
+    # `trades` directly and finding them empty looks exactly like a bug.
     r_multiple: Mapped[Decimal | None] = mapped_column(Numeric(10, 4))
     mfe: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
     mae: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
