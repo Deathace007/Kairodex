@@ -11,24 +11,30 @@ exposure_cap_pct: 0.30
 min_liquidity_score: 0.3
 reentry_cooldown_minutes: 30
 
-# Minimum confluence score to spend a concurrent slot on, set at this
-# segment's OWN p75.
+# A VOLUME THROTTLE, not a quality filter — see nse_stock.yaml for the
+# forward-outcome evidence that confidence is anti-predictive, and for why
+# the weekly p75 re-siting ritual is retired.
 #
-# RE-SITED 2026-08-12 (was 0.32) against the LIVE post-deploy distribution —
-# see nse_stock.yaml for the general reason. This segment is the worse miss
-# of the two: §16b's replay predicted p75 = 0.3167, but two real sessions
-# (n=114) measure p50 0.6043 / p75 0.6117, so 0.32 sat near the SECOND
-# percentile and the gate was effectively inert — 5 confidence rejections
-# out of 106 evaluations on 08-12, with the exposure cap doing all the real
-# filtering. Now 0.61.
+# DELIBERATELY NOT RE-SITED on 2026-08-14, while nse_stock moved 0.60 ->
+# 0.51. Unwiring `iv_skew_sentiment` hits this segment much harder than
+# nse_stock, and the sample here cannot support fitting a new number:
 #
-# §16b's reasoning that nse_index is structurally lower than nse_stock
-# because only two families stay live here does not hold up live: the two
-# segments' p75s are now within 0.008 of each other. That prediction came
-# from the replay, and the replay was wrong about both segments.
+#   - only 30 evaluations were recorded on 08-13, of which 11 still produce
+#     a direction once VOLATILITY is dropped;
+#   - `iv_skew` was voting on 29 of those 30 (97%), so it had been carrying
+#     most of this segment's confluence — with zero measured information;
+#   - `relative_strength` reads above the 0.20 agreement threshold on 0 of
+#     30, so this segment is now effectively 2-of-2: structure and flow must
+#     agree unanimously.
 #
-# n=114 is two sessions of one index. Re-measure weekly; treat this as
-# provisional in a way the nse_stock number is not.
+# Leaving the gate at 0.61 on top of a 2-of-2 requirement makes nse_index
+# markedly quieter. That is the conservative direction and it is intended:
+# four closed nse_index trades since the 08-11 reset are -Rs 1,616 net, so
+# trading less here costs nothing that has been demonstrated. Fitting 0.294
+# (the pass-rate-preserving value) on 30 rows would be noise-fitting.
+#
+# WATCH THIS: if nse_index goes silent for a full week, that is the signal
+# to re-measure on a real sample — not a bug to chase.
 min_confidence: 0.61
 
 # --- P7 hardening (2026-08-10), all derived from the first ten closed
@@ -45,10 +51,12 @@ entry_warmup_minutes: 20
 # having given them only two real sessions.
 max_holding_sessions: 3
 
-# Every closed trade that ever reached +10% did so within 82 session-
-# minutes; the four that never worked at all (best excursion +0.7%,
-# +2.3%, +0.2%, -5.0%) rode to a -30% stop for 92% of all losses.
-scratch_exit_after_minutes: 90
+# Leave a position that has had time to work and hasn't. 90 -> 45 on
+# 2026-08-14 — see nse_stock.yaml for the measurement. The evidence is
+# almost entirely nse_stock's (4 nse_index trades in the sample), and the
+# window is kept in step across both NSE segments deliberately rather
+# than fitted twice on samples that cannot support it.
+scratch_exit_after_minutes: 45
 scratch_exit_min_mfe_pct: 0.08
 
 # No new entries this close to the bell. Everything is intraday (user's

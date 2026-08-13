@@ -1,6 +1,8 @@
 """Strategy protocol (ARCHITECTURE.md §10) and a reference implementation
-bundling this session's four detectors — one per confluence family, enough
-to prove the framework fires (and correctly refuses to fire) end to end.
+bundling three of this codebase's four detectors — one per confluence
+family except VOLATILITY, whose detector was unwired on 2026-08-14 after
+it measured flat against forward outcomes at every score band (see
+`_REFERENCE_DETECTORS` for the numbers and the route back).
 
 `manage`'s implementation here just delegates to
 `kairodex.engine.monitor.evaluate_exits` — that function only needs a
@@ -25,7 +27,6 @@ from kairodex.engine.monitor import Position, evaluate_exits
 from kairodex.strategy.detectors.flow import oi_price_flow_detector
 from kairodex.strategy.detectors.relative_strength import relative_strength_detector
 from kairodex.strategy.detectors.structure import trend_structure_detector
-from kairodex.strategy.detectors.volatility import iv_skew_detector
 from kairodex.strategy.types import Evidence, MarketContext
 
 Detector = Callable[[MarketContext], Evidence | None]
@@ -42,25 +43,55 @@ class Strategy(Protocol):
     def manage(self, pos: Position, ctx: MarketContext) -> MonitorExitDecision | None: ...
 
 
+# `iv_skew_detector` is deliberately NOT here, from 2026-08-14. The
+# module and its tests are untouched — it is unwired, not deleted —
+# because what is broken is the feature it reads, not the translation
+# from feature to score.
+#
+# Measured over 19,729 nse_stock signals joined against their own
+# `signals.forward_outcome` (PROGRESS.md §19), against a 33.3% no-edge
+# baseline for the 1-ATR-stop/2-ATR-target resolver:
+#
+#   |score| < 0.2 : 32.3% target hit, -0.029 ATR
+#   |score| >= 0.2: 30.4%            , -0.089
+#   |score| >= 0.5: 30.5%            , -0.085
+#   |score| >= 0.9: 31.5%            , -0.055
+#
+# Flat and slightly negative at every band — no information at any score
+# level, while casting a full confluence vote. It reproduced flat on the
+# independent 08-13 session too. §16c had already found the shape
+# problem behind it (27.5% of readings below 0.01, 33.2% saturated above
+# 0.99, from put IV - call IV with one leg occasionally garbage) and
+# correctly called it a feature defect rather than a constant to retune.
+# Fix `features/compute/iv.py::iv_skew` and re-wire this; until then a
+# vote with no information is worse than no vote.
+#
+# Consequence worth stating: this leaves three families, so
+# `min_families: 2` is 2-of-3 on nse_stock. On nse_index it is 2-of-2 —
+# `relative_strength` measures an index against itself and reads above
+# the 0.20 agreement threshold on 0 of 30 recorded evaluations there, so
+# that segment now requires structure and flow to agree unanimously. It
+# will trade markedly less; that is intended, not a regression. No
+# `if segment ==` anywhere — the agreement floor does it, per §16a.
 _REFERENCE_DETECTORS: tuple[Detector, ...] = (
     trend_structure_detector,
     oi_price_flow_detector,
-    iv_skew_detector,
     relative_strength_detector,
 )
 _REFERENCE_REQUIRED_FEATURES = frozenset(
-    {"trend_state_strength", "oi_change", "iv_skew", "relative_strength_vs_index"}
+    {"trend_state_strength", "oi_change", "relative_strength_vs_index"}
 )
 
 
 @dataclass(frozen=True, slots=True)
 class ReferenceStrategy:
-    """One detector per family (structure/flow/volatility/relative-strength)
-    — exercises the confluence requirement for real rather than trivially
-    (a strategy with detectors from only 1-2 families could never
-    demonstrate "single-family agreement can never fire" meaning
-    anything). Not tuned or backtested; it exists to prove the pipeline
-    wiring, not to trade well."""
+    """One detector per family across structure/flow/relative-strength —
+    still enough families to exercise the confluence requirement for real
+    rather than trivially (a strategy with detectors from only one family
+    could never demonstrate "single-family agreement can never fire"
+    meaning anything). VOLATILITY is unwired, not missing — see
+    `_REFERENCE_DETECTORS`. Not tuned or backtested; it exists to prove
+    the pipeline wiring, not to trade well."""
 
     id: str = "reference_v1"
     detectors: tuple[Detector, ...] = field(default=_REFERENCE_DETECTORS)

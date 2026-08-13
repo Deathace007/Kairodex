@@ -52,23 +52,54 @@ from kairodex.strategy.types import MarketContext
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_STOP_LOSS_PCT = 0.30  # ponytail: first-pass — a 30%-of-premium
-# stop is a common simple options-buying convention; recalibrate once
-# backtesting can measure it against real outcomes, per position sizing.
+# 0.30 -> 0.20 on 2026-08-14, the first time this was set from outcomes
+# rather than convention. Sweeney-style excursion analysis over the 24 NSE
+# trades closed since the 08-11 reset (PROGRESS.md §19): no winner ever
+# drew down more than 9.2% in its first 30 session-minutes, while losers
+# reached -26.6%; every winner reached at least +12.2% MFE against a
+# median loser peak of +3.4%. A 30% stop sits far outside the region where
+# the two populations separate — it cut only 2 of 16 losers, leaving the
+# rest to the scratch rule 90 minutes later.
+#
+# MUST be changed together with `_DEFAULT_R_MULTIPLE_TARGETS` below: R is
+# defined as the stop distance, so every partial-exit rung moves with this
+# number. Tightening the stop alone silently tightens profit-taking too,
+# which is why "tighter stop" on its own measured WORSE in replay
+# (-5,297 vs -3,002) while the same stop with the ladder widened measured
+# better (+7,311).
+_DEFAULT_STOP_LOSS_PCT = 0.20
 _DEFAULT_MAX_QUOTE_AGE_MS = 2000
 _DEFAULT_PROFIT_TARGET_PCT = 1.0  # ponytail: exit at 2x entry premium
 # (100% gain) — first-pass, same status as the stop-loss/target-delta
 # constants above: a common options-buying convention, not backtested yet.
-# Partial exits at 0.5R/1R/2R. 1R was the first rung until 2026-08-10,
-# which with a 30%-of-premium stop means +30% of premium before anything
-# is banked — and the first ten closed trades say that is too far out to
-# reach. Every trade that worked topped out between +14.8% and +42.8%
-# (median ~25%), so only two of six ever touched +30%, while all six
-# cleared +14.8%. A 0.5R rung banks half the position at roughly the
-# median winner's own peak instead of watching most of them round-trip:
-# trade 9 (Nifty 24650 C) reached +14.8%, had no rung below +30% to hit,
-# and closed at -Rs 411.
-_DEFAULT_R_MULTIPLE_TARGETS = (0.5, 1.0, 2.0)
+# Partial exits at 2R only, from 2026-08-14. The history matters here
+# because this rung has now moved twice on opposite evidence:
+#
+#   - until 2026-08-10 the first rung was 1R (+30% of premium at the then
+#     30% stop), judged too far out to reach on the first ten trades;
+#   - 2026-08-10 added 0.5R/1R/2R, banking half the position at +15%;
+#   - 2026-08-14 removes everything below 2R, on 24 closed trades.
+#
+# What the 24 trades say (PROGRESS.md §19): only 8 of 24 ever reached
+# +15%, 3 reached +30%, and 1 reached +60%. The ladder therefore halved
+# the position on precisely the third of trades that carry the entire
+# book, while every loser exited at full size — an inverted payoff on an
+# options-buying strategy, whose whole premise is convexity. Trade 62
+# (TCS) is the clearest case: 12 of its 13 lots were sold inside 7
+# minutes and the last lot ran to +106%.
+#
+# 2R against the 20% stop above fires at +40% of premium. Deliberately
+# NOT expressed as a percentage: R-multiples are the correct unit for
+# risk-relative profit-taking, and a second unit system here would be one
+# more thing to keep in sync. The coupling is real and is documented on
+# `_DEFAULT_STOP_LOSS_PCT` instead.
+#
+# Honest limit: removing the ladder outright is worth +Rs 8,388 in replay
+# but 87% of that is one trade, and it fails a leave-one-out check. The
+# 2R-only variant, paired with the 20% stop and the 45-minute scratch
+# window, beats the live ruleset even with the two dominant winners
+# deleted (+4,026), which is why this is the shape that shipped.
+_DEFAULT_R_MULTIPLE_TARGETS = (2.0,)
 # Theta guard in SESSION seconds now, not wall-clock — the per-segment
 # `max_holding_sessions` knob converts. Kept as the fallback for a trade
 # row written before that config existed.

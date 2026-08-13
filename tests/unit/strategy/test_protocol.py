@@ -29,7 +29,12 @@ def test_strongly_bullish_features_produce_a_buy_signal():
     features = {
         "trend_state_strength": 0.10,  # strong uptrend
         "oi_change": 0.20,  # buildup, agrees with the up-move -> full conviction
-        "iv_skew": -8.0,  # calls richer than puts -> bullish
+        # `iv_skew` is deliberately still supplied. The VOLATILITY detector
+        # was unwired on 2026-08-14 (see protocol._REFERENCE_DETECTORS), and
+        # leaving the feature in the dict pins the thing that matters: the
+        # strategy no longer reads it. If it is ever re-wired, this test
+        # starts reporting 4 and says so.
+        "iv_skew": -8.0,
         "relative_strength_vs_index": 0.05,  # outperforming
     }
     ctx = MarketContext(
@@ -38,28 +43,39 @@ def test_strongly_bullish_features_produce_a_buy_signal():
     )
     strategy = ReferenceStrategy()
     evidence = strategy.evaluate(ctx)
-    assert len(evidence) == 4  # every detector fired
+    assert len(evidence) == 3  # structure + flow + relative-strength
+    assert {e.family.value for e in evidence} == {"structure", "flow", "relative_strength"}
 
     result = ConfluenceScorer().score(evidence)
     assert result.direction is Side.BUY
-    assert len(result.agreeing_families) == 4
+    assert len(result.agreeing_families) == 3
     assert result.confidence > 0.5
 
 
 def test_conflicting_features_produce_no_signal():
-    bars = [_bar(0, 100.0), _bar(_FLOW_SPAN, 101.0)]
+    """With three families and `min_families=2`, abstention is the case
+    where no side reaches two — one bullish, one bearish, one with no
+    real opinion. The pre-2026-08-14 version of this test relied on the
+    VOLATILITY family to supply the second bearish vote; without it, the
+    same feature values would resolve 2-1 to BUY rather than abstain, so
+    the conflict is now built from the families that actually vote."""
+    # +0.05% over the flow window: real, but below the scorer's own 0.20
+    # agreement threshold once scaled, so FLOW holds no opinion.
+    bars = [_bar(0, 100.0), _bar(_FLOW_SPAN, 100.05)]
     features = {
         "trend_state_strength": 0.10,  # bullish
-        "oi_change": -0.20,  # covering, weak bullish
-        "iv_skew": 8.0,  # bearish
+        "oi_change": 0.20,  # buildup, but the price leg is ~flat
         "relative_strength_vs_index": -0.05,  # bearish
     }
     ctx = MarketContext(
         feature_ctx=FeatureContext(as_of=_T0, segment=Segment.NSE_INDEX, underlying_bars=bars),
         features=features,
     )
-    result = ConfluenceScorer().score(ReferenceStrategy().evaluate(ctx))
+    evidence = ReferenceStrategy().evaluate(ctx)
+    assert len(evidence) == 3  # all three fired — they just do not agree
+    result = ConfluenceScorer().score(evidence)
     assert result.direction is None
+    assert result.confidence == 0.0
 
 
 def test_missing_features_yield_fewer_evidence_items_not_a_crash():

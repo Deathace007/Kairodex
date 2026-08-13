@@ -17,24 +17,40 @@ exposure_cap_pct: 0.40
 min_liquidity_score: 0.3
 reentry_cooldown_minutes: 30
 
-# Minimum confluence score to spend a concurrent slot on, set at this
-# segment's OWN p75.
+# A VOLUME THROTTLE, not a quality filter. Read this before moving it.
 #
-# RE-SITED 2026-08-12 (was 0.71) against the LIVE post-deploy distribution
-# instead of the replayed one. §16b fitted 0.7117 by replaying stored
-# `signals.evidence` through the new scorer — the best surface available on
-# 08-11, and it did not survive contact: two real sessions under the new
-# scorer (n=2,256) measure p50 0.4269 / p75 0.6041 / p90 0.7357, so 0.71 was
-# sitting at roughly the 85th percentile, materially stricter than the p75
-# the number was supposed to be. Now 0.60.
+# `backtest.backfill` has now answered the question §17 left open, and the
+# answer is that confidence has NEGATIVE predictive value. Over 19,729
+# nse_stock signals resolved against their own forward bars, against a
+# 33.3% no-edge baseline:
 #
-# The point of the p75 convention is that selectivity stays fixed while the
-# scorer drifts, so this gets re-measured against live signals weekly rather
-# than fitted once. Note the direction of this particular move: it LOOSENS
-# the gate. That is the convention being applied honestly, not evidence that
-# more flow is better — whether confidence predicts anything at all is the
-# open question `backtest.backfill` exists to answer (PROGRESS.md §17).
-min_confidence: 0.60
+#   all signals    31.8% target hit
+#   conf >= 0.60   29.5%
+#   conf >= 0.80   20.2%
+#
+# Confirmed OUT-OF-SAMPLE on the independent 08-13 session (n=1,019):
+# 0.60-0.80 -> 23.1%, >= 0.80 -> 14.3%. Every filter on this quantity makes
+# the forward outcome worse, monotonically. The mechanism (PROGRESS.md §17d)
+# is that confidence is monotone in *extension*, so the scorer is most
+# certain exactly where an intraday move is most stretched — an extension
+# meter, not an edge estimate.
+#
+# So this number does not select good trades and cannot be made to. What it
+# still does, and what it is kept for, is cap how many evaluations reach the
+# risk gates per session. That is worth having: at zero edge, more trades is
+# just more theta and more spread.
+#
+# RE-SITED ONCE on 2026-08-14, 0.60 -> 0.51, for one reason only: unwiring
+# `iv_skew_sentiment` shifted the confidence distribution down (p75 0.5609 ->
+# 0.5115 over the 1,335 recorded 08-13 evaluations), and 0.51 holds the SAME
+# 20.4% pass rate the old gate had. Throttle maintenance after a scorer
+# change, not a quality judgement.
+#
+# THE WEEKLY p75 RE-SITING RITUAL IS RETIRED. It was fitting a threshold to
+# a meter now twice-confirmed to point the wrong way, and it cost a session
+# of work each time. Move this number only when the scorer itself changes,
+# and then only to preserve the pass rate.
+min_confidence: 0.51
 
 # --- P7 hardening (2026-08-10), all derived from the first ten closed
 # trades and the 33k signals behind them. See PROGRESS.md §15.
@@ -50,10 +66,21 @@ entry_warmup_minutes: 20
 # having given them only two real sessions.
 max_holding_sessions: 3
 
-# Every closed trade that ever reached +10% did so within 82 session-
-# minutes; the four that never worked at all (best excursion +0.7%,
-# +2.3%, +0.2%, -5.0%) rode to a -30% stop for 92% of all losses.
-scratch_exit_after_minutes: 90
+# Leave a position that has had time to work and hasn't.
+#
+# 90 -> 45 on 2026-08-14. The rule is the single most valuable one in the
+# system: replaying the 24 trades closed since the 08-11 reset with it
+# REMOVED and everything else held gives -Rs 8,614 against -Rs 3,002 with
+# it, so it is worth +Rs 5,612 as it stands. But it fires late. Its
+# threshold is +8% MFE and the median trade's MFE is +8.0% — it was
+# deciding at a coin flip. Ten of the 24 peaked within 15 minutes at a
+# trivial level and then bled for another 75 before the rule released
+# them. Every (stop x scratch) cell tested improves at 45 minutes.
+#
+# The +8% threshold is deliberately unchanged: 45 minutes is the knob the
+# evidence speaks to, and moving both at once would leave neither
+# attributable. Re-measure the threshold separately.
+scratch_exit_after_minutes: 45
 scratch_exit_min_mfe_pct: 0.08
 
 # No new entries this close to the bell. Everything is intraday (user's
