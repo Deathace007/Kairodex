@@ -1,6 +1,6 @@
 # Kairodex — Development Progress
 
-**Last updated:** 2026-08-14
+**Last updated:** 2026-08-14 (evening — §20)
 **Current phase:** P1 (The Recorder) is done pending the unattended
 5-session check (§7). P2 (Pricing & features) is functionally complete
 (§8). **P3 (Engine & paper execution) is functionally complete and
@@ -93,7 +93,22 @@ says the confluence scorer's confidence is anti-predictive**: every
 confidence filter makes the forward outcome worse than the unfiltered
 baseline. See §17d before tuning any threshold.
 
-**§19 (P7-B) is the current frontier, and it changes what to work on.**
+**§20 (P7-C) is the current frontier.** The first live session under §19's
+rules closed -Rs 2,729 on 10 trades, and the largest loss driver was not
+the strategy: `max_premium_pct` (0.35) binds below the risk-budget
+notional (0.40x equity) while `exposure_cap_pct` is 0.40, so every trade
+asks for 35% of capital, `max_concurrent: 5` is unreachable, and position
+size carries **zero** information (`corr(notional, return) = -1.2%` across
+115x dispersion). The engine also **stored no features** — 2 rows in
+`feature_vectors`, `feature_vector_id` NULL on all 79,209 signals — which
+is what made "learn from past decisions" impossible rather than unbuilt.
+That is now wired (§20e) and live-verified; `target_delta` moved 0.40 ->
+0.50 on a measured cost curve; a feature backfill is running. **Read §20d
+before proposing any signal work**: the option costs ~1.28 ATR and the
+median signal offers 0.95, so only 42.7% of signals can ever pay for the
+instrument expressing them. §20f lists what was tested and rejected.
+
+**§19 (P7-B) remains the reference for the exit ladder and the scorer.**
 Confidence being anti-predictive is now confirmed **out-of-sample**, and
 it is not the confluence aggregation — *each detector is individually
 inverted at its own extremes*. `oi_price_flow` did not reproduce §18c's
@@ -2863,3 +2878,203 @@ data; the first session under these rules is 2026-08-14. Watch two
 things: whether `nse_index` goes silent under 2-of-2 (expected, not a
 bug — a full silent week is the signal to re-measure), and whether the
 2R rung is ever reached at all.
+
+---
+
+## 20. P7-C — the features were never stored (2026-08-14, evening)
+
+§19h's two watch items both resolved on the first live session under the
+new rules. `nse_index` went silent — **6 evaluations, 0 trades**, all
+rejected `BELOW_MIN_CONFIDENCE`, which is the 2-of-2 requirement working,
+not a bug (a full silent week is still the signal to re-measure). And the
+2R rung **was** reached: trade 80, BHARTIARTL 1980 CE, +49.5% in ten
+minutes.
+
+The day closed **-Rs 2,729 over 10 nse_stock trades**, 2 winners. Nothing
+in §19's ruleset misfired; the five 45-minute scratches capped their
+losses between -Rs 13 and -Rs 547.
+
+### 20a. The largest loss driver is not the strategy
+
+Three risk knobs contradict each other, and have since 05 Aug:
+
+| constraint | formula | permits (at Rs 48,907 equity) |
+|---|---|---|
+| risk budget | `equity × base_risk_pct ÷ stop_pct` = `× 0.08 ÷ 0.20` | Rs 19,563 — never binds |
+| premium cap | `equity × max_premium_pct` = `× 0.35` | **Rs 17,117 — binds every trade** |
+| exposure cap | `equity × exposure_cap_pct` = `× 0.40` | funds **1.14** positions |
+| `max_concurrent` | config | 5 — **unreachable** |
+
+Because `max_premium_pct` (0.35) is below the risk-budget notional
+(0.40 × equity), *every* trade asks for 35% of capital, and the exposure
+cap then allows 40% total. The first signal after warmup is funded in
+full; everything after divides a Rs 2,446 remainder. 171
+`EXPOSURE_CAP_EXCEEDED` rejections today, the second-largest reason.
+
+Confirmed exactly: trade 76 got 56 lots × 25 × Rs 12.18 = **Rs 17,052**;
+a 57th lot would have breached the Rs 17,117 cap.
+
+**What it costs.** The day's best trade — the 2R winner above — was sized
+at **1 lot, Rs 391**, because two earlier positions had eaten the budget.
+It returned Rs 192. At trade 76's notional it was worth ~Rs 8,400.
+
+Across all 34 trades since the 08-11 reset, notional spans **Rs 148 to
+Rs 17,052 (115×)** on positions the risk model believes are one identical
+unit, and `corr(notional, return) = -1.2%` — not inverted, *random*.
+Flat-weighting the same trades at Rs 5,000 gives **-Rs 3,256** against
+the **-Rs 5,438** booked: Rs 2,182 of pure sizing variance.
+
+**Not yet fixed** — the proposed shape is per-trade notional =
+`exposure_cap_pct × equity ÷ max_concurrent`, so the cap is respected by
+construction rather than by a first-come race.
+
+### 20b. Other mechanical findings, none yet fixed
+
+- **The stop runs on a 3.5-minute grid, last.** `EVAL_INTERVAL` is 60s but
+  a watchlist sweep takes ~2.5 min, and exits are evaluated *after* it.
+  `position_marks` gaps measured 161-222s avg, 280s max. Trade 84 filled
+  at **-29.0%** on a -20% stop. Moving the exit pass ahead of the entry
+  sweep is the highest value per line available.
+- **`trail_pct` is still 0.30 while the stop moved to 0.20.** §19d moved
+  the stop and the R-rungs together but the trail lives in
+  `engine/monitor.py` and was missed. Above +14.3% MFE the trail binds
+  *wider* than the initial risk.
+- **The selector has no spread filter.** Sub-Rs-5 legs cost 4.39%
+  round-trip and lost Rs 2,619. ITC 275 P: 9.53% round-trip against a
+  +3.2% best excursion — unwinnable at any moment of its life.
+- **Re-entry cooldown (30 min) is shorter than the scratch window (45).**
+  BHARTIARTL re-entered the identical leg 32 minutes after stopping out;
+  -Rs 3,430 on one underlying in one session.
+
+### 20c. Three detectors, one signal — the mechanism behind §19b
+
+`corr(trend_structure, oi_price_flow) = **0.813**`, same sign on **93.3%**
+of 2,408 evaluations. The code explains it: `trend_structure` is
+`tanh(EMA fast-slow spread)`; `oi_price_flow`'s *direction* is
+`tanh(30-min price change / 0.0038)` — OI only scales magnitude. They are
+the same measurement under two family labels, so `min_families: 2` is
+satisfied automatically. `relative_strength` is the only weakly
+independent input (r = 0.21 / 0.25).
+
+So §19b is better stated as: there is **one** signal here — short-horizon
+extension — and confluence multiplies confidence in it. Adding a fourth
+momentum detector cannot help.
+
+**New, and it changes the framing:** direction is *not* inverted.
+Mirroring every signal gives 8.1% clean target hits against 31.6% as
+signalled. **Direction is weakly right; confidence is backwards.** That
+is the meta-labelling setup, not a reason to flip anything.
+
+### 20d. The hurdle: what the trade costs, in ATR
+
+All signal research here is in ATR of the underlying; the exit ladder is
+in % of premium. Nobody had converted between them. Median nse_stock ATR
+is **0.0689% of price**. Measured per quote over 778k liquid chain rows
+(OI > 500k), charging theta over the 121-minute median hold:
+
+| \|delta\| | spread | theta | **total hurdle** |
+|---|---|---|---|
+| 0.15-0.25 | 0.727 | 1.018 | 1.843 ATR |
+| 0.25-0.35 | 0.604 | 0.797 | 1.486 |
+| 0.35-0.45 | 0.554 | 0.635 | **1.276** ← was |
+| 0.45-0.55 | 0.512 | 0.536 | **1.125** ← now |
+| 0.55-0.65 | 0.570 | 0.440 | 1.068 (aggregate min) |
+| 0.75-1.00 | 1.786 | 0.166 | 1.947 |
+
+Against that, the **median signal's `mfe_atr` is 0.95** — its single best
+moment. **Only 42.7% of signals ever travel far enough to cover the
+option bought to express them** (43.0/43.3/43.0/42.7/39.6/39.4 per
+session — stable, because it is cost arithmetic, not an edge claim).
+
+A better direction model does not begin paying until it clears that.
+
+### 20e. Shipped: A, B — and what C is still doing
+
+**A. The engine now stores its features.** `orchestrator` called
+`features.registry.compute_all` and discarded the result: `feature_vectors`
+held **2 rows** (both 05 Aug) and `signals.feature_vector_id` was NULL on
+all **79,209** rows. `features.store.compute_and_store` had existed since
+P2 for exactly this, documented "(once wired in)", with zero callers.
+
+Wired in *before* scoring, so non-signals and rejections are captured too
+(§11: "the rejections are training data"). `write_feature_vector` now
+returns the row id via `RETURNING` — on the conflict path too, so a
+replayed tick links to the same row.
+
+Live-verified the same evening against the open US market: after restart
+the `us_stock` engine wrote 18 vectors (= watchlist size) on its first
+tick and **18 of 18 subsequent signals linked, 100%**, while every one was
+rejected at `BREAKER_TRIPPED` — which is the point.
+
+**Immediately paid for itself:** the `quality` column resolved "18
+features" to **15**. Three are `MISSING` on every row and are dead in the
+live engine too — `iv_rank`/`iv_percentile` need an IV history nothing
+supplies (and `option_quotes.iv` is NULL on all 64.8M rows while the
+vendor's `vendor_iv` is 84.9% populated and unread), and
+`opening_range_position` needs `session_open_ts`, which `build_context`
+leaves "for the caller to set" and **no caller anywhere sets**. Same
+defect shape as §18a's `prior_as_of` and `index_bars`. Not fixed here.
+
+**B. `_DEFAULT_TARGET_DELTA` 0.40 -> 0.50**, per §20d's table. The
+0.45-0.55 band beat 0.35-0.45 in **all five** sessions individually.
+Deliberately stops short of the 0.55-0.65 aggregate minimum: that basin
+is flat (0.06 ATR) and deeper ITM spends gamma — the convexity §19d's
+ladder argument rests on — plus premium per lot against `max_premium_pct`.
+Moves the payable share **42.7% -> 46.0%**, improving in all 6 sessions.
+Lowers the cost of being right; does not make the system right.
+
+Selector behaviour tests now pin `target_delta=0.40` explicitly instead of
+inheriting the constant, and `test_target_delta_constant.py` pins 0.50 to
+its evidence — precisely because the trail/stop pair drifted in §19d with
+nothing failing.
+
+**C. `kairodex backtest backfill-features`** reconstructs feature vectors
+for signals scored before A existed, so the 20,729 existing
+`forward_outcome` labels have a design matrix. `build_context` is already
+a real point-in-time read; the correctness requirement is reproducing what
+the engine saw, and both caller-supplied inputs are the ones that have
+silently killed detectors here before — `prior_as_of = ts -
+flow.OI_LOOKBACK` and the separate `index_bars` injection. Both pinned by
+tests that compare against `live_loop`'s own call site.
+
+**Running, not finished.** ~43 signals/min against 23,600, so several
+hours. Idempotent and resumable — safe to re-run, it skips what is linked.
+
+### 20f. Rejected while testing — do not re-propose without new evidence
+
+**A hard 45-minute holding cap.** The theta arithmetic argues for it and
+replay over the 34-trade book reads **+Rs 1,593** — but trade 84 alone
+contributes +Rs 3,061, so deleting one trade flips the sign. Same
+leave-one-out failure §19d used to reject "remove the ladder". It also
+truncates the winners that carry the book (ADANIENT peaked at 275
+minutes, BANKNIFTY 302, INFY 305), and most of its apparent gain comes
+from cutting losers before their stop — a stop-and-cadence fix, not a cap.
+
+Also tested and rejected on the §19e per-session split, all on the
+incumbents' own metric (20,729 resolved signals, 33.3% baseline):
+
+| hypothesis | aggregate | per session | verdict |
+|---|---|---|---|
+| invert the signal | 8.1% vs 31.6% | — | rejected outright |
+| ATR regime 0.15-0.20% | 42.9%, +0.286 ATR (n=434) | 64.4 / 41.8 / 52.4 / **2.3** / 35.3 / 28.6 | noise |
+| fade cross-sectional breadth | 39.8%, +0.193 (n=626) | 45.0 / 54.9 / 23.6 / **13.1** / 30.2 | one session carried it |
+| time of day 09:45-10:59 | 28.4% vs 33.3% | below baseline in **5 of 6** | survives, as a filter |
+
+Three of four died on the split. That is the base rate here, and it is the
+reason nothing in §20e claims edge.
+
+### 20g. Status
+
+512 tests (9 new), ruff/mypy/import-linter clean, locally and on the VM.
+All four engine units restarted 19:39 IST on `2e934e4`. `kairodex-api` not
+restarted — nothing it reads changed.
+
+`docs/reports/` is now in `.gitignore`. It had been kept untracked by
+hand; a `git add -A` this session nearly committed three reports carrying
+real P&L, positions and equity to GitHub.
+
+**Next, and gated:** the meta-labelling model (§20c's framing) trained on
+the substrate A and C produce, measured on P4's existing purged/embargoed
+walk-forward before anything is wired — plus a real event calendar, since
+`event_blackout_gate` unconditionally returns `True` and the system buys
+11-DTE options into earnings blind.
