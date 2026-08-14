@@ -3144,3 +3144,88 @@ ruff/mypy/import-linter clean, locally and on the VM. All four engines plus
 session under them is Monday 2026-08-17. Watch: whether five positions
 actually open (max_concurrent has never been reachable before), and whether
 any stop still fills more than a couple of points past its level.
+
+## 21. P7-D — the meta-label model, measured (2026-08-15)
+
+Steps A and C built the substrate; this is the first question asked of it.
+Keep `ReferenceStrategy` deciding the SIDE — §20c established direction is
+weakly *right* (inverting resolves 8.1% against 31.6% as-signalled) while
+confidence is monotonically *backwards* — and learn a second model that
+only decides whether to ACT. Binary, on labels that already existed.
+
+`backtest/metalabel.py` + `kairodex backtest metalabel`. **Wired to
+nothing.** No new dependency: logistic regression and AUC are ~30 lines of
+numpy, and "is there any linear signal here at all" is the honest first
+question. Purged/embargoed walk-forward reuses `validation.
+walk_forward_splits` verbatim so the purge rule cannot drift from the
+promotion gates'; standardisation and imputation statistics come from the
+train fold only.
+
+### 21a. The result
+
+n=20,729, 15 live features, base rate 0.316, 3 usable folds after purging.
+
+| feature set | mean AUC | folds > 0.5 | shuffles beating it | verdict |
+|---|---|---|---|---|
+| all 15 | 0.5262 | 3/3 | 0/30 (p=0.032) | outside the null |
+| **used** — the 3 detectors read | **0.5053** | 2/3 | **7/30 (p=0.258)** | **noise** |
+| **discarded** — the other 12 | **0.5268** | 3/3 | **0/30 (p=0.032)** | outside the null |
+
+**The three features the strategy actually reads contribute nothing.** The
+discarded twelve alone (0.5268) match all fifteen together (0.5262), and
+the used three cannot be told apart from shuffled labels. That is §20c's
+"three detectors, one signal" conclusion reproduced by an independent
+method, and it is the first concrete payoff from persisting features.
+
+A **label-shuffle null** is what makes any of this interpretable — without
+it 0.526 cannot be distinguished from a biased harness. Thirty shuffles
+preserve overlap, fold boundaries, class balance and imputation while
+destroying the feature-label relationship; the null centres on 0.4971
+(so the harness is unbiased) with a maximum of 0.5077.
+
+### 21b. Do not deploy, and why
+
+The signal is real but tiny. AUC 0.527 against 0.500. `lift@10%` — the
+metric that actually matters if this gated entries — reads 1.22 / 0.95 /
+1.01, i.e. below the base rate in one of three folds. Three folds over six
+sessions, and p=0.032 is the resolution floor at 30 permutations, not a
+strong number. Effective n is far below 20,729 because neighbouring
+signals overlap.
+
+### 21c. The one conditional that survives a per-session split
+
+`vwap_position` carries the largest coefficient, and it is the first thing
+tested this week to beat its own session's baseline in EVERY session:
+
+| session | `vwap < -1` | that session's baseline | edge |
+|---|---|---|---|
+| 08-06 | 35.7 | 32.0 | +3.7 |
+| 08-07 | 32.4 | 32.2 | +0.2 |
+| 08-10 | 36.0 | 31.3 | +4.7 |
+| 08-11 | 35.5 | 32.4 | +3.1 |
+| 08-12 | 31.3 | 29.1 | +2.2 |
+| 08-13 | 29.8 | 28.9 | +0.9 |
+
+Six of six, mean about +2.5 points. `vwap > 1` is erratic by contrast
+(-9.8 to +5.2), so the direction is **mean-reversion — long when price is
+stretched BELOW VWAP** — consistent with §19e (against-the-move beat
+with-the-move) and with confidence being an extension meter.
+
+**It is still not an edge.** ~34% against the 33.3% breakeven that a
+1-ATR-stop / 2-ATR-target payoff needs, before §20d's ~1.13 ATR instrument
+hurdle. A filter candidate, exactly like the 09:45-10:59 window — not
+something to build a strategy on.
+
+### 21d. What this changes
+
+The honest state is unchanged in its headline (§19: no detector has
+demonstrated positive edge) but sharper in its direction:
+
+- Stop re-weighting the three current detectors. They are one correlated
+  momentum signal and the meta-model cannot separate them from noise.
+- `vwap_position` and `volume_profile_poc_distance` are the candidates
+  worth a detector, tested per §19c on the incumbents' own metric — which
+  §21c has now started.
+- More sessions matter more than a better model. Six sessions and three
+  folds cannot support a stronger claim than "outside the null", and a
+  gradient-booster on this much data would fit noise faster, not find more.
