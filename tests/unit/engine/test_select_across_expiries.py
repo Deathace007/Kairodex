@@ -26,8 +26,11 @@ def _tick(strike: int, **over: object) -> Tick:
         "ts": _TS,
         "strike": Decimal(strike),
         "option_type": "C",
-        "bid": Decimal("4.90"),
-        "ask": Decimal("5.10"),
+        # 1.6% of mid — inside select_contract's relative-spread limit, so
+        # these expiry-fallthrough tests are not silently testing the spread
+        # filter. Was 4.90/5.10 (4%), which the filter added 2026-08-14 rejects.
+        "bid": Decimal("4.96"),
+        "ask": Decimal("5.04"),
         "bid_sz": 50,
         "ask_sz": 50,
     }
@@ -106,7 +109,11 @@ def test_reports_the_substantive_reason_not_the_0dte_expiry_window_miss():
     Here the 0 DTE legs are out-of-window; the 1 DTE leg is a 0.005-delta
     lottery ticket that the delta cap rejects. The substantive reason must
     win."""
-    lottery = _tick(400, delta=Decimal("0.005"), bid=Decimal(1), ask=Decimal(2))
+    # Tight spread (1.33% of mid) on purpose: this test is about the
+    # substantive reason winning over the 0-DTE expiry-window miss, so the
+    # leg must fail on DELTA and nothing else. At the original 1/2 quote it
+    # was a 67%-of-mid spread and reported NO_CONTRACT_INSIDE_SPREAD_LIMIT.
+    lottery = _tick(400, delta=Decimal("0.005"), bid=Decimal("1.49"), ask=Decimal("1.51"))
     chain = [
         _snapshot(_TODAY, [100]),  # 0 DTE -> NO_CANDIDATES_IN_EXPIRY_WINDOW
         ChainSnapshot(

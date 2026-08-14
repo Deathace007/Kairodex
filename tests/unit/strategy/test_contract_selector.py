@@ -29,8 +29,18 @@ def _candidates() -> list[ContractCandidate]:
 
 
 def _select(candidates, direction, **overrides):
+    # `max_relative_spread` is effectively disabled by default here: these
+    # fixtures use synthetic 20%-of-mid spreads (bid 9 / ask 11) chosen long
+    # before the filter existed, and they exercise delta targeting,
+    # affordability and the expiry window — not microstructure. The filter
+    # has its own tests below. Overriding keeps each test measuring one thing.
     kwargs = dict(
-        spot=Decimal(100), equity=Decimal(50000), max_premium_pct=0.35, lot_size=25, as_of=_AS_OF
+        spot=Decimal(100),
+        equity=Decimal(50000),
+        max_premium_pct=0.35,
+        lot_size=25,
+        as_of=_AS_OF,
+        max_relative_spread=1.0,
     )
     kwargs.update(overrides)
     return select_contract(candidates, direction, **kwargs)
@@ -177,3 +187,52 @@ def test_delta_cap_still_lets_a_reasonable_contract_through():
     result = _select(_candidates(), Side.BUY, target_delta=0.40)
     assert result.selected is not None
     assert result.selected.instrument_id == 2  # unchanged from the original test above
+
+
+# --- relative-spread filter (2026-08-14) -------------------------------------
+# Until this existed the only microstructure check was `bid > 0 and ask > 0`:
+# a contract was tradeable if quoted at all, at any width. Measured over the
+# 34 NSE trades closed since the 08-11 reset, sub-Rs-5 legs paid 4.39%
+# round-trip and lost Rs 2,619; the worst (ITC 275 P at Rs 2.18) paid 9.53%
+# round-trip against a +3.2% best-ever excursion and could not have been
+# closed at a profit at any moment of its life.
+
+
+def _leg(id_: int, bid: str, ask: str, delta: str = "0.50") -> ContractCandidate:
+    return ContractCandidate(
+        id_, Decimal(100), "C", _NEAR_EXPIRY, Decimal(bid), Decimal(ask), Decimal(delta)
+    )
+
+
+def test_rejects_a_leg_whose_spread_is_wider_than_the_limit():
+    """The ITC case: a Rs 2.18 leg quoted 2.08/2.28 is 9.2% of mid one-way."""
+    result = _select([_leg(1, "2.08", "2.28")], Side.BUY, max_relative_spread=0.02)
+    assert result.selected is None
+    assert result.reason == "NO_CONTRACT_INSIDE_SPREAD_LIMIT"
+
+
+def test_keeps_a_normally_quoted_leg():
+    """1.0% of mid — the measured median at the 0.45-0.55 delta band this
+    selector now targets. Must survive."""
+    result = _select([_leg(2, "9.95", "10.05")], Side.BUY, max_relative_spread=0.02)
+    assert result.selected is not None
+    assert result.selected.instrument_id == 2
+
+
+def test_spread_filter_picks_a_better_strike_rather_than_killing_the_signal():
+    """Why this is in the selector and not a risk gate: a gate rejects the
+    whole signal, this only rejects one leg. A wide near-target leg beside a
+    tight slightly-further one must still produce a trade."""
+    wide_at_target = _leg(3, "1.80", "2.20", delta="0.50")  # 20% of mid
+    tight_nearby = _leg(4, "9.95", "10.05", delta="0.42")  # 1% of mid
+    result = _select([wide_at_target, tight_nearby], Side.BUY, max_relative_spread=0.02)
+    assert result.selected is not None
+    assert result.selected.instrument_id == 4
+
+
+def test_spread_boundary_is_inclusive_like_the_other_limits():
+    """Exactly at the limit passes — matching `max_delta_distance` and the
+    affordability boundary, both of which use `>` to reject."""
+    at_limit = _leg(5, "9.90", "10.10")  # 0.20 / 10.00 = exactly 2%
+    result = _select([at_limit], Side.BUY, max_relative_spread=0.02)
+    assert result.selected is not None

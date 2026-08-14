@@ -29,8 +29,9 @@ def _mid_session(market) -> datetime.datetime:
     parametrized-over-all-segments test has to ask per market."""
     open_dt, close_dt = session_window_utc(market, datetime.date(2026, 8, 5))
     return open_dt + (close_dt - open_dt) / 2
-_CONFIG = get_segment_config(Segment.NSE_STOCK)  # capital=50000, base_risk=0.08, ceiling=0.35,
-# max_premium=0.35, max_concurrent=1, daily_loss=0.16, weekly=0.30, drawdown=0.40, exposure=0.40
+# The REAL segment config, not a fixture — so these tests track the live
+# knobs. Read them from `_CONFIG` rather than restating them as literals.
+_CONFIG = get_segment_config(Segment.NSE_STOCK)
 
 
 def _account(**overrides: object) -> AccountState:
@@ -188,8 +189,12 @@ def test_reentry_cooldown_applies_after_a_WINNING_close_too():
 
 
 def test_correlation_cluster_cooldown_expired_passes():
-    thirty_one_min_ago = _NOW - datetime.timedelta(minutes=31)
-    account = _account(last_close_ts_by_underlying={"RELIANCE": thirty_one_min_ago})
+    # Derived from the config, not a literal. This test hardcoded 31 minutes
+    # against a 30-minute cooldown and broke when the knob moved to 45 on
+    # 2026-08-14 — the same drift that let `trail_pct` sit at 0.30 while the
+    # stop moved to 0.20 with nothing failing.
+    just_past = _NOW - datetime.timedelta(minutes=_CONFIG.reentry_cooldown_minutes + 1)
+    account = _account(last_close_ts_by_underlying={"RELIANCE": just_past})
     result = run_gate_chain(_proposal(), account, _CONFIG, now=_NOW)
     assert result.allowed
 

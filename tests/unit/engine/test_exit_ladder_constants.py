@@ -11,11 +11,16 @@ Nothing pinned that coupling before this file. These tests fail loudly if
 either constant moves without the other being reconsidered.
 """
 
+import dataclasses
 import datetime
 from decimal import Decimal
 
 from kairodex.core.enums import Segment, Side
-from kairodex.engine.monitor import Position, r_multiple_partial_exit_check
+from kairodex.engine.monitor import (
+    Position,
+    r_multiple_partial_exit_check,
+    trailing_stop_check,
+)
 from kairodex.engine.orchestrator import (
     _DEFAULT_PROFIT_TARGET_PCT,
     _DEFAULT_R_MULTIPLE_TARGETS,
@@ -85,3 +90,48 @@ def test_profit_target_still_sits_above_every_rung():
     target_pct = _DEFAULT_PROFIT_TARGET_PCT
     highest_rung_pct = max(_DEFAULT_R_MULTIPLE_TARGETS) * _DEFAULT_STOP_LOSS_PCT
     assert target_pct > highest_rung_pct
+
+
+def test_trailing_stop_gives_back_exactly_the_initial_risk_by_default():
+    """The third member of the coupled set, added 2026-08-14.
+
+    §19d moved `_DEFAULT_STOP_LOSS_PCT` 0.30 -> 0.20 and moved the R-rungs
+    with it, on the reasoning that R *is* the stop distance. The trailing
+    stop's give-back is the same decision and was left behind at a bare
+    0.30 literal in `engine/monitor.py`, where nothing failed.
+
+    It is now derived from the position's own initial stop rather than
+    configured separately, so the two cannot disagree. Live cost of them
+    disagreeing: with a 20% stop and a 30% trail the trail becomes binding
+    above +14.3% MFE and is wider than the initial risk — trade 79 peaked
+    +21.0% and exited -15.8%, trade 84 peaked +16.4% and exited -29.0%.
+    """
+    entry = Decimal("100")
+    stop = entry * (Decimal(1) - Decimal(str(_DEFAULT_STOP_LOSS_PCT)))  # 80
+    position = dataclasses.replace(
+        _position_at("100"),
+        avg_entry=entry,
+        stop_price=stop,
+        initial_stop_price=stop,
+        high_water_mark_price=Decimal("200"),
+        current_mark=Decimal("200"),
+    )
+    ratchet = trailing_stop_check(position)
+    assert ratchet is not None
+    # Give-back must equal the stop pct, not some independent literal.
+    expected = Decimal("200") * (Decimal(1) - Decimal(str(_DEFAULT_STOP_LOSS_PCT)))
+    assert ratchet.new_stop_price == expected
+
+
+def test_trailing_stop_abstains_when_there_is_no_real_risk_distance():
+    """An initial stop at or above entry leaves no risk to mirror, exactly
+    as `Position.r_multiple` returns None in the same situation."""
+    position = dataclasses.replace(
+        _position_at("100"),
+        avg_entry=Decimal("100"),
+        stop_price=Decimal("100"),
+        initial_stop_price=Decimal("100"),
+        high_water_mark_price=Decimal("200"),
+        current_mark=Decimal("200"),
+    )
+    assert trailing_stop_check(position) is None

@@ -59,6 +59,31 @@ EXIT_MAX_QUOTE_AGE_MS = 300_000
 # STALE_QUOTE anyway). Same reasoning, and the same shared
 # `core.sessions` window, as the recorder's own closed-market idle.
 CLOSED_MARKET_INTERVAL = datetime.timedelta(minutes=5)
+# How many underlyings the entry sweep may evaluate before pausing to check
+# every open position's exits.
+#
+# Measured 2026-08-14 (PROGRESS.md §20b): exits used to run exactly once per
+# cycle, *after* the whole entry sweep. `EVAL_INTERVAL` is 60s but a full
+# 22-name sweep takes ~150s, so the real gap between two consecutive exit
+# checks was ~3.5 minutes — the `position_marks` cadence measured 161-222s
+# on average and 280s at worst across all ten of that day's trades. A stop
+# cannot be enforced tighter than it is looked at: trade 84 (BHARTIARTL 2020
+# CE) was marked 13.45 at 15:01:48 and 11.70 at 15:06:19, and filled at
+# 11.58 — **-29.0% against a -20% stop**, a 45% overshoot on the system's
+# primary risk control. Trade 82 filled at -21.4% the same way.
+#
+# Moving the sweep before the entry loop is NOT the fix and was rejected:
+# it changes the phase, not the period, so consecutive exit checks would
+# still be one full cycle apart. Interleaving is what shortens the gap. At
+# ~7s per underlying this puts an exit check roughly every 35s, a 6x
+# improvement, for about 24 extra queries per cycle.
+#
+# Deliberately NOT a second concurrent task with its own cadence: that
+# needs a second DB session writing the same trades/equity rows as this
+# one, and the ordering bugs that invites are worse than the latency being
+# fixed. One session, one task, deterministic — the exits simply get
+# looked at more often.
+EXIT_SWEEP_EVERY_N_UNDERLYINGS = 5
 
 
 async def _ensure_strategy_row(
@@ -76,6 +101,80 @@ async def _ensure_strategy_row(
     await session.flush()
     await session.commit()
     return row.strategy_id
+
+
+async def _sweep_exits(
+    session: AsyncSession,
+    *,
+    segment: Segment,
+    exit_execution: ExecutionPort,
+    clock: LiveClock,
+) -> None:
+    """Evaluate exits for every open position in `segment`, once.
+
+    Extracted from `run_segment`'s cycle so it can be called repeatedly
+    *during* the entry sweep as well as before it — see
+    `EXIT_SWEEP_EVERY_N_UNDERLYINGS` for why the old once-per-cycle
+    placement could not enforce a stop tighter than ~3.5 minutes.
+
+    Cheap enough to call often: one query for the open trades plus one
+    quote read per trade, against a `max_concurrent` of 5.
+    """
+    open_trades = list(
+        await session.scalars(
+            select(Trade).where(
+                Trade.segment == segment, Trade.run_id.is_(None), Trade.closed_at.is_(None)
+            )
+        )
+    )
+    for trade in open_trades:
+        try:
+            # Re-read the clock per trade rather than reusing the
+            # cycle's `now`. A full cycle walks the whole watchlist
+            # and takes tens of seconds, so by the time exits ran,
+            # `now` was stale — which made the quote-age check
+            # measure the wrong interval, and occasionally *negative*
+            # (a quote written after the cycle started looked like it
+            # came from the future, and sailed through the staleness
+            # check for that reason alone). That is how trade 6's one
+            # successful partial exit filled on 2026-08-07 while
+            # genuine stop-losses on the same cycle were rejected.
+            now = clock.now()
+            exit_outcome = await run_exit_tick(
+                session, trade=trade, broker=exit_execution, now=now
+            )
+            if exit_outcome.closed:
+                logger.info("trade %d closed: %s", trade.trade_id, exit_outcome.action)
+                await publish(
+                    StreamMessage(
+                        type="trade_closed",
+                        segment=segment.value,
+                        ts=now,
+                        data={"trade_id": trade.trade_id, "reason": exit_outcome.action},
+                    )
+                )
+            else:
+                mark = await session.scalar(
+                    select(PositionMark)
+                    .where(PositionMark.trade_id == trade.trade_id)
+                    .order_by(PositionMark.ts.desc())
+                    .limit(1)
+                )
+                await publish(
+                    StreamMessage(
+                        type="position_update",
+                        segment=segment.value,
+                        ts=now,
+                        data={
+                            "trade_id": trade.trade_id,
+                            "action": exit_outcome.action,
+                            "mark": str(mark.mark) if mark else None,
+                            "unrealized": str(mark.unrealized) if mark else None,
+                        },
+                    )
+                )
+        except Exception:
+            logger.exception("exit tick failed for trade %d", trade.trade_id)
 
 
 async def run_segment(segment: Segment, *, shadow: bool = True) -> None:
@@ -158,7 +257,16 @@ async def run_segment(segment: Segment, *, shadow: bool = True) -> None:
             # query per *taken* trade, not per underlying.
             account = await build_account_state(session, segment, now)
 
-            for underlying in underlyings:
+            # Risk protection ahead of opportunity search. An open position
+            # past its stop is unbounded risk that is already running; a
+            # setup not yet entered is not. Spending ~150s hunting entries
+            # before looking at either is the wrong order, independent of
+            # how often the sweep repeats below.
+            await _sweep_exits(
+                session, segment=segment, exit_execution=exit_execution, clock=clock
+            )
+
+            for position, underlying in enumerate(underlyings, start=1):
                 try:
                     outcome = await run_entry_tick(
                         session,
@@ -214,60 +322,21 @@ async def run_segment(segment: Segment, *, shadow: bool = True) -> None:
                         "%s: entry tick failed for %s", segment.value, underlying.symbol
                     )
 
-            open_trades = list(
-                await session.scalars(
-                    select(Trade).where(
-                        Trade.segment == segment, Trade.run_id.is_(None), Trade.closed_at.is_(None)
+                # Interleaved, not once at the end — this is what actually
+                # shortens the gap between two exit checks from a whole
+                # cycle to ~35s. See EXIT_SWEEP_EVERY_N_UNDERLYINGS.
+                if position % EXIT_SWEEP_EVERY_N_UNDERLYINGS == 0:
+                    await _sweep_exits(
+                        session, segment=segment, exit_execution=exit_execution, clock=clock
                     )
-                )
+
+            # Final sweep: the interleaved calls above only fire on exact
+            # multiples, so a watchlist whose length is not a multiple of
+            # the stride would otherwise leave its tail unswept until the
+            # next cycle's leading sweep.
+            await _sweep_exits(
+                session, segment=segment, exit_execution=exit_execution, clock=clock
             )
-            for trade in open_trades:
-                try:
-                    # Re-read the clock per trade rather than reusing the
-                    # cycle's `now`. A full cycle walks the whole watchlist
-                    # and takes tens of seconds, so by the time exits ran,
-                    # `now` was stale — which made the quote-age check
-                    # measure the wrong interval, and occasionally *negative*
-                    # (a quote written after the cycle started looked like it
-                    # came from the future, and sailed through the staleness
-                    # check for that reason alone). That is how trade 6's one
-                    # successful partial exit filled on 2026-08-07 while
-                    # genuine stop-losses on the same cycle were rejected.
-                    exit_outcome = await run_exit_tick(
-                        session, trade=trade, broker=exit_execution, now=clock.now()
-                    )
-                    if exit_outcome.closed:
-                        logger.info("trade %d closed: %s", trade.trade_id, exit_outcome.action)
-                        await publish(
-                            StreamMessage(
-                                type="trade_closed",
-                                segment=segment.value,
-                                ts=now,
-                                data={"trade_id": trade.trade_id, "reason": exit_outcome.action},
-                            )
-                        )
-                    else:
-                        mark = await session.scalar(
-                            select(PositionMark)
-                            .where(PositionMark.trade_id == trade.trade_id)
-                            .order_by(PositionMark.ts.desc())
-                            .limit(1)
-                        )
-                        await publish(
-                            StreamMessage(
-                                type="position_update",
-                                segment=segment.value,
-                                ts=now,
-                                data={
-                                    "trade_id": trade.trade_id,
-                                    "action": exit_outcome.action,
-                                    "mark": str(mark.mark) if mark else None,
-                                    "unrealized": str(mark.unrealized) if mark else None,
-                                },
-                            )
-                        )
-                except Exception:
-                    logger.exception("exit tick failed for trade %d", trade.trade_id)
 
             try:
                 await update_equity_and_risk_state(session, segment, now)

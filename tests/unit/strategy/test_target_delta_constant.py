@@ -74,8 +74,14 @@ def test_atm_is_preferred_over_the_old_target_by_distance():
     from kairodex.strategy.contract_selector import ContractCandidate, select_contract
 
     expiry = date(2026, 8, 25)
-    atm = ContractCandidate(1, Decimal(100), "C", expiry, Decimal(9), Decimal(11), Decimal("0.50"))
-    otm = ContractCandidate(2, Decimal(110), "C", expiry, Decimal(4), Decimal(6), Decimal("0.40"))
+    # Tight, realistic spreads — the selector's relative-spread filter would
+    # reject a 20%-of-mid quote before delta targeting ever ran.
+    atm = ContractCandidate(
+        1, Decimal(100), "C", expiry, Decimal("9.95"), Decimal("10.05"), Decimal("0.50")
+    )
+    otm = ContractCandidate(
+        2, Decimal(110), "C", expiry, Decimal("4.98"), Decimal("5.02"), Decimal("0.40")
+    )
     result = select_contract(
         [atm, otm],
         Side.BUY,

@@ -82,6 +82,46 @@ _DEFAULT_TARGET_DELTA = 0.50
 # every leg) and not worth a second, separately-tuned threshold yet.
 _DEFAULT_MAX_DELTA_DISTANCE = 0.25
 
+# Reject a leg whose bid-ask spread is wider than this fraction of its mid.
+#
+# Added 2026-08-14. Until then the only microstructure filter here was
+# `bid > 0 and ask > 0 and ask >= bid` — a contract was tradeable if it was
+# quoted at all, at any width. Measured over the 34 NSE trades closed since
+# the 08-11 reset, by entry premium:
+#
+#   premium        n   avg round-trip spread   net P&L
+#   under Rs 5     8            4.39%          -Rs 2,619
+#   Rs 5-20       13            1.79%          -Rs 3,829
+#   Rs 20-60       9            2.09%          +Rs 2,627
+#   Rs 60+ (idx)   4            0.50%          -Rs 1,616
+#
+# Relative spread is essentially 1/premium on NSE stock options, so the
+# cheap end is where the damage is. The worst single case: ITC 275 P bought
+# at Rs 2.18 with a 9.53% round-trip spread against a best-ever excursion of
+# +3.2% — that position could not have been closed at a profit at any
+# moment of its life. It was not a bad trade, it was an untradeable
+# contract. Thirteen of the 34 had a round-trip spread at or above their own
+# MFE.
+#
+# 0.02 is one-way, so ~4% round trip. It keeps the Rs 20-60 band (the only
+# profitable one) and the index legs, and removes the sub-Rs-5 band. Chosen
+# to sit just above the 20-60 band's observed 2.09% round trip rather than
+# fitted: the measurement says "the cheap tail is fatal", not "the optimum
+# is exactly here".
+#
+# NOTE this is knowable *before* entry, which is what makes it actionable —
+# unlike the MFE-vs-spread comparison above, which is partly circular (a
+# trade that never rose is a trade that lost).
+_DEFAULT_MAX_RELATIVE_SPREAD = 0.02
+
+
+def _relative_spread(c: ContractCandidate) -> float:
+    """(ask - bid) / mid. Callers have already established bid/ask > 0."""
+    mid = (c.bid + c.ask) / 2
+    if mid <= 0:  # pragma: no cover — guarded by the bid/ask > 0 filter
+        return float("inf")
+    return float((c.ask - c.bid) / mid)
+
 
 @dataclass(frozen=True, slots=True)
 class ContractCandidate:
@@ -126,6 +166,7 @@ def select_contract(
     max_dte: int = _DEFAULT_MAX_DTE,
     target_delta: float = _DEFAULT_TARGET_DELTA,
     max_delta_distance: float = _DEFAULT_MAX_DELTA_DISTANCE,
+    max_relative_spread: float = _DEFAULT_MAX_RELATIVE_SPREAD,
 ) -> SelectionResult:
     option_type = "C" if direction is Side.BUY else "P"
     in_window = [
@@ -140,8 +181,16 @@ def select_contract(
     if not in_window:
         return SelectionResult(None, "NO_CANDIDATES_IN_EXPIRY_WINDOW")
 
+    # Relative spread, applied here rather than as a risk gate on purpose:
+    # a gate rejects the whole *signal*, while this only rejects one leg and
+    # lets a better strike on the same underlying still be chosen. Selection
+    # is where "which contract" belongs.
+    tradeable = [c for c in in_window if _relative_spread(c) <= max_relative_spread]
+    if not tradeable:
+        return SelectionResult(None, "NO_CONTRACT_INSIDE_SPREAD_LIMIT")
+
     max_premium = Decimal(str(max_premium_pct)) * equity
-    affordable = [c for c in in_window if ((c.bid + c.ask) / 2) * lot_size <= max_premium]
+    affordable = [c for c in tradeable if ((c.bid + c.ask) / 2) * lot_size <= max_premium]
     if not affordable:
         return SelectionResult(None, "NO_AFFORDABLE_CONTRACT")
 

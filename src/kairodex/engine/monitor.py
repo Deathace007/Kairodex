@@ -87,15 +87,50 @@ def stop_loss_check(position: Position) -> ExitDecision | None:
     return None
 
 
-def trailing_stop_check(position: Position, *, trail_pct: float = 0.30) -> ExitDecision | None:
+def _initial_stop_pct(position: Position) -> float | None:
+    """The fraction of entry price the position's own initial stop sat
+    below entry. `None` when there is no real risk distance to measure.
+
+    This is what `trail_pct` defaults to, and the indirection is the whole
+    point: the give-back allowance and the initial risk are the same
+    decision, so deriving one from the other makes them incapable of
+    disagreeing. They disagreed for four days. §19d moved
+    `_DEFAULT_STOP_LOSS_PCT` 0.30 -> 0.20 and correctly moved the
+    R-multiple rungs with it, reasoning that "R *is* the stop distance" —
+    but `trail_pct` lived here, in another module, as a bare 0.30 literal,
+    and nothing failed when it was left behind.
+    """
+    if position.avg_entry <= 0:
+        return None
+    risk = position.avg_entry - position.initial_stop_price
+    if risk <= 0:
+        return None
+    return float(risk / position.avg_entry)
+
+
+def trailing_stop_check(
+    position: Position, *, trail_pct: float | None = None
+) -> ExitDecision | None:
     """Stop trails at `trail_pct` below the best mark seen since entry —
     only ever moves up (never loosens), and only actually fires an exit
     if the CURRENT mark has fallen back down through the trailed level
     (not the position's originally-set `stop_price`, which the caller is
     responsible for having already ratcheted up over time — this
     function reports where the stop *should* be as of the latest high,
-    and separately whether that new level is breached right now)."""
-    trailed_stop = position.high_water_mark_price * Decimal(str(1 - trail_pct))
+    and separately whether that new level is breached right now).
+
+    `trail_pct=None` (the default) means "give back exactly as much as the
+    initial stop risked" — see `_initial_stop_pct`. Measured cost of the
+    two having drifted apart, live 2026-08-14: with a 20% stop and a 30%
+    trail, the trail becomes the binding level once a position exceeds
+    +14.3% MFE, and is *wider* than the initial risk ever was. Trade 79
+    peaked +21.0% and exited -15.8%; trade 84 peaked +16.4% and exited
+    -29.0%. An explicit float still overrides, for callers that genuinely
+    want a different give-back from their entry risk."""
+    effective_trail_pct = trail_pct if trail_pct is not None else _initial_stop_pct(position)
+    if effective_trail_pct is None:
+        return None
+    trailed_stop = position.high_water_mark_price * Decimal(str(1 - effective_trail_pct))
     effective_stop = max(position.stop_price, trailed_stop)
     if position.current_mark <= effective_stop:
         return ExitDecision("TRAILING_STOP", position.qty_lots, new_stop_price=effective_stop)
@@ -122,6 +157,24 @@ def r_multiple_partial_exit_check(
     r = position.r_multiple
     if r is None:
         return None
+    # A "partial" of a 1-lot position is the whole position, since
+    # `max(1, ...)` floors the quantity at one lot. That is deliberate, and
+    # a `qty_lots < 2: return None` guard was written on 2026-08-14 and then
+    # REVERTED — recorded here so it is not re-proposed.
+    #
+    # The reasoning for it was that trade 80 (BHARTIARTL 1980 CE, the best
+    # trade since the 08-11 reset) closed outright at +49.5% labelled
+    # PARTIAL_EXIT_R2 because the exposure cap had sized it at 1 lot, so it
+    # never got a runner. But abstaining hands a 1-lot position to the stop
+    # and the trail instead, and `test_stop_ratchet_does_not_pre_empt_a_
+    # partial_exit_on_the_same_tick` is a regression test built from real
+    # trade 4 — a genuine 1-lot position that touched 1R at 117.35 against
+    # an 89.37 entry, was consumed by the ratchet, and stopped out at -₹271
+    # after being +31%. Taking the rung is what protects that trade.
+    #
+    # Unmeasured judgement against a documented real loss loses. The actual
+    # defect is the sizing contradiction that manufactures 1-lot positions
+    # (§20a) — fix that and this case becomes rare on its own.
     for target in sorted(position.r_multiple_targets):
         if target in position.partial_exits_taken:
             continue
@@ -245,7 +298,7 @@ def evaluate_exits(
     now: datetime.datetime,
     *,
     blackout_active: bool = False,
-    trail_pct: float = 0.30,
+    trail_pct: float | None = None,
     partial_exit_fraction: float = 0.5,
 ) -> ExitDecision | None:
     """First *exit* wins, in priority order: stop-loss, trailing stop,

@@ -91,7 +91,8 @@ def test_trailing_stop_ratchets_up_without_exiting():
     effective_stop=105. current_mark=110 > 105 -> no exit, but the stop
     should ratchet up to 105."""
     result = trailing_stop_check(
-        _position(high_water_mark_price=Decimal(150), current_mark=Decimal(110))
+        _position(high_water_mark_price=Decimal(150), current_mark=Decimal(110)),
+        trail_pct=0.30,
     )
     assert result is not None
     assert result.reason == "STOP_RATCHET"
@@ -103,7 +104,8 @@ def test_trailing_stop_exits_when_mark_falls_through_trailed_level():
     """Same hwm=150 -> effective_stop=105, but current_mark=100 <= 105 ->
     exit at the trailed level, not the original stop_price."""
     result = trailing_stop_check(
-        _position(high_water_mark_price=Decimal(150), current_mark=Decimal(100))
+        _position(high_water_mark_price=Decimal(150), current_mark=Decimal(100)),
+        trail_pct=0.30,
     )
     assert result is not None
     assert result.reason == "TRAILING_STOP"
@@ -293,7 +295,7 @@ def test_stop_ratchet_still_returned_when_nothing_else_fires():
         current_mark=Decimal(200), high_water_mark_price=Decimal(200),
         profit_target=Decimal(300), r_multiple_targets=(50.0,),
     )
-    decision = evaluate_exits(position, _NOW)
+    decision = evaluate_exits(position, _NOW, trail_pct=0.30)
     assert decision is not None
     assert decision.qty_lots == 0  # ratchet, no exit
     assert decision.new_stop_price == Decimal(200) * Decimal("0.7")

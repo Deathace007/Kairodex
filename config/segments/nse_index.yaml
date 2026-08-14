@@ -9,7 +9,24 @@ weekly_loss_limit_pct: 0.28
 max_drawdown_pct: 0.35
 exposure_cap_pct: 0.30
 min_liquidity_score: 0.3
-reentry_cooldown_minutes: 30
+# 30 -> 45 on 2026-08-14, to match `scratch_exit_after_minutes` below.
+#
+# The two numbers were inconsistent and the inconsistency was expensive: the
+# system held that 45 minutes is long enough to conclude a trade is not
+# working, and that 30 minutes is long enough to forget about it.
+#
+# BHARTIARTL, 2026-08-14, one underlying in one session: 1980 CE won (+49.5%,
+# 1 lot, +Rs 192), then 2020 CE stopped out (-21.4%, 17 lots, -Rs 1,593),
+# then the SAME 2020 CE leg in the SAME direction stopped out again (-29.0%,
+# 17 lots, -Rs 2,029). Net -Rs 3,430. Trade 82 closed 12:42:08 and trade 84
+# opened 13:14:17 — 32 minutes and 9 seconds, clearing the old gate by two
+# minutes. ITC was traded three times the same day (put, put, call) for
+# -Rs 505; RELIANCE 1300 PE was scratched on 08-13 and bought again on 08-14.
+#
+# This is the other half of §17's fix. That session corrected the gate's
+# SYMMETRY (a winning close populated nothing, so TCS re-entered on the next
+# tick and lost Rs 4,343). What was left uncorrected is its DURATION.
+reentry_cooldown_minutes: 45
 
 # A VOLUME THROTTLE, not a quality filter — see nse_stock.yaml for the
 # forward-outcome evidence that confidence is anti-predictive, and for why

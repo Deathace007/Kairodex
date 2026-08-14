@@ -91,7 +91,44 @@ def size_position(
     max_exposure_lots = (
         math.floor(exposure_room / premium_cost_per_lot) if exposure_room > 0 else 0
     )
-    lots = min(lots, max_premium_lots, max_exposure_lots)
+
+    # Per-slot premium budget: the exposure cap divided by the number of
+    # positions the segment is configured to hold at once. Added 2026-08-14
+    # (PROGRESS.md §20a) because the three existing caps contradicted each
+    # other and the contradiction, not the strategy, was the day's largest
+    # loss driver.
+    #
+    # The arithmetic. `risk_budget / stop_distance` is a NOTIONAL, and since
+    # `stop_distance` is `_DEFAULT_STOP_LOSS_PCT` (0.20) of premium, that
+    # notional is `equity * base_risk_pct / 0.20` = 0.40 * equity. The
+    # premium cap is 0.35 * equity, so it binds on EVERY trade; the exposure
+    # cap is 0.40 * equity, so it funds 1.14 such positions. Result:
+    # `max_concurrent: 5` was arithmetically unreachable, the first signal
+    # of the day was funded in full, and positions 2..N divided a remainder.
+    #
+    # Live 2026-08-14 this produced notionals from Rs 148 to Rs 17,052 — a
+    # 115x spread across trades the risk model believes are one identical
+    # unit — with `corr(notional, return) = -1.2%`, i.e. size carried NO
+    # information, only variance. Flat-weighting the same 34 trades gives
+    # -Rs 3,256 against the -Rs 5,438 booked. The clearest single case: the
+    # best trade since the 08-11 reset (+49.5%, 2R in ten minutes) got ONE
+    # lot, Rs 391, because two earlier positions had eaten the budget.
+    #
+    # Expressed as a cap rather than by redefining `risk_budget`, so
+    # ARCHITECTURE.md §11's stated formula still holds as written and this
+    # sits alongside the other two caps in the same `min()`.
+    #
+    # ponytail: equal slices, not conviction-weighted. Weighting by a
+    # calibrated P(win) is the right eventual answer and is exactly what a
+    # meta-label model would supply — but `confidence` is measured
+    # ANTI-predictive (§19b), so weighting by it today would be worse than
+    # equal. Revisit when something with demonstrated edge can set the weight.
+    per_slot_premium = (
+        Decimal(str(config.exposure_cap_pct)) * equity / Decimal(max(config.max_concurrent, 1))
+    )
+    max_slot_lots = math.floor(per_slot_premium / premium_cost_per_lot)
+
+    lots = min(lots, max_premium_lots, max_exposure_lots, max_slot_lots)
 
     if lots < 1:
         return SizingResult(0, risk_budget, mult, True, "NO_TRADE_MIN_SIZE")
