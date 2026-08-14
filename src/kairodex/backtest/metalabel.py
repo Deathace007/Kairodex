@@ -339,6 +339,38 @@ def evaluate(
     )
 
 
+def permutation_null(
+    data: Dataset,
+    *,
+    n_permutations: int = 20,
+    n_folds: int = 5,
+    embargo: datetime.timedelta = DEFAULT_EMBARGO,
+    seed: int = 0,
+) -> list[float]:
+    """Re-run the WHOLE evaluation with the labels shuffled, `n` times.
+
+    This is what makes a marginal AUC interpretable, and without it a
+    number like 0.526 cannot be told apart from a biased harness. Shuffling
+    `y` destroys any feature-label relationship while leaving everything
+    else — the overlap between neighbouring signals, the fold boundaries,
+    the class balance, the imputation — exactly as it was. So the resulting
+    distribution is what this pipeline scores when there is *provably*
+    nothing to find.
+
+    If the real AUC sits inside that distribution, the honest reading is
+    "no edge detected", however far above 0.500 it happens to look.
+    Returns the mean AUC of each permutation.
+    """
+    rng = np.random.default_rng(seed)
+    nulls: list[float] = []
+    for _ in range(n_permutations):
+        shuffled = dataclasses.replace(data, y=rng.permutation(data.y))
+        report = evaluate(shuffled, n_folds=n_folds, embargo=embargo)
+        if report.folds:
+            nulls.append(report.mean_auc)
+    return nulls
+
+
 def univariate_lift(data: Dataset, *, n_bins: int = 5) -> dict[str, list[tuple[int, float]]]:
     """Per-feature target-hit rate by quantile bin — the same shape every
     detector in this system has been judged on (§19b/§19c), so a candidate

@@ -329,6 +329,9 @@ def metalabel_cmd(
     segment: Segment = typer.Option(..., help="nse_stock, nse_index, us_stock, or us_index"),
     folds: int = typer.Option(5, help="walk-forward folds (purged + embargoed)"),
     show_features: bool = typer.Option(False, help="also print per-feature univariate lift"),
+    permutations: int = typer.Option(
+        0, help="label-shuffle null runs — makes a marginal AUC interpretable"
+    ),
 ) -> None:
     """MEASURE whether a meta-label model can rank winning signals above
     losing ones. Trades nothing and wires nothing.
@@ -341,11 +344,18 @@ def metalabel_cmd(
     Read the AUC per fold, not the mean: three of four hypotheses tested
     on 2026-08-14 looked good in aggregate and died on the per-session
     split. An AUC at 0.5 means no edge, and that is a valid result."""
-    asyncio.run(_metalabel(segment, folds, show_features))
+    asyncio.run(_metalabel(segment, folds, show_features, permutations))
 
 
-async def _metalabel(segment: Segment, folds: int, show_features: bool) -> None:
-    from kairodex.backtest.metalabel import evaluate, load_dataset, univariate_lift
+async def _metalabel(
+    segment: Segment, folds: int, show_features: bool, permutations: int = 0
+) -> None:
+    from kairodex.backtest.metalabel import (
+        evaluate,
+        load_dataset,
+        permutation_null,
+        univariate_lift,
+    )
 
     sessionmaker = get_sessionmaker()
     async with sessionmaker() as session:
@@ -371,6 +381,24 @@ async def _metalabel(segment: Segment, folds: int, show_features: bool) -> None:
         f"folds beating chance: {report.folds_beating_chance}/{len(report.folds)}"
     )
     typer.echo("(AUC 0.50 = no ranking ability. Judge the per-fold column, not the mean.)")
+    if permutations:
+        import statistics as _stats
+
+        nulls = permutation_null(data, n_permutations=permutations, n_folds=folds)
+        if nulls:
+            better = sum(1 for v in nulls if v >= report.mean_auc)
+            typer.echo(
+                f"\nlabel-shuffle null over {len(nulls)} runs: "
+                f"mean {_stats.fmean(nulls):.4f}  max {max(nulls):.4f}"
+            )
+            typer.echo(
+                f"real AUC {report.mean_auc:.4f} was beaten by {better}/{len(nulls)} "
+                f"shuffles -> empirical p = {(better + 1) / (len(nulls) + 1):.3f}"
+            )
+            if (better + 1) / (len(nulls) + 1) > 0.05:
+                typer.echo("VERDICT: indistinguishable from noise. Do not wire this.")
+            else:
+                typer.echo("VERDICT: outside the null. Worth a second look, not a deployment.")
     top = sorted(report.coefficients.items(), key=lambda kv: -abs(kv[1]))[:8]
     typer.echo("\nfull-sample coefficients (INSPECTION ONLY, not out-of-sample evidence):")
     for name, coef in top:
