@@ -3229,3 +3229,53 @@ demonstrated positive edge) but sharper in its direction:
 - More sessions matter more than a better model. Six sessions and three
   folds cannot support a stronger claim than "outside the null", and a
   gradient-booster on this much data would fit noise faster, not find more.
+
+### 21e. Backfill fidelity — measured, and a real limit on mixing sources
+
+C finished 2026-08-15 05:26 IST: **nse_stock 23,649/23,649 and nse_index
+1,572/1,572, both 100%**, `no_instrument=0 no_context=0`, and 26,163
+`signals.feature_vector_id` values resolve to 26,163 rows with **0
+dangling**. Backfilled vectors carry a byte-identical schema to the ones
+the live engine writes (same 18 quality keys, same three `MISSING`).
+
+Then an exact per-row seam test, which is worth recording because it
+failed at first and the diagnosis matters. `signals.evidence` stores
+`score = tanh(trend_state_strength / _SCALE)` as written by the live
+engine at signal time, so inverting it must reproduce the backfilled
+value. Solving for the scale the engine actually used, per session:
+
+| session | implied `_SCALE` |
+|---|---|
+| 08-10 | **0.0457** |
+| 08-11 | 0.001417 |
+| 08-12 | 0.001455 |
+| 08-13 | 0.001530 |
+| 08-14 | 0.001573 |
+
+08-10 reads the OLD 0.05 constant, before §16a recalibrated it to 0.0018
+— so a single-scale inversion was always going to mismatch there, and
+that half of the failure was the test's fault, not the backfill's.
+
+**The other half is a genuine limitation.** Post-recalibration sessions
+imply ~0.0015 against the actual 0.0018 — about 15% low — drifting
+*closer* to 0.0018 the more recent the session. That is the signature of
+data revision: `build_context` is point-in-time with respect to `ts`, but
+it reads `underlying_bars` **as they exist now**, and 1-minute bars
+ingested or corrected after a signal fired were not available to the
+engine at the time. Older data has had longer to be revised, which is
+exactly the observed gradient.
+
+Consequences, stated plainly:
+
+- **§21's result is unaffected.** That dataset was 100% backfilled, so it
+  is internally consistent, and the offset is systematic rather than
+  noisy — standardisation removes a uniform scale anyway.
+- **Mixed training sets are the hazard.** From the first NSE session under
+  step A, live-written vectors land in the same table as backfilled ones
+  on a slightly different footing. A model trained across that boundary
+  can learn the seam instead of the market. Until this is quantified per
+  feature, **train on one source or the other, not both** — and prefer
+  live-written once enough of it exists.
+- `relative_strength_vs_index` reconstructs at p90 = 0.0272 against §16's
+  independently measured 0.022, so the divergence is not uniform across
+  features and deserves a per-feature measurement before any mixed run.
