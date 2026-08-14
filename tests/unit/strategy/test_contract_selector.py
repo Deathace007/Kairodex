@@ -37,11 +37,14 @@ def _select(candidates, direction, **overrides):
 
 
 def test_picks_closest_delta_to_target_among_affordable_calls():
-    """target_delta=0.40 (default). Affordable in-window calls: C1(delta
+    """target_delta pinned to 0.40 explicitly, not taken from the
+    constant: this test covers the distance arithmetic, not the live
+    target (see test_target_delta_constant.py for that). Affordable
+    in-window calls: C1(delta
     0.50, dist 0.10), C2(delta 0.35, dist 0.05), C3(delta 0.15, dist
     0.25). C6 is unaffordable (mid=710*25=17750 > 17500), C5 is past
     max_dte. C2 has the smallest distance -> selected."""
-    result = _select(_candidates(), Side.BUY)
+    result = _select(_candidates(), Side.BUY, target_delta=0.40)
     assert result.selected is not None
     assert result.selected.instrument_id == 2
 
@@ -57,7 +60,8 @@ def test_sell_direction_only_considers_puts():
 
 
 def test_picks_closest_delta_to_target_among_affordable_puts():
-    """target_delta=0.40 (default) -> signed target for puts is -0.40 (puts
+    """target_delta pinned to 0.40 explicitly (see above) -> signed
+    target for puts is -0.40 (puts
     carry negative delta by this codebase's convention). Candidates: P1
     (delta -0.15, dist |-0.15 - -0.40| = 0.25), P2 (delta -0.40, dist 0.0),
     P3 (delta -0.60, dist 0.20). P2 has the smallest distance -> selected.
@@ -70,7 +74,7 @@ def test_picks_closest_delta_to_target_among_affordable_puts():
         _c(22, 105, "P", _NEAR_EXPIRY, 8, 10, "-0.40"),
         _c(23, 110, "P", _NEAR_EXPIRY, 8, 10, "-0.60"),
     ]
-    result = _select(puts, Side.SELL)
+    result = _select(puts, Side.SELL, target_delta=0.40)
     assert result.selected is not None
     assert result.selected.instrument_id == 22
 
@@ -144,7 +148,7 @@ def test_deep_itm_is_also_rejected_not_just_deep_otm():
     leveraged stock substitute at a huge premium) is exactly as far from
     target_delta=0.40 as a lottery ticket, just on the other side."""
     near_stock = _c(31, 20, "C", _NEAR_EXPIRY, 80, 82, "0.95")
-    result = _select([near_stock], Side.BUY)
+    result = _select([near_stock], Side.BUY, target_delta=0.40)
     assert result.selected is None
     assert result.reason == "NO_CONTRACT_NEAR_TARGET_DELTA"
 
@@ -155,13 +159,13 @@ def test_exact_boundary_distance_still_selects():
     the check is `>`, not `>=`, matching this codebase's own affordability
     boundary convention (test_affordability_boundary_exact_limit_passes)."""
     boundary = _c(32, 120, "C", _NEAR_EXPIRY, 1, 2, "0.15")
-    result = _select([boundary], Side.BUY)
+    result = _select([boundary], Side.BUY, target_delta=0.40)
     assert result.selected is not None
 
 
 def test_just_past_the_boundary_is_rejected():
     boundary_plus = _c(33, 121, "C", _NEAR_EXPIRY, 1, 2, "0.149")
-    result = _select([boundary_plus], Side.BUY)
+    result = _select([boundary_plus], Side.BUY, target_delta=0.40)
     assert result.selected is None
     assert result.reason == "NO_CONTRACT_NEAR_TARGET_DELTA"
 
@@ -170,6 +174,6 @@ def test_delta_cap_still_lets_a_reasonable_contract_through():
     """The gate must not become a blanket rejection — a genuinely
     near-target contract (the existing hand-picked fixture) still selects
     exactly as before this change."""
-    result = _select(_candidates(), Side.BUY)
+    result = _select(_candidates(), Side.BUY, target_delta=0.40)
     assert result.selected is not None
     assert result.selected.instrument_id == 2  # unchanged from the original test above

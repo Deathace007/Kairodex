@@ -36,3 +36,8 @@ frontend/out/
 
 # Alembic
 alembic/versions/__pycache__/
+
+# Session reports: contain real P&L, positions and equity. Local only —
+# never pushed. Left untracked by hand until 2026-08-14, when a `git add -A`
+# nearly committed three of them.
+docs/reports/

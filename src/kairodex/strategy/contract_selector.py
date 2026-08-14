@@ -21,9 +21,47 @@ from kairodex.core.enums import Side
 
 _DEFAULT_MIN_DTE = 1
 _DEFAULT_MAX_DTE = 45
-_DEFAULT_TARGET_DELTA = 0.40  # ponytail: first-pass — a common "slightly
-# OTM, cheaper premium, still meaningful directional exposure" choice;
-# recalibrate once backtesting can measure what delta actually performs.
+# 0.40 -> 0.50 on 2026-08-14. This constant stood as an untested "slightly
+# OTM is conventional" choice with a note to recalibrate once something
+# could measure it. It sits directly inside the trade's breakeven
+# equation, so it was never a preference:
+#
+#     required underlying move = (spread + theta_over_hold) / (delta * spot)
+#
+# Both the numerator and `delta` move with strike, so the function has an
+# interior minimum. Measured over 778k liquid nse_stock chain quotes
+# (OI > 500k) across 5 sessions, expressed in ATR of the underlying so it
+# is comparable with `signals.forward_outcome` (median ATR 0.0689% of
+# price), charging theta over the 121-minute median hold:
+#
+#   |delta|      spread   theta   TOTAL hurdle
+#   0.01-0.15     1.799   1.831   3.721 ATR
+#   0.15-0.25     0.727   1.018   1.843
+#   0.25-0.35     0.604   0.797   1.486
+#   0.35-0.45     0.554   0.635   1.276   <- the old target
+#   0.45-0.55     0.512   0.536   1.125   <- here
+#   0.55-0.65     0.570   0.440   1.068   <- aggregate minimum
+#   0.65-0.75     0.722   0.355   1.095
+#   0.75-1.00     1.786   0.166   1.947
+#
+# A clean U. Far OTM is destroyed by relative spread (10.5% at 0.03
+# delta — the "cheap lottery ticket" is the most expensive thing on the
+# board); far ITM by lost leverage. Per session the 0.45-0.55 band beats
+# 0.35-0.45 in ALL FIVE (1.210/1.122, 1.318/1.082, 1.259/1.154,
+# 1.284/1.152, 1.313/1.135), so this is not one day's artefact.
+#
+# NOT moved to the 0.55-0.65 aggregate minimum, deliberately. The basin
+# is flat (1.068 vs 1.125, a 0.06 ATR difference) and going deeper ITM
+# spends two things this strategy is built on: gamma — the convexity
+# that PROGRESS.md §19d's whole ladder argument rests on — and premium
+# per lot, which binds against `max_premium_pct` and buys fewer lots.
+# 0.50 takes 0.15 of the 0.21 ATR available and keeps both.
+#
+# What this does NOT do is create edge: it moves the share of signals
+# whose best moment can cover the option from 42.7% to 46.0% (improving
+# in all 6 sessions). It lowers the cost of being right; it does not
+# make the system right.
+_DEFAULT_TARGET_DELTA = 0.50
 
 # How far from target_delta the "closest available" candidate is still
 # allowed to be. Without this, `min(affordable, key=distance)` always

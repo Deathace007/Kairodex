@@ -40,7 +40,7 @@ from kairodex.execution.simulator import ExecutionPort, ExecutionResult
 from kairodex.execution.synthetic_quote import SPREAD_PCT, synthesize_quote
 from kairodex.execution.types import OrderRequest, QuoteSnapshot
 from kairodex.features import loader as feature_loader
-from kairodex.features import registry as feature_registry
+from kairodex.features import store as feature_store
 from kairodex.risk.gates import run_gate_chain
 from kairodex.risk.sizing import size_position
 from kairodex.risk.types import AccountState, TradeProposal
@@ -262,7 +262,19 @@ async def run_entry_tick(
     index_bars = await feature_loader.load_index_bars(session, segment, now)
     if index_bars:
         feature_ctx = dataclasses.replace(feature_ctx, index_bars=index_bars)
-    values, _quality = feature_registry.compute_all(feature_ctx)
+    # `compute_and_store`, not `compute_all`: the registry computes all 18
+    # features on every tick and this strategy reads 3 of them, so until
+    # 2026-08-14 the other 15 were computed and dropped on the floor —
+    # `feature_vectors` held 2 rows total and `signals.feature_vector_id`
+    # was NULL on all 79,209 signals. Persisting here (before scoring, so
+    # non-signals and rejections are captured too, per ARCHITECTURE.md
+    # §11's "the rejections are training data") turns ~13,000 discarded
+    # observations per session into the design matrix that pairs with the
+    # `forward_outcome` labels already backfilled. One insert per
+    # underlying per tick against a tick that already takes ~150s.
+    values, _quality, feature_vector_id = await feature_store.compute_and_store(
+        session, feature_ctx, segment=segment, instrument_id=underlying.instrument_id
+    )
     market_ctx = MarketContext(feature_ctx=feature_ctx, features=values)
 
     evidence = strategy.evaluate(market_ctx)
@@ -277,6 +289,7 @@ async def run_entry_tick(
         underlying_id=underlying.instrument_id,
         direction=result.direction,
         confidence=Decimal(str(result.confidence)),
+        feature_vector_id=feature_vector_id,
         evidence=[
             {"detector": e.detector, "family": e.family.value, "score": e.score, "weight": e.weight}
             for e in evidence

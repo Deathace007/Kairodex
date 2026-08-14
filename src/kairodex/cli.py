@@ -285,6 +285,45 @@ async def _backfill_outcomes(
     )
 
 
+@backtest_app.command("backfill-features")
+def backfill_features_cmd(
+    segment: Segment = typer.Option(..., help="nse_stock, nse_index, us_stock, or us_index"),
+    since: str = typer.Option(..., help="YYYY-MM-DD — only signals at/after this date"),
+    overwrite: bool = typer.Option(False, help="re-compute signals that already link a vector"),
+) -> None:
+    """Reconstruct `feature_vectors` for signals scored before the engine
+    persisted them, and point `signals.feature_vector_id` at the result.
+
+    Pairs the design matrix with the labels `backfill-outcomes` already
+    wrote. Point-in-time by construction — see
+    `backtest/backfill_features.py` for why `prior_as_of` and `index_bars`
+    have to be supplied exactly as `engine.live_loop` supplies them.
+
+    Slow by nature: two chain reads per signal against a 64M-row quote
+    table. Run it under nohup and let it work. Safe to interrupt and
+    re-run — it resumes."""
+    start = datetime.datetime.combine(
+        datetime.date.fromisoformat(since), datetime.time.min, tzinfo=datetime.UTC
+    )
+    asyncio.run(_backfill_features(segment, start, overwrite))
+
+
+async def _backfill_features(
+    segment: Segment, since: datetime.datetime, overwrite: bool
+) -> None:
+    from kairodex.backtest.backfill_features import backfill_feature_vectors
+
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        stats = await backfill_feature_vectors(
+            session, segment=segment, since=since, overwrite=overwrite
+        )
+    typer.echo(
+        f"{segment.value}: scanned={stats.scanned} written={stats.written} "
+        f"no_instrument={stats.no_instrument} no_context={stats.no_context}"
+    )
+
+
 @backtest_app.command("run")
 def backtest_run_cmd(
     segment: Segment = typer.Option(..., help="nse_stock, nse_index, us_stock, or us_index"),
