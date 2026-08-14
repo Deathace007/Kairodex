@@ -339,6 +339,24 @@ def evaluate(
     )
 
 
+# The three features `ReferenceStrategy` actually reads. Everything else in
+# the registry is computed every tick and discarded — which is what makes
+# "do the discarded features carry more than the used ones" a question the
+# substrate from steps A and C can finally answer.
+STRATEGY_FEATURES = frozenset({"trend_state_strength", "oi_change", "relative_strength_vs_index"})
+
+
+def subset(data: Dataset, names: list[str]) -> Dataset:
+    """A Dataset restricted to `names`, preserving row order and labels."""
+    keep = [i for i, n in enumerate(data.feature_names) if n in set(names)]
+    return Dataset(
+        signals=data.signals,
+        x=data.x[:, keep] if keep else np.empty((len(data.signals), 0)),
+        y=data.y,
+        feature_names=[data.feature_names[i] for i in keep],
+    )
+
+
 def permutation_null(
     data: Dataset,
     *,

@@ -332,6 +332,9 @@ def metalabel_cmd(
     permutations: int = typer.Option(
         0, help="label-shuffle null runs — makes a marginal AUC interpretable"
     ),
+    features: str = typer.Option(
+        "all", help="all | used (the 3 detectors read) | discarded (the other 12)"
+    ),
 ) -> None:
     """MEASURE whether a meta-label model can rank winning signals above
     losing ones. Trades nothing and wires nothing.
@@ -344,16 +347,22 @@ def metalabel_cmd(
     Read the AUC per fold, not the mean: three of four hypotheses tested
     on 2026-08-14 looked good in aggregate and died on the per-session
     split. An AUC at 0.5 means no edge, and that is a valid result."""
-    asyncio.run(_metalabel(segment, folds, show_features, permutations))
+    asyncio.run(_metalabel(segment, folds, show_features, permutations, features))
 
 
 async def _metalabel(
-    segment: Segment, folds: int, show_features: bool, permutations: int = 0
+    segment: Segment,
+    folds: int,
+    show_features: bool,
+    permutations: int = 0,
+    features: str = "all",
 ) -> None:
     from kairodex.backtest.metalabel import (
+        STRATEGY_FEATURES,
         evaluate,
         load_dataset,
         permutation_null,
+        subset,
         univariate_lift,
     )
 
@@ -364,6 +373,10 @@ async def _metalabel(
         typer.echo(f"{segment.value}: no signals with BOTH features and outcomes — run "
                    "`backtest backfill-features` and `backtest backfill-outcomes` first")
         return
+    if features == "used":
+        data = subset(data, sorted(STRATEGY_FEATURES))
+    elif features == "discarded":
+        data = subset(data, [n for n in data.feature_names if n not in STRATEGY_FEATURES])
     report = evaluate(data, n_folds=folds)
     typer.echo(
         f"{segment.value}: n={report.n} features={len(report.feature_names)} "
