@@ -3078,3 +3078,69 @@ the substrate A and C produce, measured on P4's existing purged/embargoed
 walk-forward before anything is wired — plus a real event calendar, since
 `event_blackout_gate` unconditionally returns `True` and the system buys
 11-DTE options into earnings blind.
+
+### 20h. The five measured fixes, shipped (2026-08-14, 20:19 IST)
+
+All measured off real trades this week. None is a strategy view and none
+creates edge — they stop a bleed and remove noise larger than any effect
+worth detecting.
+
+| # | fix | where | evidence |
+|---|---|---|---|
+| 1 | exit sweep interleaved every 5 underlyings | `engine/live_loop.py` | stop checked every ~35s, was ~3.5 min |
+| 2 | `trail_pct` derived from the position's own initial stop | `engine/monitor.py` | trail 0.30 vs stop 0.20 since §19d |
+| 3 | reject legs wider than 2% of mid | `strategy/contract_selector.py` | sub-Rs-5 band: 4.39% RT, -Rs 2,619 |
+| 4 | `reentry_cooldown_minutes` 30 -> 45 | `config/segments/*.yaml` | BHARTIARTL -Rs 3,430, re-entered at 32m09s |
+| 5 | per-slot premium cap | `risk/sizing.py` | 115x notional dispersion, `corr(size,ret) = -1.2%` |
+
+**On (1):** moving the sweep before the entry loop is *not* the fix and was
+rejected — it changes the phase, not the period. Interleaving is what
+shortens the gap. Not a second concurrent task either: that needs a second
+session writing the same trade/equity rows, and those ordering bugs are
+worse than the latency being fixed.
+
+**On (2):** the trail is now *derived* from `initial_stop_price` rather than
+configured separately, so the two cannot drift again. §19d moved the stop
+and the rungs together on the reasoning that "R is the stop distance" and
+the trail — the same decision — sat in another module as a bare literal.
+
+**On (5):** verified numerically at the real 14 Aug closing equity. Every
+position now sizes to Rs 3,450-3,700 against Rs 148-17,052 before —
+dispersion 115x -> 1.07x — and five concurrent positions fit at 38.1% of
+equity, inside the 40% cap. The day's 2R winner would have had **9 lots
+instead of 1**. Expressed as a fourth cap in the same `min()` so
+ARCHITECTURE.md §11's `risk_budget` formula still holds as written.
+
+**Reverted while implementing, recorded so it is not re-proposed:** a
+`qty_lots < 2` guard on the partial-exit rung. A "partial" of a 1-lot
+position is the whole position, which is how the 2R winner closed with no
+runner — but abstaining hands it to the stop instead, and
+`test_stop_ratchet_does_not_pre_empt_a_partial_exit_on_the_same_tick` is a
+regression built from real trade 4, a genuine 1-lot position that touched 1R
+at 117.35 and stopped out at -Rs 271 after being +31%. Unmeasured judgement
+against a documented real loss loses. Fix (5) is the actual cause of 1-lot
+positions.
+
+**A THIRD reason US cannot trade, found live within seconds of deploying.**
+Both US segments now reject every candidate with
+`NO_CONTRACT_INSIDE_SPREAD_LIMIT`, 100%, deterministically:
+`synthetic_quote.SPREAD_PCT` is 0.04 and LSE publishes no order book at all
+(§15i), so the whole US book is fabricated at an assumed 4% spread that can
+never clear a 2% limit. Left as-is — a threshold measured on real NSE quotes
+means nothing applied to a synthetic book, and refusing to buy an instrument
+whose spread is an assumption is correct. But like §19a's unreachable
+`us_index` gate it now sits outside its own distribution. **Do not unhalt US
+expecting trades until `max_relative_spread` has a real per-segment value.**
+
+Tests that inherited a constant now pin it explicitly (`trail_pct`,
+`target_delta`, and the cooldown derived from `_CONFIG`) so the next knob
+move fails loudly instead of silently changing what they assert. 518 tests,
+ruff/mypy/import-linter clean, locally and on the VM. All four engines plus
+`kairodex-api` restarted 20:19 IST on `ce54ad9` — the API because
+`config/segments/*.yaml` changed, which is §18f exactly. Verified:
+`GET /api/segments/nse_stock/risk` returns `reentry_cooldown_minutes: 45`.
+
+**Not yet observed live.** NSE was shut when these deployed; the first
+session under them is Monday 2026-08-17. Watch: whether five positions
+actually open (max_concurrent has never been reachable before), and whether
+any stop still fills more than a couple of points past its level.

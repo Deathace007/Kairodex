@@ -112,6 +112,23 @@ _DEFAULT_MAX_DELTA_DISTANCE = 0.25
 # NOTE this is knowable *before* entry, which is what makes it actionable —
 # unlike the MFE-vs-spread comparison above, which is partly circular (a
 # trade that never rose is a trade that lost).
+#
+# CONSEQUENCE FOR US, observed live within seconds of deploying this and
+# recorded so it is not re-discovered as a mystery: both US segments now
+# reject EVERY candidate with `NO_CONTRACT_INSIDE_SPREAD_LIMIT`, 100% of the
+# time, and this is deterministic rather than distributional.
+# `execution.synthetic_quote.SPREAD_PCT` is 0.04 — LSE publishes zero bid,
+# ask and size on every row (§15i), so the entire US book is *fabricated* at
+# an assumed 4% spread, which can never clear a 2% limit.
+#
+# Left as-is deliberately. The threshold was measured on real NSE quotes and
+# means nothing applied to a synthetic book; refusing to buy an instrument
+# whose spread is an assumption is the correct behaviour, not a bug. It is a
+# THIRD independent reason US cannot trade, alongside §15i's missing order
+# book and §19a's unreachable `us_index` confidence gate — and like that
+# one, it is a gate sitting outside its own distribution, so it must be
+# re-sited when the data layer is fixed. **Do not unhalt US expecting trades
+# until `max_relative_spread` is given a real per-segment value.**
 _DEFAULT_MAX_RELATIVE_SPREAD = 0.02
 
 
