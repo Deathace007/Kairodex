@@ -324,6 +324,64 @@ async def _backfill_features(
     )
 
 
+@backtest_app.command("metalabel")
+def metalabel_cmd(
+    segment: Segment = typer.Option(..., help="nse_stock, nse_index, us_stock, or us_index"),
+    folds: int = typer.Option(5, help="walk-forward folds (purged + embargoed)"),
+    show_features: bool = typer.Option(False, help="also print per-feature univariate lift"),
+) -> None:
+    """MEASURE whether a meta-label model can rank winning signals above
+    losing ones. Trades nothing and wires nothing.
+
+    Keeps the existing strategy deciding the side (direction is weakly
+    right — inverting it is far worse) and asks only whether a second
+    model can tell which of its calls will work, which is what
+    `confidence` was supposed to do and measurably does not.
+
+    Read the AUC per fold, not the mean: three of four hypotheses tested
+    on 2026-08-14 looked good in aggregate and died on the per-session
+    split. An AUC at 0.5 means no edge, and that is a valid result."""
+    asyncio.run(_metalabel(segment, folds, show_features))
+
+
+async def _metalabel(segment: Segment, folds: int, show_features: bool) -> None:
+    from kairodex.backtest.metalabel import evaluate, load_dataset, univariate_lift
+
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        data = await load_dataset(session, segment=segment)
+    if len(data) == 0:
+        typer.echo(f"{segment.value}: no signals with BOTH features and outcomes — run "
+                   "`backtest backfill-features` and `backtest backfill-outcomes` first")
+        return
+    report = evaluate(data, n_folds=folds)
+    typer.echo(
+        f"{segment.value}: n={report.n} features={len(report.feature_names)} "
+        f"base_rate={report.base_rate:.3f}"
+    )
+    header = f"{'test_start':<20}{'n_train':>8}{'n_test':>8}{'base':>7}{'AUC':>7}{'lift@10%':>10}"
+    typer.echo(header)
+    for f in report.folds:
+        typer.echo(
+            f"{f.test_start:%Y-%m-%d %H:%M}     {f.n_train:>8} {f.n_test:>7} "
+            f"{f.base_rate:>6.3f} {f.auc:>6.3f} {f.lift_top_decile:>9.2f}"
+        )
+    typer.echo(
+        f"\nmean AUC {report.mean_auc:.4f}   "
+        f"folds beating chance: {report.folds_beating_chance}/{len(report.folds)}"
+    )
+    typer.echo("(AUC 0.50 = no ranking ability. Judge the per-fold column, not the mean.)")
+    top = sorted(report.coefficients.items(), key=lambda kv: -abs(kv[1]))[:8]
+    typer.echo("\nfull-sample coefficients (INSPECTION ONLY, not out-of-sample evidence):")
+    for name, coef in top:
+        typer.echo(f"  {name:<32} {coef:+.4f}")
+    if show_features:
+        typer.echo("\nunivariate hit rate by quintile (low -> high):")
+        for name, bins in sorted(univariate_lift(data).items()):
+            cells = "  ".join(f"{r:.3f}" for _n, r in bins)
+            typer.echo(f"  {name:<32} {cells}")
+
+
 @backtest_app.command("run")
 def backtest_run_cmd(
     segment: Segment = typer.Option(..., help="nse_stock, nse_index, us_stock, or us_index"),
