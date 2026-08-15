@@ -3279,3 +3279,78 @@ Consequences, stated plainly:
 - `relative_strength_vs_index` reconstructs at p90 = 0.0272 against §16's
   independently measured 0.022, so the divergence is not uniform across
   features and deserves a per-feature measurement before any mixed run.
+
+## 22. Attacking the hurdle instead of the signal (2026-08-15)
+
+§20d established the binding constraint: the option costs ~1.1 ATR and the
+median signal delivers 0.95, so a better entry model earns nothing until it
+clears that. `target_delta` was one constant on that equation and measuring
+it moved the hurdle 1.276 -> 1.125 in an afternoon. Two more constants sit
+on the same equation and had never been measured.
+
+### 22a. DTE — hypothesis rejected, no change warranted
+
+Theta is over half the hurdle and scales roughly as 1/sqrt(T), so a longer
+tenor should cut it. Measured over liquid nse_stock quotes with the delta
+band held at 0.45-0.55 and the hold held at 121 minutes:
+
+| DTE band | spread ATR | theta ATR | **hurdle ATR** |
+|---|---|---|---|
+| 8-14 (what the selector picks) | 0.434 | 0.595 | **1.064** |
+| 15-25 | 0.477 | 0.555 | **1.056** |
+| 46+ | 1.332 | 0.315 | **1.646** |
+
+Theta does halve as predicted (0.595 -> 0.315). But relative spread nearly
+triples (0.92% -> 1.47%) because the far month is thin, and the net hurdle
+is **55% worse**. NSE stock monthlies leave no 26-45 DTE window to exploit,
+so there is no middle ground. **`_select_across_expiries`' "nearest working
+expiry" is already the optimum.** No code change.
+
+### 22b. Per-underlying hurdle — real, stable, and it varies 2.1x
+
+The hurdle in ATR units is `cost% / ATR%`, and ATR% is a property of the
+NAME. So the same option-buying strategy faces a materially different bar
+depending on what it trades — which the watchlist has never been filtered on.
+
+Measured per name (cost at 0.40-0.60 delta, OI > 200k; ATR from that name's
+own resolved signals):
+
+| | hurdle | clears | target hit | | | hurdle | clears | target hit |
+|---|---|---|---|---|---|---|---|---|
+| BHARTIARTL | 0.94 | 56.0% | 36.0% | | HINDUNILVR | 1.08 | 41.0% | 25.6% |
+| MARUTI | 1.10 | 53.6% | 36.4% | | ONGC | 1.70 | 38.6% | 33.6% |
+| RELIANCE | 0.83 | 52.7% | 33.2% | | ITC | 1.71 | 38.6% | 35.5% |
+| SUNPHARMA | 1.01 | 52.2% | 36.2% | | WIPRO | 1.77 | 36.3% | 33.5% |
+| SBIN | 0.87 | 51.6% | 30.1% | | HDFCBANK | 1.45 | 35.2% | 26.5% |
+| ADANIENT | 1.54 | 43.2% | 38.2% | | KOTAKBANK | 1.42 | 33.0% | 24.2% |
+
+`clears` is the share of that name's signals whose best moment exceeded its
+OWN hurdle — deliberately distribution-aware rather than a median
+comparison, because a median cut repeats §20f's leave-one-out mistake.
+**ADANIENT proves the point**: second-worst hurdle (1.54) but mid-pack on
+clears (43.2%), because its tail is the fattest in the watchlist (38.2% of
+signals reach 2 ATR). A median-based filter would have dropped the name
+that produced 14 Aug's single biggest winner.
+
+The ranking validates externally against the real book: BHARTIARTL 1st and
+produced the best trade of 08-14; ITC 17th and WIPRO 18th, both traded and
+both lost; KOTAKBANK last and has never been traded at all.
+
+**The COST half is stable** — per session the hurdle barely moves
+(ADANIENT 1.53-1.54, ONGC 1.66-1.73, RELIANCE 0.79-0.89), which is expected
+of a structural quantity and is why this is a better lever than signal
+hunting.
+
+### 22c. What this does NOT yet support
+
+**A watchlist cut.** `clears_pct` decomposed per session is too thin to
+rank the middle: ~30 signals per name per session, and it shows —
+RELIANCE reads 100 in one session, WIPRO swings 10 -> 47, HDFCBANK 33 ->
+67. Only the extremes survive: **KOTAKBANK never exceeds 42** (36/42/34/
+34/33, worst or near-worst every session, and worst on target hit at
+24.2%), and **BHARTIARTL never drops below 47**.
+
+So: record the hurdle, do not re-site the watchlist on six sessions. The
+cost ranking is trustworthy today; the outcome half needs more sessions.
+Revisit once live-written features have accumulated (§21e — and note that
+mixing them with backfilled rows is its own hazard).
