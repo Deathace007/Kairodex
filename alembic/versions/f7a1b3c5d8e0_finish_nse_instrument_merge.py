@@ -1,34 +1,31 @@
-"""finish NSE instrument merge — option_quotes, loser deletion, guard rail
+"""repoint remaining NSE instrument-merge FK stragglers
 
 Revision ID: f7a1b3c5d8e0
 Revises: d3e9f1a2b4c6
 Create Date: 2026-08-19 15:45:00.000000
 
-The maintenance-window half of `d3e9f1a2b4c6`, deferred there because
-46.8M of `option_quotes`'s ~102.6M rows belonged to loser instrument_ids
-and rewriting that live during market hours was the wrong tradeoff. NSE
-market is now closed for the day (last quote 2026-08-19 15:40 IST, engine
-logged "market closed" for both nse_stock and nse_index at 15:31-15:32),
-the recorder has gone quiet, and there are 0 open positions — so this
-finishes the job:
+`d3e9f1a2b4c6` repointed every small FK table for the NSE duplicate
+merge, but a follow-up check (2026-08-19 20:08 IST, after the
+option_quotes-merge migration failed on this) found `underlying_bars`
+still had 1,437 rows on loser instrument_id=1 ("Nifty 50", the dead twin
+of the live "NIFTY" row, instrument_id=6031, watchlist_membership's
+actual underlying) — the fix that migration made to the OTHER keyed
+tables evidently didn't fully land for this one row/table combination,
+root cause not chased further since re-running the identical,
+already-proven-correct repoint logic is both the fix and the diagnostic:
+if any table still has stragglers, this sweep catches them too.
 
-  - recomputes the identical loser/survivor mapping `d3e9f1a2b4c6` used
-    (same ordering, and that migration didn't touch `last_seen`, so the
-    ranking is unchanged) and merges `option_quotes` the same
-    collision-safe way the small keyed tables were merged: drop any
-    loser-side row that would collide with one the survivor already has
-    at the same `ts`, then repoint the rest.
-  - deletes the now-fully-childless loser `instruments` rows.
-  - adds the guard-rail partial unique indexes on
-    `(exchange, provider_ids->>'upstox')` and
-    `(exchange, provider_ids->>'lse')` so this duplicate-identity class
-    becomes structurally impossible, not just code-guarded
-    (`ingest.upsert_instrument`'s deterministic ordering).
+This is deliberately split out from the option_quotes merge (a separate,
+much slower migration) rather than folded back into one transaction: the
+first attempt at that combined migration ran for ~4 hours, successfully
+rewrote all 46.8M option_quotes rows, and then failed at the very last
+step (deleting loser instruments rows) on exactly this FK straggler —
+throwing away all 4 hours of work when the transaction rolled back. Small,
+fast, and isolated is the point: if this migration or a future one still
+misses something, only the fast part needs re-running, not the slow one.
 
-A scoped backup of the affected `option_quotes` rows (loser instrument_ids
-only, ~46.8M rows) was taken via `COPY ... TO PROGRAM 'gzip > ...'` before
-this ran — see the VM's `/tmp/loser_option_quotes_backup.csv.gz` /
-`backups/`.
+Idempotent: re-running the same collision-safe repoint against tables
+that are already fully merged is a set of no-op UPDATEs.
 """
 
 from collections.abc import Sequence
@@ -42,18 +39,28 @@ down_revision: str | Sequence[str] | None = "d3e9f1a2b4c6"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
+_SIMPLE_TABLES = [
+    ("trades", "instrument_id"),
+    ("trades", "underlying_id"),
+    ("orders", "instrument_id"),
+    ("signals", "underlying_id"),
+    ("chain_snapshots", "underlying_id"),
+    ("instruments", "underlying_id"),
+]
+
+_KEYED_TABLES = [
+    ("underlying_bars", "instrument_id", ["timeframe", "ts"]),
+    ("market_depth", "instrument_id", ["ts", "side", "level"]),
+    ("options_flow", "instrument_id", ["ts", "price", "size"]),
+    ("corporate_actions", "instrument_id", ["ex_date", "action_type"]),
+    ("instrument_specs", "instrument_id", ["valid_from"]),
+    ("watchlist_membership", "instrument_id", ["segment", "valid_from"]),
+    ("feature_vectors", "instrument_id", ["segment", "as_of", "registry_version"]),
+]
+
 
 def upgrade() -> None:
     conn = op.get_bind()
-
-    # option_quotes is a compressed hypertable — its older chunks are
-    # TimescaleDB-compressed, and writing to a compressed chunk means
-    # decompressing the rows it touches first. The default per-transaction
-    # cap (100,000 tuples) exists to catch runaway DML, but this merge's
-    # ~46.8M affected rows are a known, one-time, already-scoped volume,
-    # not a runaway query — SET LOCAL keeps the raised limit inside this
-    # migration's own transaction only.
-    conn.execute(sa.text("SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0"))
 
     conn.execute(
         sa.text(
@@ -84,84 +91,45 @@ def upgrade() -> None:
     if n_pairs == 0:
         return
 
-    # Raising the tuple-decompression cap above only lifts DELETE's limit.
-    # UPDATE on a compressed chunk is refused outright by TimescaleDB
-    # ("cannot update column ... of a compressed chunk — decompress the
-    # chunk before running this update") regardless of that setting, so
-    # the chunks actually have to be decompressed first. `decompress_chunk`
-    # on this install (2.28.1) takes `if_compressed boolean DEFAULT true`
-    # — the default already means "no-op instead of erroring if it isn't
-    # compressed" (not `if_not_compressed`, which doesn't exist on this
-    # version — that mistake is what f7a1b3c5d8e0's third attempt hit).
-    # Not recompressed afterward here — the existing compression policy
-    # job picks that up on its normal schedule; this migration only needs
-    # the write to succeed, not to manage storage layout.
-    conn.execute(
-        sa.text(
-            """
-            SELECT decompress_chunk(c)
-            FROM show_chunks('option_quotes') c
-            """
+    for table, col, keys in _KEYED_TABLES:
+        key_match = " AND ".join(f"s2.{k} = child.{k}" for k in keys)
+        conn.execute(
+            sa.text(
+                f"""
+                DELETE FROM {table} child
+                USING instrument_merge_map m
+                WHERE child.{col} = m.loser_id
+                  AND EXISTS (
+                      SELECT 1 FROM {table} s2
+                      WHERE s2.{col} = m.survivor_id AND {key_match}
+                  )
+                """
+            )
         )
-    )
+        conn.execute(
+            sa.text(
+                f"""
+                UPDATE {table} child SET {col} = m.survivor_id
+                FROM instrument_merge_map m
+                WHERE child.{col} = m.loser_id
+                """
+            )
+        )
 
-    # option_quotes' primary key is (instrument_id, ts) — same collision
-    # risk as the small keyed tables in d3e9f1a2b4c6, same fix: drop the
-    # loser-side row first wherever the survivor already has one at the
-    # same ts, then repoint what's left.
-    conn.execute(
-        sa.text(
-            """
-            DELETE FROM option_quotes child
-            USING instrument_merge_map m
-            WHERE child.instrument_id = m.loser_id
-              AND EXISTS (
-                  SELECT 1 FROM option_quotes s2
-                  WHERE s2.instrument_id = m.survivor_id AND s2.ts = child.ts
-              )
-            """
+    for table, col in _SIMPLE_TABLES:
+        conn.execute(
+            sa.text(
+                f"""
+                UPDATE {table} child SET {col} = m.survivor_id
+                FROM instrument_merge_map m
+                WHERE child.{col} = m.loser_id
+                """
+            )
         )
-    )
-    conn.execute(
-        sa.text(
-            """
-            UPDATE option_quotes child SET instrument_id = m.survivor_id
-            FROM instrument_merge_map m
-            WHERE child.instrument_id = m.loser_id
-            """
-        )
-    )
-
-    # Every FK table (including option_quotes, just above) now points
-    # only at survivors — the loser rows are childless and safe to drop.
-    conn.execute(
-        sa.text(
-            """
-            DELETE FROM instruments
-            WHERE instrument_id IN (SELECT loser_id FROM instrument_merge_map)
-            """
-        )
-    )
-
-    op.create_index(
-        "uq_instruments_provider_upstox",
-        "instruments",
-        [sa.text("exchange"), sa.text("(provider_ids ->> 'upstox')")],
-        unique=True,
-        postgresql_where=sa.text("provider_ids ? 'upstox'"),
-    )
-    op.create_index(
-        "uq_instruments_provider_lse",
-        "instruments",
-        [sa.text("exchange"), sa.text("(provider_ids ->> 'lse')")],
-        unique=True,
-        postgresql_where=sa.text("provider_ids ? 'lse'"),
-    )
 
 
 def downgrade() -> None:
-    op.drop_index("uq_instruments_provider_lse", table_name="instruments")
-    op.drop_index("uq_instruments_provider_upstox", table_name="instruments")
-    # The merge and the loser-row deletion are not reversible — restore
-    # from the pre-migration backup (instruments + option_quotes) if this
-    # ever needs to be undone.
+    # Not reversible, and nothing here is destructive to reverse — this
+    # only repoints FK columns that were already meant to point at the
+    # survivor per d3e9f1a2b4c6.
+    pass
