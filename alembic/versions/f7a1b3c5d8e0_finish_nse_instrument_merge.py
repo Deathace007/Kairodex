@@ -46,6 +46,15 @@ depends_on: str | Sequence[str] | None = None
 def upgrade() -> None:
     conn = op.get_bind()
 
+    # option_quotes is a compressed hypertable — its older chunks are
+    # TimescaleDB-compressed, and writing to a compressed chunk means
+    # decompressing the rows it touches first. The default per-transaction
+    # cap (100,000 tuples) exists to catch runaway DML, but this merge's
+    # ~46.8M affected rows are a known, one-time, already-scoped volume,
+    # not a runaway query — SET LOCAL keeps the raised limit inside this
+    # migration's own transaction only.
+    conn.execute(sa.text("SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0"))
+
     conn.execute(
         sa.text(
             """
