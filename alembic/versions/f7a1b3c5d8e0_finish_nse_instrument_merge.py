@@ -84,6 +84,25 @@ def upgrade() -> None:
     if n_pairs == 0:
         return
 
+    # Raising the tuple-decompression cap above only lifts DELETE's limit.
+    # UPDATE on a compressed chunk is refused outright by TimescaleDB
+    # ("cannot update column ... of a compressed chunk — decompress the
+    # chunk before running this update") regardless of that setting, so
+    # the chunks actually have to be decompressed first. `if_not_compressed
+    # => true` no-ops the 7 of 12 option_quotes chunks that are already
+    # uncompressed rather than erroring on them. Not recompressed
+    # afterward here — the existing compression policy job picks that up
+    # on its normal schedule; this migration only needs the write to
+    # succeed, not to manage storage layout.
+    conn.execute(
+        sa.text(
+            """
+            SELECT decompress_chunk(c, if_not_compressed => true)
+            FROM show_chunks('option_quotes') c
+            """
+        )
+    )
+
     # option_quotes' primary key is (instrument_id, ts) — same collision
     # risk as the small keyed tables in d3e9f1a2b4c6, same fix: drop the
     # loser-side row first wherever the survivor already has one at the
