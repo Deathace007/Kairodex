@@ -59,7 +59,16 @@ def run_migrations_offline() -> None:
 
 
 def do_run_migrations(connection: Connection) -> None:
-    context.configure(connection=connection, target_metadata=target_metadata)
+    # Without this, `alembic upgrade head` across N pending revisions runs
+    # them all in ONE transaction — a failure in revision N rolls back
+    # revision 1 through N-1 too, even though they already succeeded.
+    # Cost real time once: a1b2c3d4e5f6 (2026-08-19) failed on a temp-table
+    # collision with the revision run just before it in the same batch,
+    # and the rollback took the already-committed-in-spirit prior
+    # migration down with it.
+    context.configure(
+        connection=connection, target_metadata=target_metadata, transaction_per_migration=True
+    )
 
     with context.begin_transaction():
         context.run_migrations()
