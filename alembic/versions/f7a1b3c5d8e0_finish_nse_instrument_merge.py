@@ -88,16 +88,18 @@ def upgrade() -> None:
     # UPDATE on a compressed chunk is refused outright by TimescaleDB
     # ("cannot update column ... of a compressed chunk — decompress the
     # chunk before running this update") regardless of that setting, so
-    # the chunks actually have to be decompressed first. `if_not_compressed
-    # => true` no-ops the 7 of 12 option_quotes chunks that are already
-    # uncompressed rather than erroring on them. Not recompressed
-    # afterward here — the existing compression policy job picks that up
-    # on its normal schedule; this migration only needs the write to
-    # succeed, not to manage storage layout.
+    # the chunks actually have to be decompressed first. `decompress_chunk`
+    # on this install (2.28.1) takes `if_compressed boolean DEFAULT true`
+    # — the default already means "no-op instead of erroring if it isn't
+    # compressed" (not `if_not_compressed`, which doesn't exist on this
+    # version — that mistake is what f7a1b3c5d8e0's third attempt hit).
+    # Not recompressed afterward here — the existing compression policy
+    # job picks that up on its normal schedule; this migration only needs
+    # the write to succeed, not to manage storage layout.
     conn.execute(
         sa.text(
             """
-            SELECT decompress_chunk(c, if_not_compressed => true)
+            SELECT decompress_chunk(c)
             FROM show_chunks('option_quotes') c
             """
         )
