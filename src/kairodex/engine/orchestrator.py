@@ -621,7 +621,7 @@ async def run_exit_tick(
     quoted mark, run through `kairodex.engine.monitor.evaluate_exits`,
     acted on if it fires. Always writes a `position_marks` row regardless
     of outcome, which is what makes MFE/MAE exact (ARCHITECTURE.md §12)."""
-    latest_quote = await _latest_quote(session, trade.instrument_id)
+    latest_quote = await _latest_quote_with_failover(session, trade, now)
     if latest_quote is None:
         return ExitOutcome(trade.trade_id, "NO_QUOTE", closed=False)
     mark = latest_quote.ltp
@@ -985,3 +985,83 @@ async def _latest_quote(session: AsyncSession, instrument_id: int) -> OptionQuot
         .limit(1)
     )
     return row
+
+
+# A normal inter-tick gap for a thin option leg can run minutes (§1's
+# decision log — the per-tick SEQUENCE_GAP flag was removed for exactly
+# this reason). This threshold is for a different failure mode entirely:
+# a duplicate-identity split (upsert_instrument's docstring) orphaning the
+# row a trade is pinned to, permanently, not just for one slow tick.
+_ORPHAN_QUOTE_AGE_S = 300.0
+
+
+async def _latest_quote_with_failover(
+    session: AsyncSession, trade: Trade, now: datetime.datetime
+) -> OptionQuote | None:
+    """`_latest_quote` against `trade.instrument_id` — with a fallback for
+    when that row has gone dark far longer than a thin leg's normal quiet
+    spell can explain. Checks whether a sibling `instruments` row sharing
+    the same provider key (the duplicate-identity class `upsert_instrument`
+    now dedupes on ingest, but does not retroactively merge — see its
+    docstring, and PROGRESS.md §15) is the one actually receiving quotes,
+    and if so repoints `trade.instrument_id` to it.
+
+    Without this, an identity split orphans an open position's price feed
+    silently and indefinitely — SBIN (trade 95) and TCS (trade 101) sat on
+    a dead row retrying `OVERNIGHT_EXIT` once a minute for 23+ hours on
+    2026-08-18/19 before this existed. With it, the position self-heals on
+    its own next exit tick instead of needing a manual DB repair."""
+    quote = await _latest_quote(session, trade.instrument_id)
+    if quote is not None and (now - quote.ts).total_seconds() <= _ORPHAN_QUOTE_AGE_S:
+        return quote
+
+    instrument = await session.get(Instrument, trade.instrument_id)
+    if instrument is None:
+        return quote
+    provider = "upstox" if trade.segment.market is Market.NSE else "lse"
+    provider_key = instrument.provider_ids.get(provider)
+    if provider_key is None:
+        return quote
+
+    sibling = await session.scalar(
+        select(Instrument)
+        .where(
+            Instrument.instrument_id != trade.instrument_id,
+            Instrument.exchange == instrument.exchange,
+            Instrument.provider_ids[provider].astext == provider_key,
+        )
+        .order_by(Instrument.last_seen.desc())
+        .limit(1)
+    )
+    if sibling is None:
+        return quote
+
+    sibling_quote = await _latest_quote(session, sibling.instrument_id)
+    if sibling_quote is None or (quote is not None and sibling_quote.ts <= quote.ts):
+        return quote  # the sibling isn't actually fresher — nothing to fail over to
+
+    logger.warning(
+        "trade %d: instrument %d has gone dark (last quote %s) while sibling "
+        "instrument %d (same %s key %s) is live (last quote %s) — repointing",
+        trade.trade_id,
+        trade.instrument_id,
+        quote.ts if quote is not None else "never",
+        sibling.instrument_id,
+        provider,
+        provider_key,
+        sibling_quote.ts,
+    )
+    await event_log.append_event(
+        session,
+        trade_id=trade.trade_id,
+        event_type="INSTRUMENT_REPOINTED",
+        payload={
+            "from_instrument_id": trade.instrument_id,
+            "to_instrument_id": sibling.instrument_id,
+            "reason": "duplicate_identity_orphan",
+        },
+        ts=now,
+    )
+    trade.instrument_id = sibling.instrument_id
+    await session.flush()
+    return sibling_quote

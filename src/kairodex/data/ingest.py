@@ -52,23 +52,43 @@ async def upsert_instrument(session: AsyncSession, rec: InstrumentRecord, provid
     Merging on the provider key also keeps the original intent — the same
     contract seen from two vendors resolves to one row."""
     provider_key = rec.provider_ids.get(provider)
+    # Both lookups below are `.order_by(last_seen.desc()).limit(1)`, not a
+    # bare `session.scalar()`. That matters only when a duplicate pair
+    # still exists (§15's fix stops new ones but never merged the backlog)
+    # — an unordered `scalar()` on a multi-row result returns whichever
+    # row Postgres's query plan hands back first, which is not guaranteed
+    # stable call to call. That was the exact mechanism behind the
+    # 2026-08-18/19 SBIN/TCS recurrence: a position entered against
+    # whichever duplicate `_resolve_leg_instrument_id` picked as
+    # most-recently-quoted, and the *next* ingest write for the same
+    # provider key landed on the other row instead, orphaning the open
+    # trade's price feed for good. Ordering by `last_seen` makes the pick
+    # deterministic AND sticky — whichever row wins a pick has the
+    # freshest `last_seen` afterward, so it keeps winning — instead of
+    # flip-flopping between the two on every call.
     existing = None
     if provider_key is not None:
         existing = await session.scalar(
-            select(Instrument).where(
+            select(Instrument)
+            .where(
                 Instrument.exchange == rec.exchange,
                 Instrument.provider_ids[provider].astext == provider_key,
             )
+            .order_by(Instrument.last_seen.desc())
+            .limit(1)
         )
     if existing is None:
         existing = await session.scalar(
-            select(Instrument).where(
+            select(Instrument)
+            .where(
                 Instrument.exchange == rec.exchange,
                 Instrument.symbol == rec.symbol,
                 Instrument.expiry == rec.expiry,
                 Instrument.strike == rec.strike,
                 Instrument.option_type == rec.option_type,
             )
+            .order_by(Instrument.last_seen.desc())
+            .limit(1)
         )
     now = datetime.datetime.now(datetime.UTC)
     if existing is not None:
