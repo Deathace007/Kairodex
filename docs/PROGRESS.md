@@ -1,6 +1,13 @@
 # Kairodex — Development Progress
 
-**Last updated:** 2026-08-14 (evening — §20)
+**Last updated:** 2026-08-20 (evening — §23)
+
+**2026-08-20: US segment (us_stock/us_index) removed, application shut
+down, VM about to be stopped.** See §23 for the full account — hard
+delete verified (0 US rows anywhere, NSE untouched), a full DB backup
+taken and restore-verified, transferred off the VM before shutdown.
+**If you are picking this project back up on a new host, start at §23,
+not here** — it has the restore procedure and where the backup lives.
 **Current phase:** P1 (The Recorder) is done pending the unattended
 5-session check (§7). P2 (Pricing & features) is functionally complete
 (§8). **P3 (Engine & paper execution) is functionally complete and
@@ -3354,3 +3361,141 @@ So: record the hurdle, do not re-site the watchlist on six sessions. The
 cost ranking is trustworthy today; the outcome half needs more sessions.
 Revisit once live-written features have accumulated (§21e — and note that
 mixing them with backfilled rows is its own hazard).
+
+---
+
+## 23. US segment removed, application shut down, VM stopped (2026-08-20)
+
+Scoped in a prior same-evening session alongside the (unrelated) NSE
+instrument-duplicate-identity fix (§6 #11's root cause — see the
+`d3e9f1a2b4c6`/`f7a1b3c5d8e0`/`a1b2c3d4e5f6`/`b6f5e4d3c2a1` migration
+chain and `alembic/env.py`'s `transaction_per_migration=True`, both from
+that session). Decision, not re-litigated here: remove **both**
+`us_stock` and `us_index` — no edge ever demonstrated on that side (§19a,
+§20h's "third reason US cannot trade": the synthetic 4% spread can never
+clear the 2% spread limit) — **stop+disable only, not a code deletion**
+(Market.US/LSE code touches ~65 files; a real removal is separate,
+bigger-scope work for later). `strategies`/`strategy_promotions` for
+us_stock/us_index and `fx_rates` were deliberately left alone (dormant
+config, not segment-specific data).
+
+### 23a. What was actually done, in order
+
+1. **Services stopped+disabled**: `kairodex-engine-us_stock`,
+   `kairodex-engine-us_index`, `kairodex-ingest-us` (the LSE recorder).
+2. **`config/watchlist.yaml`**: `us_index`/`us_stock` blocks deleted.
+3. **Hard delete**, three Alembic revisions (same split-by-risk pattern
+   as the NSE merge — isolate the one slow step from everything else):
+   `e4b8a2c6d9f1` (every FK-child table except option_quotes — trades,
+   signals, orders, fills, trade_events, position_marks,
+   equity_snapshots, risk_state, backtest_runs, feature_vectors,
+   chain_snapshots, options_flow, market_depth, underlying_bars,
+   instrument_specs, watchlist_membership, corporate_actions) ->
+   `d7f3c1a9e5b2` (option_quotes alone — 21,830,195 US rows on a
+   compressed hypertable; `SET LOCAL
+   timescaledb.max_tuples_decompressed_per_dml_transaction = 0` +
+   `decompress_chunk` first, same reasoning as the NSE merge's own
+   `a1b2c3d4e5f6`) -> `c2a6f4b8d1e7` (defensive `NOT EXISTS`-gated
+   instruments delete + the `feed_health` 'lse' row, same guard-rail
+   shape as `b6f5e4d3c2a1`). Ran clean, no errors, all three committed
+   independently. **Only ran once NSE market had actually closed**
+   (`kairodex-engine-nse_stock`/`nse_index` both logged "market closed —
+   idling" before the DELETE started) — a throwaway read-only
+   `decompress_chunk()` verification query run *during* market hours
+   earlier the same session had blocked two live NSE queries against
+   `option_quotes` for ~2 minutes before being killed, confirming the
+   lock-contention risk is real on this shared hypertable.
+4. **Backed up before deleting**: non-hypertable US tables via `COPY`
+   (not `pg_dump -t` — see §16e's lesson about that missing hypertable
+   chunk data) while NSE was still open (safe, no lock risk on plain
+   tables), then the 7 hypertables (option_quotes, underlying_bars,
+   market_depth, position_marks, equity_snapshots, feature_vectors,
+   options_flow) once NSE had closed. All row counts verified exact
+   against a pre-delete count pass. Left on the VM at
+   `/root/backups/us_segment_removal_2026-08-20/` — **gone once the VM
+   is stopped**, superseded anyway by the full backup in §23c.
+5. **Verified**: 0 rows anywhere for `exchange='US'` / `segment IN
+   ('us_stock','us_index')` across every table checked; NSE untouched
+   (79 trades, 28,062 signals, 35,432 NSE instruments, all matching
+   pre-delete); all remaining engines/units healthy.
+
+### 23b. Frontend, same evening, unrelated to the US removal
+
+Two dashboard fixes, requested and shipped while waiting for NSE market
+close:
+
+1. **Equity chart now renders in IST**, not lightweight-charts' UTC
+   default. The library has no timezone option, only formatter hooks —
+   `EquityChart.tsx` now overrides `timeScale.tickMarkFormatter` and
+   `localization.timeFormatter` via `Intl`/`Asia/Kolkata`, matching
+   `fmtTsIST`'s existing convention everywhere else in this app.
+2. **Trade history is now date-filterable**, defaulting to today (IST),
+   latest trade on top (the API returns ascending; reversed client-side).
+   `TradeDateFilter.tsx` drives a `?date=` search param on
+   `segment/[segment]/page.tsx`, reusing the trades endpoint's existing
+   `from`/`to` filter — no backend change needed.
+
+**Broke, then fixed, the Surge static-export auto-rebuild.** The first
+version of (2) awaited `props.searchParams` unconditionally — `output:
+"export"` (`deploy-surge.sh`, `app.swingpro.tech`) has no server, so
+per-request `searchParams` is structurally impossible there, and Next
+fails the *whole* build the instant a page awaits it under that mode.
+`kairodex-surge-deploy.timer` (every 20 min) failed silently from 15:11
+IST until caught; `app.swingpro.tech` served a stale pre-change snapshot
+in the meantime. Fixed by gating the `await` behind
+`if (!IS_STATIC_EXPORT)` — an `if`, not a ternary awaiting inside one
+branch, so the static-export build's dead-code elimination drops the
+`await props.searchParams` call entirely (same pattern this file already
+used for `generateStaticParams`) rather than merely skipping it at
+runtime. **Lesson for next time a page prop is added here**: check
+`IS_STATIC_EXPORT`/`next.config.ts`'s own top comment before touching
+anything in `segment/[segment]/page.tsx` — this file runs in two
+structurally different modes from one source tree, and the static one
+has no server at all.
+
+### 23c. Full backup taken before VM shutdown
+
+User's call: shut the application down and stop the VM entirely (moving
+to a different provider later), so — beyond the US-removal backups in
+§23a, which live only on this VM — a complete, portable backup was
+needed first.
+
+**Procedure**: all `kairodex-*` services stopped for a settled, nothing-
+writing snapshot -> `pg_dump -Fc` of the whole `kairodex` database ->
+**restore-verified** (the actual point of doing this at all, per §16e's
+hard lesson that a `pg_dump` reporting success is not the same as a
+correct backup): restored into a scratch DB
+(`kairodex_restore_check`, dropped after) and every one of 25 tables'
+row counts compared exact against the live source, including every
+hypertable — `option_quotes: 90,681,000` rows matching precisely.
+`pg_restore` does print 7 non-fatal errors on this dump (`ALTER TABLE
+ONLY ... ADD CONSTRAINT` isn't supported the same way on/into
+hypertables — a known `pg_dump`/TimescaleDB DDL-ordering quirk); verified
+these are cosmetic, not data loss, and documented the clean workaround
+(build the schema via `alembic upgrade head` first, then
+`pg_restore --data-only --disable-triggers`) in the bundle's own
+`README.md`.
+
+**Bundle** (matches the shape of the earlier `kairodex_2026-08-17` ad hoc
+snapshot, done properly this time with integrity checks and a restore
+procedure): `kairodex.dump` (2.4GB), `kairodex.env` (the VM's
+`/opt/Kairodex/.env`, mode 600), the `systemd/*.service`+`*.timer` unit
+files (VM-local config, never checked into git), `README.md` (full
+restore procedure + the 7-error explanation above), `SHA256SUMS`.
+
+**Transferred off the VM** (a backup that stays only on a VM about to be
+stopped is not a backup) to the user's local machine at
+`~/Kairodex_backups/kairodex_final_2026-08-20/` — checksums verified
+`OK` on all 14 files post-transfer via `shasum -a 256 -c SHA256SUMS`.
+
+Paired code version: git commit `4932e8e0e2d6188d6f6d95828687c730318d6633`
+on `main`, `github.com:Deathace007/Kairodex.git` — the repo itself is
+NOT part of this backup, clone it separately when standing the app back
+up elsewhere.
+
+**To resume this project on a new provider**: clone the repo at the
+commit above, read this file (start at the top, then this section), and
+follow `~/Kairodex_backups/kairodex_final_2026-08-20/README.md`'s restore
+procedure. The VM this file's §2 "Where everything lives" table
+describes (`164.52.206.92`) will no longer exist once stopped — every
+command in this file that says "SSH to the VM" needs a new host.
