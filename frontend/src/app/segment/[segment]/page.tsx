@@ -35,10 +35,25 @@ export default async function SegmentPage(props: PageProps<"/segment/[segment]">
   if (!SEGMENTS.includes(raw as Segment)) notFound();
   const segment = raw as Segment;
 
-  const searchParams = await props.searchParams;
-  const rawDateParam = searchParams.date;
-  const rawDate = Array.isArray(rawDateParam) ? rawDateParam[0] : rawDateParam;
-  const tradeDate = isValidIsoDate(rawDate) ? rawDate : todayIST();
+  // Static export (`output: "export"`, deploy-surge.sh) has no server,
+  // so it cannot support per-request `searchParams` at all -- Next fails
+  // the whole build the moment a page awaits it under that mode ("used
+  // await searchParams ... couldn't be rendered statically"), same
+  // reasoning `generateStaticParams` above is already gated on
+  // `IS_STATIC_EXPORT`. The `if` (not a ternary awaiting inside one
+  // branch) is what lets the static-export build's dead-code elimination
+  // drop the `await props.searchParams` call entirely rather than merely
+  // skipping it at runtime -- the Surge snapshot's date filter is
+  // therefore always "today (as of last rebuild)", same accepted
+  // degradation AutoRefresh's own docstring already describes for that
+  // build.
+  let rawDate: string | string[] | undefined;
+  if (!IS_STATIC_EXPORT) {
+    rawDate = (await props.searchParams).date;
+  }
+  const tradeDate = isValidIsoDate(Array.isArray(rawDate) ? rawDate[0] : rawDate)
+    ? ((Array.isArray(rawDate) ? rawDate[0] : rawDate) as string)
+    : todayIST();
 
   const [overview, equity, positions, opportunities, trades, risk] = await Promise.all([
     apiGetSafe<SegmentOverview>(`/segments/${segment}/overview`),
