@@ -37,36 +37,7 @@ nse_stock:
   - WIPRO
   - ONGC
 
-# ADR 0007: LSE's options catalog (3,186 underlyings, verified live) has no
-# SPX/NDX/RUT at all — index-option data isn't offered by this vendor.
-# User's decision: trade index-tracking ETF options instead — S&P 500
-# (SPY), NASDAQ 100 (QQQ), Dow Jones (DIA), Russell 2000 (IWM). Real ETF
-# shares, not index values, priced/risk-managed on the same American-style
-# physically-settled path as us_stock — see the ADR for why that matters.
-# Must NOT also appear in us_stock: the same option-leg rows would have
-# their `segment` column overwritten depending on watchlist iteration order.
-us_index:
-  - SPY
-  - QQQ
-  - DIA
-  - IWM
-
-us_stock:
-  - AAPL
-  - MSFT
-  - NVDA
-  - AMZN
-  - GOOGL
-  - META
-  - TSLA
-  - AMD
-  - NFLX
-  - JPM
-  - XOM
-  - BAC
-  - WMT
-  - DIS
-  - INTC
-  - CRM
-  - ORCL
-  - COST
+# US segment (us_index/us_stock) removed 2026-08-20 — stop+disable only,
+# see docs/PROGRESS.md. No trading edge ever demonstrated on this side
+# (LSE's synthetic 4% spread can never clear the 2% spread limit), and the
+# code paths are dormant on the VM rather than deleted.
