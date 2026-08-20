@@ -60,6 +60,23 @@ export function fmtTs(iso: string | null | undefined): string {
  * timestamps (`opened_at`/`closed_at`); `timeZone: "Asia/Kolkata"` does
  * the conversion, same IST offset `kairodex.core.sessions` uses on the
  * backend. */
+/** Today's calendar date in IST, `YYYY-MM-DD` — the default window for
+ * anything date-filtered (trade history), same reference timezone as
+ * `fmtTsIST`. `en-CA` is just the shortest locale that happens to format
+ * as `yyyy-mm-dd`; nothing Canadian about it. */
+export function todayIST(): string {
+  return new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
+}
+
+/** `YYYY-MM-DD`, strictly — guards the `?date=` search param before it
+ * reaches the API (a malformed value should fall back to today, not
+ * become an invalid `from`/`to` the backend 422s on). */
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+export function isValidIsoDate(v: string | null | undefined): v is string {
+  return v != null && ISO_DATE_RE.test(v);
+}
+
 export function fmtTsIST(iso: string | null | undefined): string {
   if (!iso) return "—";
   const formatted = new Date(iso).toLocaleString("en-IN", {

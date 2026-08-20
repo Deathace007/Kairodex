@@ -1,8 +1,61 @@
 "use client";
 
 import { useEffect, useRef } from "react";
-import { createChart, AreaSeries, type IChartApi } from "lightweight-charts";
+import { createChart, AreaSeries, TickMarkType, type IChartApi, type Time, type UTCTimestamp } from "lightweight-charts";
 import type { EquityPoint } from "@/lib/types";
+
+// Every quote/trade timestamp in this codebase is IST (NSE trading
+// hours), so the chart should read in IST too rather than the library's
+// UTC default — lightweight-charts has no built-in timezone option, only
+// formatter hooks (dist/typings.d.ts's TickMarkFormatter/TimeFormatterFn),
+// so both the axis and the crosshair label are overridden here.
+const IST_TZ = "Asia/Kolkata";
+
+function toISTDate(time: Time): Date {
+  return new Date((time as UTCTimestamp) * 1000);
+}
+
+function formatTickMark(time: Time, tickMarkType: TickMarkType): string {
+  const date = toISTDate(time);
+  switch (tickMarkType) {
+    case TickMarkType.Year:
+      return date.toLocaleString("en-GB", { timeZone: IST_TZ, year: "numeric" });
+    case TickMarkType.Month:
+      return date.toLocaleString("en-GB", { timeZone: IST_TZ, month: "short" });
+    case TickMarkType.DayOfMonth:
+      return date.toLocaleString("en-GB", { timeZone: IST_TZ, day: "numeric" });
+    case TickMarkType.TimeWithSeconds:
+      return date.toLocaleString("en-GB", {
+        timeZone: IST_TZ,
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false,
+      });
+    default:
+      return date.toLocaleString("en-GB", {
+        timeZone: IST_TZ,
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+      });
+  }
+}
+
+function formatCrosshairTime(time: Time): string {
+  const date = toISTDate(time);
+  return (
+    date.toLocaleString("en-GB", {
+      timeZone: IST_TZ,
+      day: "2-digit",
+      month: "short",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    }) + " IST"
+  );
+}
 
 /** TradingView Lightweight Charts (ARCHITECTURE.md §16) — its own
  * crosshair + tooltip ships built in, satisfying the dataviz skill's
@@ -28,8 +81,13 @@ export function EquityChart({ points }: { points: EquityPoint[] }) {
         vertLines: { color: isDark ? "#242422" : "#f3f2ef" },
         horzLines: { color: isDark ? "#242422" : "#f3f2ef" },
       },
-      timeScale: { timeVisible: true, borderColor: isDark ? "#34342f" : "#e4e2dd" },
+      timeScale: {
+        timeVisible: true,
+        borderColor: isDark ? "#34342f" : "#e4e2dd",
+        tickMarkFormatter: formatTickMark,
+      },
       rightPriceScale: { borderColor: isDark ? "#34342f" : "#e4e2dd" },
+      localization: { timeFormatter: formatCrosshairTime },
     });
     chartRef.current = chart;
 

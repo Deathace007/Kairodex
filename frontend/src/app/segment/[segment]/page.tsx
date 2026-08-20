@@ -1,13 +1,14 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { apiGetSafe } from "@/lib/api";
-import { fmtMoney, fmtPct, fmtNum, fmtTs, fmtTsIST } from "@/lib/format";
+import { fmtMoney, fmtPct, fmtNum, fmtTs, fmtTsIST, todayIST, isValidIsoDate } from "@/lib/format";
 import { AutoRefresh } from "@/components/AutoRefresh";
 import { Card } from "@/components/ui/Card";
 import { StatTile } from "@/components/ui/StatTile";
 import { Badge, breakerStatus, pnlColor } from "@/components/ui/Badge";
 import { EquityChart } from "@/components/EquityChart";
 import { RecentActivity } from "@/components/RecentActivity";
+import { TradeDateFilter } from "@/components/TradeDateFilter";
 import { IS_STATIC_EXPORT } from "@/lib/renderMode";
 import {
   SEGMENTS,
@@ -34,14 +35,31 @@ export default async function SegmentPage(props: PageProps<"/segment/[segment]">
   if (!SEGMENTS.includes(raw as Segment)) notFound();
   const segment = raw as Segment;
 
+  const searchParams = await props.searchParams;
+  const rawDateParam = searchParams.date;
+  const rawDate = Array.isArray(rawDateParam) ? rawDateParam[0] : rawDateParam;
+  const tradeDate = isValidIsoDate(rawDate) ? rawDate : todayIST();
+
   const [overview, equity, positions, opportunities, trades, risk] = await Promise.all([
     apiGetSafe<SegmentOverview>(`/segments/${segment}/overview`),
     apiGetSafe<EquityPoint[]>(`/segments/${segment}/equity-curve?window=30d`),
     apiGetSafe<Position[]>(`/segments/${segment}/positions`),
     apiGetSafe<Opportunity[]>(`/segments/${segment}/opportunities`),
-    apiGetSafe<TradesPage>(`/segments/${segment}/trades?page_size=20`),
+    // `from`/`to` are the same calendar date -- kairodex.api's
+    // segment_trades adds a day to `to` itself, so this is an inclusive
+    // single-day window. Plain YYYY-MM-DD dates parse as UTC midnight
+    // (api/deps.py's parse_iso_date), which still correctly brackets an
+    // IST trading day: NSE hours (09:15-15:30 IST) fall entirely within
+    // the same UTC calendar date, never crossing UTC midnight.
+    apiGetSafe<TradesPage>(
+      `/segments/${segment}/trades?from=${tradeDate}&to=${tradeDate}&page_size=200`,
+    ),
     apiGetSafe<RiskSummary>(`/segments/${segment}/risk`),
   ]);
+  // Latest trade on top -- the API returns ascending by opened_at
+  // (analytics/loader.py's load_trades).
+  const tradesForDay = trades ? [...trades.trades].reverse() : [];
+  const tradesTotal = trades?.total ?? 0;
 
   return (
     <div className="mx-auto max-w-6xl space-y-6">
@@ -175,9 +193,18 @@ export default async function SegmentPage(props: PageProps<"/segment/[segment]">
       </Card>
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
-        <Card title="Trade history">
-          {!trades || trades.trades.length === 0 ? (
-            <Empty text="No trades yet." />
+        <Card>
+          <div className="mb-3 flex items-center justify-between">
+            <h3
+              className="text-sm font-medium tracking-wide uppercase"
+              style={{ color: "var(--text-secondary)" }}
+            >
+              Trade history
+            </h3>
+            <TradeDateFilter segment={segment} date={tradeDate} />
+          </div>
+          {tradesForDay.length === 0 ? (
+            <Empty text={`No trades on ${tradeDate}.`} />
           ) : (
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
@@ -192,7 +219,7 @@ export default async function SegmentPage(props: PageProps<"/segment/[segment]">
                   </tr>
                 </thead>
                 <tbody>
-                  {trades.trades.map((t) => (
+                  {tradesForDay.map((t) => (
                     <tr key={t.trade_id} className="border-t" style={{ borderColor: "var(--border)" }}>
                       <td className="py-1.5">
                         <Link href={`/segment/${segment}/trades/${t.trade_id}`} className="hover:underline">
@@ -219,7 +246,7 @@ export default async function SegmentPage(props: PageProps<"/segment/[segment]">
                 </tbody>
               </table>
               <p className="mt-2 text-xs" style={{ color: "var(--text-muted)" }}>
-                {trades.total} total, showing page {trades.page}
+                {tradesTotal} trade{tradesTotal === 1 ? "" : "s"} on {tradeDate}
               </p>
             </div>
           )}
