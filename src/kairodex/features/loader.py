@@ -26,6 +26,26 @@ from kairodex.store.models import Instrument, OptionQuote, UnderlyingBar
 
 _DEFAULT_BARS_LOOKBACK_DAYS = 5
 _DEFAULT_MAX_EXPIRIES = 2  # matches T1 REST poll's own scope (recorder.py's poll_chain_once)
+# How far back `load_chain` will look for each leg's latest quote.
+#
+# Without a lower bound the DISTINCT ON below scans *every* historical
+# option_quotes row for every leg, so the query got monotonically slower
+# as the hypertable grew and eventually ate the trading day: measured on
+# the VM 2026-09-10 against 36 GB / 22 chunks, one RELIANCE chain read
+# did not finish in 75s (production pg_stat_activity showed the same
+# query active for 13-28 minutes), and build_context issues two of them
+# per underlying per tick. A 22-name sweep the engine assumes takes
+# ~150s was taking 4-5 hours, i.e. one cycle per session — which is what
+# collapsed nse_stock from 611 signals/day (08-31) to 3 (09-10) and left
+# every one of them stamped with the cycle-start clock. Same query
+# bounded: 1 hour -> 7.3s, 15 minutes -> 242ms.
+#
+# 15 minutes is strictly more generous than the entry path's own
+# tolerance (live_loop.ENTRY_MAX_QUOTE_AGE_MS is 90s) and 15x the T1
+# REST poll cadence, so a leg dropped by this bound was already too
+# stale for `compute_fill` to price. Relative to `as_of`, so the
+# backtest/backfill path stays a real point-in-time read.
+_CHAIN_QUOTE_LOOKBACK = datetime.timedelta(minutes=15)
 
 # relative_strength_vs_index's benchmark, per segment — ARCHITECTURE.md
 # doesn't name one explicitly ("which index is the benchmark for this
@@ -152,6 +172,7 @@ async def load_chain(
             Instrument.underlying_symbol == underlying_symbol,
             Instrument.expiry.in_(expiries),
             OptionQuote.ts <= as_of,
+            OptionQuote.ts >= as_of - _CHAIN_QUOTE_LOOKBACK,
         )
         .distinct(OptionQuote.instrument_id)
         .order_by(OptionQuote.instrument_id, OptionQuote.ts.desc())

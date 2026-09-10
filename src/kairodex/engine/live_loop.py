@@ -267,6 +267,23 @@ async def run_segment(segment: Segment, *, shadow: bool = True) -> None:
             )
 
             for position, underlying in enumerate(underlyings, start=1):
+                # Re-read the clock per underlying, not once per cycle.
+                # The cycle-start `now` above is what the session_window
+                # check needs, but feeding it to the gates makes every
+                # signal in a sweep claim the sweep's *start* time. With a
+                # ~150s sweep that is a rounding error; when the chain read
+                # regression (features.loader._CHAIN_QUOTE_LOOKBACK) pushed
+                # a cycle to 4-5 hours it became total: `now` stayed frozen
+                # at the opening bell, so `session_timing_gate` saw ~0
+                # minutes-since-open and rejected the entire session as
+                # SESSION_WARMUP (42 of the last 8 days' nse_stock
+                # rejections, at wall-clock times as late as 14:07 IST),
+                # while the next cycle started past `entry_cutoff_minutes`
+                # and rejected as SESSION_CLOSING. The legal 09:35-14:00
+                # window was never sampled, so nothing could ever be taken.
+                # It also stamped `signals.ts`, which is why the dashboard's
+                # "Opportunities (last hour)" card was permanently empty.
+                now = clock.now()
                 try:
                     outcome = await run_entry_tick(
                         session,
