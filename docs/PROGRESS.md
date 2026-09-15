@@ -1,6 +1,12 @@
 # Kairodex — Development Progress
 
-**Last updated:** 2026-09-15 (§25)
+**Last updated:** 2026-09-15 evening (§26)
+
+**2026-09-15 evening: repairs completed (§26).** Real F&O lot sizes are live —
+and with them **no nse_stock watchlist name can afford one lot** at the
+current capital/slot settings (a user decision, §26b). NSE holiday calendar,
+IV history, `session_open_ts` (feature registry v2), a REST-vs-WS IV unit bug,
+and the analytics exclusion of 8 non-strategy trades all shipped and verified.
 
 **2026-09-15: the two-segment fix plan shipped (§25).** A full audit of 180
 trades (report: `docs/reports/2026-09-15-two-segment-audit-and-fix-plan.html`,
@@ -3717,3 +3723,67 @@ read 0 on every closed trade) and `greeks_entry` now carries delta.
 6. `kairodex status` health section: no `<<<` on sweeps, labels, or frozen
    legs; `vwap_position` no longer 100% MISSING on nse_index from the first
    session with futures bars.
+
+---
+
+## 26. Repairs completed (2026-09-15, evening)
+
+Commits `b456cf9`, `ab8559e`, `70f8868`, `41bbd40`. Deployed after the close;
+verified live against the VM database (scripted PASS/FAIL checks, all
+services active with 0 restarts and no errors, all API endpoints 200).
+
+### 26a. What shipped
+
+| # | repair | verification |
+|---|---|---|
+| 1 | **Real lot sizes.** `ingest.record_spec` writes `instrument_specs` (SCD-2) from the vendor's `lot_size`, which was parsed and discarded (0 rows). `orchestrator.underlying_lot_size` replaces the hardcoded 25; leg's own spec wins; missing spec -> `NO_LOT_SIZE` rejection, never a default | `sync-instruments`: 37,187 instruments, 34,370 spec rows; all 22 watchlist names resolve (NIFTY 65, BANKNIFTY 30, stocks 50-3,000) |
+| 2 | **Analytics exclusion.** `analytics.loader.NON_ATTRIBUTABLE_TRADES` (87, 95, 101, 194, 196 exit-failure carries; 218-220 holiday) excluded from every performance metric via `performance._attributable`; still listed, still in equity; `PerformanceSummary.n_excluded` | nse_stock `n_excluded=8`, clean book 165 trades, +Rs 283, PF 1.01 |
+| 3 | **Deploy path.** Repo is public: VM `origin` fetches over HTTPS; push URL deliberately invalid (push from the laptop only). `.gitignore` committed (`backups/`) | `git pull` works on the VM; HEAD == origin |
+| 4a | **NSE holiday calendar** (`config/nse_holidays.yaml`, from NSE's own `holiday-master` API, segment FO). `core.sessions` treats them as closed for engine, recorder and session-time accounting | the 11 weekdays of 2026 with no NIFTY bars are exactly the 11 past holidays; 2026-10-02 closed, 10-01 open. **Update each December** — `kairodex status` flags a year with no dates |
+| 4b | **`session_open_ts`** set in `build_context`; `REGISTRY_VERSION` "1" -> "2" (VWAP/POC/acceptance were silently 5-day, opening range never computed). `metalabel.load_dataset` refuses mixed versions (`--registry-version`) | opening_range_position, vwap_position, price_acceptance compute for NIFTY and RELIANCE |
+| 4c | **IV history.** `atm_iv_daily` table (migration `a9c4e7f2b1d3`), filled nightly 16:05 IST and by `backtest backfill-atm-iv`; `iv_rank`/`iv_percentile` need >= 10 prior sessions, else abstain. Definition, for both history and live: median `vendor_iv` of \|delta\| 0.40-0.60 legs on the nearest expiry >= 7 DTE, 15:00-15:15 IST, WS rows only | 279 rows, all 0.094-0.322; RELIANCE iv_rank computes; NIFTY abstains until tonight's 10th session (live reading 0.132 vs 0.094-0.124 history) |
+| 4d | **Fix-plan gaps:** end-of-day exit from 15:00 for legs whose price hasn't changed in 5 min (1.4); status alerts for session-open-no-bars and missing holiday year (Phase 4) | unit tests; status runs clean |
+
+**Found and fixed along the way — a real data bug:** Upstox's option-chain
+REST endpoint reports IV in **percent**, the WS feed as a **fraction**, and both
+were stored unconverted in `option_quotes.vendor_iv` under `source='upstox'`
+(REST rows have `snapshot_id` set). `features.compute.iv._iv` falls back to
+`vendor_iv`, so **`iv_skew` subtracted a percent from a fraction** whenever its
+two legs came from different writers — the heavy-tailed `iv_skew` of §16c that
+got `iv_skew_sentiment` unwired in §19d. REST IV is now stored as a fraction
+(`upstox.client.iv_percent_to_fraction`). Rows before 2026-09-15 are not
+rewritten: filter `snapshot_id IS NULL` for a consistent series. **`iv_skew`
+deserves a re-measurement on post-fix data before anyone concludes the
+detector itself has no information.**
+
+Two defects in this session's own code were caught by live verification
+before being relied on: stale rows surviving an IV re-backfill (now deleted
+when a session has no qualifying quotes), and live vs stored ATM IV using
+different expiries (unified at >= 7 DTE).
+
+### 26b. Decision needed — nse_stock cannot currently trade
+
+With real lots, sizing is honest for the first time. At 14:30 IST 09-15,
+median near-ATM premium x lot:
+
+| budget | value | fits |
+|---|---|---|
+| nse_stock per-slot cap = 0.40 x equity 57,149 / 5 | **Rs 4,572** | **0 of 20** (cheapest: ITC Rs 6,081; dearest: AXISBANK Rs 22,547) |
+| nse_index per-slot cap = 0.30 x 46,079 / 1 | Rs 13,824 | NIFTY (Rs 13,223) yes, BANKNIFTY (Rs 19,549) no |
+
+The paper book was sized on 25-unit lots all along: rupee P&L figures in §15-§25
+(including the fix plan's replay rupees) are scale-wrong per name; win rates,
+exit behaviour and ATR-based measurements are not. ADR 0005 (capital Rs 50,000)
+was the user's call and is unchanged. Options: raise capital; lower
+`max_concurrent` (at 2 the slot is ~Rs 11,400 and 11 of 20 names fit; at 1,
+18 of 20 within `max_premium_pct`); or trim the watchlist to names that fit.
+Until decided, nse_stock signals will reject at sizing (`NO_TRADE_MIN_SIZE`) —
+the safe direction.
+
+### 26c. Watch
+
+1. 16 Sep: `relative_strength` in nse_stock signals; no `DETECTOR_DEAD` halt.
+2. nse_stock rejections at sizing, not a crash; nse_index sizes NIFTY at 65.
+3. 16:05 IST job writes 22 `atm_iv_daily` rows; NIFTY iv_rank computes from 16 Sep.
+4. New feature vectors carry `registry_version = '2'`.
+5. 02 Oct: engine and recorder idle all day (first calendar holiday since the fix).
