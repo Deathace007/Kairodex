@@ -1,13 +1,27 @@
 # Kairodex — Development Progress
 
-**Last updated:** 2026-08-20 (evening — §23)
+**Last updated:** 2026-09-15 (§25)
+
+**2026-09-15: the two-segment fix plan shipped (§25).** A full audit of 180
+trades (report: `docs/reports/2026-09-15-two-segment-audit-and-fix-plan.html`,
+local only) found `relative_strength` dead since the 08-20 instrument merge,
+the engine trading a closed exchange on 09-14, frozen quotes passing the
+staleness check, outcome labels stalled since 08-13, and the clean nse_stock
+book at -Rs 4,370 (PF 0.90). All repaired; four replay-tested strategy
+changes shipped; nse_index given its own framework. **Read §25 before
+touching any exit rule, gate, or the index segment.**
+
+**2026-08-30/31: migrated to AWS EC2** (`m7i-flex.large`, ap-south-1,
+Elastic IP `52.66.144.6`) from the stopped E2E VM — see §24 for the full
+account, including two restore-procedure gaps (TimescaleDB dump restore,
+Postgres role recreation) that only surfaced by actually executing the
+§23c backup's documented procedure. All NSE-side services live and
+verified again on the new host; US segment stays removed per §23.
 
 **2026-08-20: US segment (us_stock/us_index) removed, application shut
 down, VM about to be stopped.** See §23 for the full account — hard
 delete verified (0 US rows anywhere, NSE untouched), a full DB backup
 taken and restore-verified, transferred off the VM before shutdown.
-**If you are picking this project back up on a new host, start at §23,
-not here** — it has the restore procedure and where the backup lives.
 **Current phase:** P1 (The Recorder) is done pending the unattended
 5-session check (§7). P2 (Pricing & features) is functionally complete
 (§8). **P3 (Engine & paper execution) is functionally complete and
@@ -168,14 +182,14 @@ Don't re-litigate these — each overrides SPEC.md or an earlier assumption. Ful
 |---|---|
 | **Local repo** (edit code here only) | `/Users/mohanborle/AI_ML/Kairodex` |
 | **GitHub remote** | `git@personal:Deathace007/Kairodex.git` (branch `main`), via `personal` SSH host alias — `~/.ssh/config`, key `~/.ssh/id_ed25519_personal` |
-| **VM** (all Docker/DB/tests/ingestion run here) | E2E Networks, `ssh -i ~/.ssh/id_ed25519_personal root@164.52.206.92` |
-| **VM repo clone** | `/opt/Kairodex` |
+| **VM** (all Docker/DB/tests/ingestion run here) | **AWS EC2**, `ap-south-1`, `m7i-flex.large`, 120GB gp3 — Elastic IP `52.66.144.6` (fixed across stop/start). `ssh kairodex-aws` (alias in `~/.ssh/config`, key `~/.ssh/kairodex_aws.pem`, user `ubuntu` not `root`). Migrated 2026-08-30/31 from the E2E Networks VM (`164.52.206.92`, stopped 2026-08-20 — see §23c for the backup, §24 for the migration account) |
+| **VM repo clone** | `/opt/Kairodex`, owned by `ubuntu` |
 | **VM Compose project** | `kairodex` → containers `kairodex-timescaledb-1`, `kairodex-redis-1` |
-| **VM `.env`** | `/opt/Kairodex/.env`, mode 600 — transferred via `scp -O` (see §5) |
+| **VM `.env`** | `/opt/Kairodex/.env`, mode 600 — restored from the `kairodex_final_2026-08-20` backup bundle, not regenerated |
 
-**Workflow, always:** edit locally → commit → push → SSH to VM → `git pull` → run.
+**Workflow, always:** edit locally → commit → push → SSH to VM (`ssh kairodex-aws`) → `git pull` → run. Docker commands need no `sudo` (`ubuntu` is in the `docker` group), but systemd unit edits still need `sudo`.
 
-**Also on the VM, in `/opt/`:** an unrelated app `swingpro` (Compose project `infra`). Its containers/images were removed 2026-08-04 to reclaim disk (116GB was build cache); its 8 volumes were left untouched deliberately.
+**No `swingpro` on this VM** — that was E2E-VM-local cruft from a prior unrelated project, not carried over.
 
 ---
 
@@ -3499,3 +3513,207 @@ follow `~/Kairodex_backups/kairodex_final_2026-08-20/README.md`'s restore
 procedure. The VM this file's §2 "Where everything lives" table
 describes (`164.52.206.92`) will no longer exist once stopped — every
 command in this file that says "SSH to the VM" needs a new host.
+
+---
+
+## 24. Migrated to AWS EC2 (2026-08-30/31)
+
+Moved off E2E Networks (stopped since §23c) onto AWS EC2 —
+`m7i-flex.large`, 120GB gp3, `ap-south-1`, Elastic IP `52.66.144.6`. §2's
+table has the current connection details. Repo transferred by `rsync`
+from the local Mac rather than `git clone` (user's choice, one less
+round-trip); the backup bundle (`kairodex_final_2026-08-20/`) went the
+same way, checksums re-verified `OK` post-transfer.
+
+**Two real gaps in the backup's own restore procedure, found only by
+actually executing it — not visible from reading the bundle:**
+
+1. **The bundle's "recommended" Alembic-first restore doesn't work.**
+   `pg_restore --data-only` replays `COPY` commands against literal
+   `_timescaledb_internal._hyper_N_M_chunk` table names captured at dump
+   time on the *old* database. A schema built fresh via `alembic upgrade
+   head` assigns its own hypertable/chunk IDs in `_timescaledb_catalog`,
+   so those exact chunk tables don't exist on the new database —
+   cascading failures (plus duplicate-key errors on `_timescaledb_catalog`
+   tables themselves, since those carry real row data too and Alembic's
+   own `create_hypertable()` calls had already seeded them). The bundle's
+   own documented **fallback** — a plain full `pg_restore --no-owner`
+   into a blank, extension-fresh database — is the one that actually
+   works for a TimescaleDB dump; used that instead, verified exact row
+   counts after (`option_quotes: 90,681,000`, `instruments: 35,432`,
+   `signals: 28,062`, all matching §23c/§23a's baselines). **Lesson: a
+   TimescaleDB dump's "restore via fresh-schema-then-data-only" pattern is
+   not just slower, it's actively wrong — always use whole-dump restore
+   for these, cosmetic FK-ordering errors and all.**
+2. **`pg_dump`/`pg_restore` never carries Postgres roles** — `CREATE
+   ROLE`/passwords are cluster-level objects, outside any single
+   database's dump, by design. `kairodex_app` (the least-privilege app
+   role from `f1ac2a76a6ba`, §8 area) therefore didn't exist on the new
+   cluster at all post-restore, and every process connecting as it
+   (`kairodex-ingest-nse`, both NSE engines) crash-looped 13-14 times
+   (5s `RestartSec`) before this was caught and fixed. Fixed by replaying
+   the exact `CREATE ROLE .. IF NOT EXISTS` / `GRANT` block from
+   `f1ac2a76a6ba` and the `REVOKE UPDATE, DELETE ON trade_events` from
+   `c9dcde04143c` directly via `psql`, using `APP_DB_PASSWORD` from the
+   restored `.env` — `alembic_version` already reported these migrations
+   as applied, so re-running them through Alembic wasn't an option.
+   **Lesson: any restore onto a new Postgres cluster (not just a new
+   database on the same cluster) needs its non-superuser roles rebuilt by
+   hand — grep migrations for `CREATE ROLE`/`GRANT ... TO` and replay them
+   after the data restore, every time.**
+
+**Verified after both fixes**: all NSE-side units
+(`kairodex-ingest-nse`, `kairodex-engine-nse_stock`,
+`kairodex-engine-nse_index`, `kairodex-jobs`, `kairodex-api`,
+`kairodex-frontend`) `active`/`running` with stable restart counts;
+`kairodex-ingest-us`/`kairodex-engine-us_stock`/`kairodex-engine-us_index`
+confirmed still `disabled`/`inactive` (US segment stays removed, per
+§23 — not re-enabled by this migration); `kairodex status` runs clean;
+`/api/health` → `{"status":"ok"}`; frontend responds 200. `us_stock`/
+`us_index` still appearing in `/api/segments` is pre-existing from §23's
+deliberate "stop+disable, not code deletion" scope — not a migration
+regression. Surge public mirror (`app.swingpro.tech`) deliberately not
+carried over — user's call, planning a different approach for that.
+
+### 24a. `app.swingpro.tech` repointed to a live reverse proxy, not a Surge mirror (2026-08-31)
+
+The "different approach": rather than the pre-§23 static Surge export
+(rebuilt every 20 min, never the live server), `app.swingpro.tech` now
+reverse-proxies straight to the real running `kairodex-frontend`/
+`kairodex-api` processes on the EC2 box — nginx (`/etc/nginx/sites-available/
+app.swingpro.tech`) routes `/` → `127.0.0.1:3000`, `/api/` and `/ws/` →
+`127.0.0.1:8000`, with a Let's Encrypt cert (certbot, auto-renews via its
+own systemd timer) and HTTP basic auth on the whole site (real trade/P&L
+data, not something to leave open). DNS for `app.swingpro.tech` lives in
+Cloudflare — the A record must stay in **"DNS only" mode** (grey cloud),
+not proxied, or Cloudflare's edge caches responses instead of passing
+them through, which is exactly what caused the earlier 200 OK w/
+`surge-cache: HIT` sighting after the IP was updated but before the
+proxy toggle was flipped off.
+
+**One real code bug this exposed** (harmless before, since nothing ever
+put an auth wall between the two): `frontend/src/lib/api.ts`'s
+`apiGet`/`apiGetSafe`/`apiPost` are called only from async Server
+Components (`app/page.tsx`, `app/segment/[segment]/page.tsx`,
+`app/segment/[segment]/trades/[tradeId]/page.tsx`) — i.e. they run in
+Node on the box itself. `lib/useStream.ts`'s WebSocket is the only
+client-side (browser) caller. Both used to share one `NEXT_PUBLIC_API_BASE_URL`,
+which was fine when that URL was always reachable without credentials
+(same VM, or an SSH-tunneled port). Once that URL became the public,
+basic-auth-gated `app.swingpro.tech`, the server's own `fetch()` calls —
+which can't attach browser-cached basic-auth credentials — started
+getting `401`s, and `apiGetSafe`'s catch-and-return-`null` (by design,
+so one bad panel doesn't crash the whole dashboard) turned every one of
+those into an "no data yet" empty state, even though the database and
+API were both fully populated and correct. Symptom looked exactly like
+missing data; root cause was two different callers needing two different
+base URLs. Fixed by splitting into `API_INTERNAL_BASE_URL`
+(server-only, `http://127.0.0.1:8000`, never through the proxy) and
+`NEXT_PUBLIC_WS_BASE_URL` (client-only, the public gated URL, used only
+by `useStream.ts`). **Lesson: the moment a "server and browser share one
+API URL" assumption meets an auth wall placed in front of only one of
+those two paths, it silently breaks the side that can't present
+credentials — grep for every caller of the shared constant before adding
+auth in front of it, not just the browser-facing ones.**
+
+Credentials for the basic-auth prompt are in `/etc/nginx/.htpasswd` on
+the VM (not written here — ask if you need them re-issued; `sudo
+htpasswd -b /etc/nginx/.htpasswd kairodex '<new password>'` rotates it).
+
+---
+
+## 25. The two-segment fix plan (2026-09-15)
+
+Source: `docs/reports/2026-09-15-two-segment-audit-and-fix-plan.html`
+(local, gitignored). Commit `f466c67`. Deployed after the 15:30 IST close.
+
+### 25a. Repairs — broken things, not strategy opinions
+
+| # | defect | evidence | fix |
+|---|---|---|---|
+| F1 | `relative_strength` dead since 2026-08-20 | 100% of signals through 08-19, **0 of 3,655** after; scratch rate 43% -> 58% at that date | `_BENCHMARK_SYMBOL` "Nifty 50" -> "NIFTY" (the merge renamed the row); `load_index_bars` now **raises** on a missing benchmark; `config/watchlist.yaml` updated to match |
+| — | nothing noticed F1 for 26 days (§19f's status line reported it; nobody read it) | — | `live_loop.dead_detectors`: a declared detector absent from 200 signals written by *this process* halts entries (`reject_stage='health'`, `DETECTOR_DEAD:<name>`). Signals still written, so it self-clears |
+| N1 | engine traded the 09-14 exchange holiday | 0 underlying bars that day; 885 signals, 3 ONGC fills | `live_loop.exchange_shut_today`: clock says open but no 1m bar today (10-min grace) -> `EXCHANGE_SHUT_NO_BARS` halt. No calendar needed |
+| N2 | recorder re-writes unchanged quotes with fresh `ts` | 09-14: 100% of 3,434 legs frozen; normal days 35-48% (quiet far strikes) | `orchestrator._quote_content_since`: **entry** quote age = time since bid/ask/LTP/volume last changed (15-min window). Exits deliberately still use row age |
+| F3 | mandatory exits could simply not happen | 5 trades carried 21-67 h on STALE_QUOTE (1,165 EXIT_FAILED) = Rs 6,972, the whole reported nse_stock profit | `EOD_EXIT`/`OVERNIGHT_EXIT`/`EXPIRY_EXIT` refused by the fill model re-fill at **bid x 0.95** (`forced_exit_quote`), `fills.fill_model.forced_stale`, `EXIT_FORCED` event, logged at ERROR |
+| N3 | forward-outcome labels stalled since 2026-08-13 (8,243 unlabelled) | backfill had only ever been run by hand | `jobs.resolve_recent_outcomes`, 16:15 IST nightly, rescans 7 days (idempotent) |
+| F2 | chain-scan fix (`75e4731`) ran as uncommitted VM edits | — | VM reconciled to git during this deploy |
+| N4 | index bars have volume 0 -> `vwap_position`/`price_acceptance` impossible on nse_index | NIFTY/BANKNIFTY 1m volume sum = 0 | `features.loader.with_proxy_volume`: index bars take per-minute volume from the near-month future; recorder's bar refresh now includes those futures (`with_index_futures`). Vendor verified: NIFTY FUT 2.2M volume on 09-15 |
+
+`kairodex status` gained a `health` section: EXIT_FAILED/EXIT_FORCED (24h),
+newest labelled signal, sweeps/hour per segment, features MISSING on 100%,
+share of frozen legs. Lines needing attention start `<<<`. Detector
+verdicts are now per segment (`strategy_for`).
+
+### 25b. nse_stock — replayed, not argued
+
+Replay: each of 159 clean trades (ex the 5 overnight + 3 holiday trades)
+re-run over its own `position_marks`, exits priced at mark x 0.991 minus
+real fees; entry filters modelled by removal. Required: improves the book,
+survives removing its best trade, positive on **both halves** (08-11..08-20
+vs 08-31..09-15).
+
+| change | was | now | full sample | 2nd half |
+|---|---|---|---|---|
+| scratch | 45 min / +8% | **15 min / +3%** | +7,078 | +1,288 |
+| breakeven floor | none | **entry, once +10%** | +7,156 | +2,670 |
+| confidence veto | none | **>= 0.90** | blocked trades lost 8,318 | lost 3,541 |
+| warmup | 20 min | **45 min** (no entries before 10:00) | blocked trades lost 9,462 | lost 6,931 |
+
+Stacked: -4,370 -> +18,969 (PF 2.19). **Planning number is the second half:
+-3,999 -> +5,599 over 8 sessions.** Limits: blocked trades would have freed
+slots (unsimulated); LTP pricing; two-thirds of the sample had F1 broken.
+Early entries fail on noise, not direction (signals before 10:00 resolve no
+worse; first-10-min drawdown -4.1% vs 0.0%). **Tested and rejected:** "only
+trade with the NIFTY session direction" — splits 3-2 across sessions on
+22,144 resolved signals, despite 09-15 looking like proof.
+
+Stops are now labelled `STOP_LOSS` (initial), `TRAILING_STOP`,
+`BREAKEVEN_STOP`. Breakeven keys live in `risk_params` at entry — **trades
+opened before the deploy keep the old rules.** `risk_params` also records
+`entry_qty_lots`/`entry_premium_paid` (the columns hold *remaining* size and
+read 0 on every closed trade) and `greeks_entry` now carries delta.
+
+### 25c. nse_index — its own framework
+
+- **Detectors:** `trend_structure` + `oi_price_flow` only
+  (`strategy.protocol.strategy_for`). `relative_strength` with a NIFTY
+  benchmark is NIFTY-vs-NIFTY.
+- **`min_confidence` 0.61 -> 0.50:** p80 of 338 two-detector signals over 11
+  sessions (pass-rate method, as nse_stock's 0.51). 0.61 took 0 of 80
+  correctly-signed put signals on the 09-15 sell-off.
+- **`max_concurrent` 2 -> 1:** NIFTY and BANKNIFTY are one bet.
+- **`min_dte: 7`** (new `SegmentRiskConfig.min_dte`): index hurdle at
+  |delta| 0.45-0.55 over a 121-min hold — **12.2 ATR at 0 DTE**, 1.01 at 4,
+  0.97 at 7, 0.74-0.87 at 11-18. The stock-quote result of §22a does not
+  transfer: on index legs theta, not spread, dominates.
+- warmup 45, scratch 15/+3%, breakeven as nse_stock (8 trades can't fit
+  their own values). No confidence veto — no index evidence either way.
+
+### 25d. Known, not done
+
+- `lot_size` is still a hardcoded 25 for every NSE contract
+  (`orchestrator.run_entry_tick`'s ponytail note) — paper P&L magnitudes
+  are wrong per name, signs are not. Wire `instrument_specs` before trusting
+  per-name rupee comparisons.
+- `opening_range_position`, `iv_rank`, `iv_percentile` still MISSING on all
+  rows (`session_open_ts` never set; no IV history). Setting
+  `session_open_ts` would also change `vwap_position` from a 5-day to a
+  session VWAP — a feature-series seam (§21e), so deliberately deferred.
+- No holiday *calendar*; the no-bars guard replaces it for entries. The
+  recorder still polls on holidays (harmless now that entries are guarded).
+- The 5 overnight trades (87, 95, 101, 194, 196) remain in `trades`
+  unflagged; exclude them from any strategy analysis.
+
+### 25e. Watch — stated in advance
+
+1. `relative_strength` in ~100% of new nse_stock signals; no
+   `DETECTOR_DEAD` halts in the engine log.
+2. nse_stock scratch rate falls from 58% toward the pre-F1 43%.
+3. nse_index takes trades at all; ~20% of its signals clear 0.50.
+4. After 8 sessions: clean nse_stock ~+Rs 1,000/session, PF > 1.2. If not,
+   revert the entry filters first and keep the exits.
+5. Stop-outs inside 20 minutes near zero.
+6. `kairodex status` health section: no `<<<` on sweeps, labels, or frozen
+   legs; `vwap_position` no longer 100% MISSING on nse_index from the first
+   session with futures bars.
