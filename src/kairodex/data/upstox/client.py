@@ -269,12 +269,25 @@ def _parse_leg_quote(
         oi=md.get("oi"),
         oi_change=(md.get("oi") - md.get("prev_oi")) if md.get("prev_oi") is not None else None,
         underlying_px=underlying_px,
-        vendor_iv=to_decimal(greeks.get("iv")),
+        vendor_iv=iv_percent_to_fraction(to_decimal(greeks.get("iv"))),
         delta=to_decimal(greeks.get("delta")),
         gamma=to_decimal(greeks.get("gamma")),
         theta=to_decimal(greeks.get("theta")),
         vega=to_decimal(greeks.get("vega")),
     )
+
+
+def iv_percent_to_fraction(iv: Decimal | None) -> Decimal | None:
+    """The option-chain REST endpoint reports IV in percent (22.03); the WS
+    feed reports a fraction (0.215). Both were written to
+    `option_quotes.vendor_iv` as-is under the same `source='upstox'`, so
+    on 2026-09-15 every REST row (snapshot_id set) was 100x every WS row
+    (snapshot_id NULL). `features.compute.iv._iv` falls back to vendor_iv,
+    so `iv_skew` subtracted a percent from a fraction whenever its two legs
+    came from different writers — the "one leg occasionally garbage" §16c
+    found. Stored as a fraction from here on; rows before 2026-09-15 are
+    not rewritten (filter on snapshot_id IS NULL for a consistent series)."""
+    return iv / 100 if iv is not None else None
 
 
 def _parse_candle(row: list[Any]) -> Bar:

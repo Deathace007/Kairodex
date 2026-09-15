@@ -99,8 +99,8 @@ class AtmIvDaily(Base):
     it live cost ~1.3 s per underlying per day of history on option_quotes.
 
     `atm_iv` is the median `option_quotes.vendor_iv` of legs with |delta|
-    0.40-0.60 between 15:00 and 15:15 IST on that session, in the vendor's
-    units (a fraction, e.g. 0.1868)."""
+    0.40-0.60 between 15:00 and 15:15 IST on that session, from WS rows
+    only, as a fraction (e.g. 0.1868) — see upstox.client.iv_percent_to_fraction."""
 
     __tablename__ = "atm_iv_daily"
 

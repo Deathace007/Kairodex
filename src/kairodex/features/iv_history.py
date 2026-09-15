@@ -113,6 +113,10 @@ async def record_atm_iv(
                 OptionQuote.ts < start + _WINDOW,
                 OptionQuote.vendor_iv > 0,
                 func.abs(OptionQuote.delta).between(*_ATM_DELTA),
+                # WS rows only: REST rows stored vendor_iv in percent before
+                # 2026-09-15 (upstox.client.iv_percent_to_fraction). The
+                # stream is the consistent fraction series for all history.
+                OptionQuote.snapshot_id.is_(None),
             )
         )
     ).one()

@@ -147,3 +147,14 @@ async def test_bars_skips_intraday_for_a_purely_historical_window():
     )
     assert len(client.urls) == 1
     assert "intraday" not in client.urls[0]
+
+
+def test_rest_chain_iv_is_stored_as_a_fraction_like_the_ws_feed():
+    """REST reports 22.03 (percent) where WS reports 0.2203 — stored mixed
+    until 2026-09-15."""
+    from decimal import Decimal
+
+    from kairodex.data.upstox.client import iv_percent_to_fraction
+
+    assert iv_percent_to_fraction(Decimal("22.03")) == Decimal("0.2203")
+    assert iv_percent_to_fraction(None) is None
