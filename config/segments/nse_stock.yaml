@@ -9,7 +9,12 @@ currency: INR
 base_risk_pct: 0.08
 hard_ceiling_pct: 0.35
 max_premium_pct: 0.35
-max_concurrent: 5  # user's call, 2026-08-06 (was 1)
+max_concurrent: 2
+# 5 -> 2 on 2026-09-15, user's call (was 1 -> 5 on 2026-08-06). With real
+# F&O lot sizes (PROGRESS.md §26) the per-slot budget exposure_cap_pct x
+# equity / max_concurrent was ~Rs 4,572 at 5 and no watchlist name's
+# near-ATM lot fit (cheapest ITC Rs 6,081). At 2 the slot is ~Rs 11,430 and
+# 11 of 20 names fit on 09-15 prices; the rest reject NO_TRADE_MIN_SIZE.
 daily_loss_limit_pct: 0.16
 weekly_loss_limit_pct: 0.30
 max_drawdown_pct: 0.40

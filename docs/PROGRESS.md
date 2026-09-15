@@ -3,8 +3,8 @@
 **Last updated:** 2026-09-15 evening (§26)
 
 **2026-09-15 evening: repairs completed (§26).** Real F&O lot sizes are live —
-and with them **no nse_stock watchlist name can afford one lot** at the
-current capital/slot settings (a user decision, §26b). NSE holiday calendar,
+with them no nse_stock name fit a slot at `max_concurrent: 5`, so it is now
+**2** (user's call, §26b; 11 of 20 names fit). NSE holiday calendar,
 IV history, `session_open_ts` (feature registry v2), a REST-vs-WS IV unit bug,
 and the analytics exclusion of 8 non-strategy trades all shipped and verified.
 
@@ -3777,13 +3777,16 @@ exit behaviour and ATR-based measurements are not. ADR 0005 (capital Rs 50,000)
 was the user's call and is unchanged. Options: raise capital; lower
 `max_concurrent` (at 2 the slot is ~Rs 11,400 and 11 of 20 names fit; at 1,
 18 of 20 within `max_premium_pct`); or trim the watchlist to names that fit.
-Until decided, nse_stock signals will reject at sizing (`NO_TRADE_MIN_SIZE`) —
-the safe direction.
+**Decided the same evening (user's call): `max_concurrent` 5 -> 2.** Verified
+through the real sizer at 09-15 prices: ITC, RELIANCE, WIPRO size to 1 lot;
+TCS and AXISBANK reject `NO_TRADE_MIN_SIZE`; a second position still fits the
+exposure cap. Capital stays Rs 50,000 (ADR 0005 unchanged).
 
 ### 26c. Watch
 
 1. 16 Sep: `relative_strength` in nse_stock signals; no `DETECTOR_DEAD` halt.
-2. nse_stock rejections at sizing, not a crash; nse_index sizes NIFTY at 65.
+2. nse_stock trades only names whose lot fits ~Rs 11,400 (others reject
+   `NO_TRADE_MIN_SIZE`), never more than 2 open; nse_index sizes NIFTY at 65.
 3. 16:05 IST job writes 22 `atm_iv_daily` rows; NIFTY iv_rank computes from 16 Sep.
 4. New feature vectors carry `registry_version = '2'`.
 5. 02 Oct: engine and recorder idle all day (first calendar holiday since the fix).
