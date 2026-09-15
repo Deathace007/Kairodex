@@ -23,17 +23,24 @@ from kairodex.store.models import AtmIvDaily, Instrument, OptionQuote
 # An IV rank over a handful of sessions is noise dressed as a percentile.
 MIN_PRIOR_SESSIONS = 10
 MAX_PRIOR_SESSIONS = 252
+# Both the stored history and the live reading use the nearest expiry at
+# least this far out. Mixing definitions (live = nearest expiry, history =
+# every expiry) pinned NIFTY's iv_rank at 1.0 on its 2026-09-15 weekly
+# expiry: live 0.50 against a history that never exceeded 0.134.
+MIN_DTE = 7
 _ATM_DELTA = (Decimal("0.40"), Decimal("0.60"))
 _WINDOW_START = datetime.timedelta(minutes=5 * 60 + 45)  # 15:00 IST = session open + 5h45m
 _WINDOW = datetime.timedelta(minutes=15)
 
 
-def current_atm_iv(chain: list[ChainSnapshot]) -> float | None:
-    """Median vendor IV of the nearest expiry's |delta| 0.40-0.60 legs —
-    the same definition `record_atm_iv` stores, taken from the live chain."""
-    if not chain:
+def current_atm_iv(chain: list[ChainSnapshot], today: datetime.date) -> float | None:
+    """Median vendor IV of |delta| 0.40-0.60 legs on the nearest expiry at
+    least `MIN_DTE` days out — the same definition `record_atm_iv` stores,
+    taken from the live chain."""
+    eligible = [s for s in chain if (s.expiry - today).days >= MIN_DTE]
+    if not eligible:
         return None
-    front = min(chain, key=lambda s: s.expiry)
+    front = min(eligible, key=lambda s: s.expiry)
     values = [
         float(t.vendor_iv)
         for t in front.quotes
@@ -87,18 +94,25 @@ async def record_atm_iv(
     Filters `option_quotes` by an explicit instrument-id list and a
     15-minute window so the (instrument_id, ts) primary key does the work —
     joining on `instruments.underlying_symbol` inside the scan took >2 min."""
-    ids = list(
-        await session.scalars(
-            select(Instrument.instrument_id).where(
-                Instrument.exchange == underlying.exchange,
-                Instrument.underlying_symbol == underlying.symbol,
-                Instrument.kind == InstrumentKind.OPTION,
-                Instrument.expiry >= day,
-            )
+    on_underlying = (
+        Instrument.exchange == underlying.exchange,
+        Instrument.underlying_symbol == underlying.symbol,
+        Instrument.kind == InstrumentKind.OPTION,
+    )
+    expiry = await session.scalar(
+        select(func.min(Instrument.expiry)).where(
+            *on_underlying, Instrument.expiry >= day + datetime.timedelta(days=MIN_DTE)
         )
     )
-    if not ids:
-        return None
+    ids = (
+        list(
+            await session.scalars(
+                select(Instrument.instrument_id).where(*on_underlying, Instrument.expiry == expiry)
+            )
+        )
+        if expiry is not None
+        else []
+    )
     market = Market.NSE if underlying.exchange == "NSE" else Market.US
     open_dt, _ = session_window_utc(market, day)
     start = open_dt + _WINDOW_START
@@ -120,7 +134,7 @@ async def record_atm_iv(
             )
         )
     ).one()
-    median, n = row
+    median, n = row if ids else (None, 0)
     if median is None or not n:
         # Remove any earlier value for this session, so a re-run after a
         # definition change can't leave a stale row behind.

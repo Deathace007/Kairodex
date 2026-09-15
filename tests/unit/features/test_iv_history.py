@@ -15,14 +15,24 @@ def _tick(delta: str, iv: str | None) -> Tick:
                 vendor_iv=Decimal(iv) if iv is not None else None)
 
 
-def test_current_atm_iv_uses_nearest_expiry_near_the_money_legs_only():
-    near = ChainSnapshot(underlying="NIFTY", expiry=datetime.date(2026, 9, 22), ts=_NOW, quotes=[
-        _tick("0.50", "0.20"), _tick("-0.45", "0.22"), _tick("0.10", "0.90"), _tick("0.55", None),
-    ])
-    far = ChainSnapshot(underlying="NIFTY", expiry=datetime.date(2026, 9, 29), ts=_NOW,
-                        quotes=[_tick("0.50", "0.50")])
-    assert abs(current_atm_iv([far, near]) - 0.21) < 1e-12  # type: ignore[operator]
-    assert current_atm_iv([]) is None
+def test_current_atm_iv_skips_expiries_inside_min_dte_and_uses_near_the_money_legs():
+    """On an expiry day the front contract's IV explodes (NIFTY 0.50 vs a
+    0.13 history on 2026-09-15), so both the live reading and the stored
+    history use the nearest expiry at least MIN_DTE days out."""
+    today = datetime.date(2026, 9, 15)
+    expiring = ChainSnapshot(underlying="NIFTY", expiry=today, ts=_NOW,
+                             quotes=[_tick("0.50", "0.50")])
+    next_week = ChainSnapshot(
+        underlying="NIFTY", expiry=datetime.date(2026, 9, 22), ts=_NOW,
+        quotes=[_tick("0.50", "0.20"), _tick("-0.45", "0.22"), _tick("0.10", "0.90"),
+                _tick("0.55", None)],
+    )
+    later = ChainSnapshot(underlying="NIFTY", expiry=datetime.date(2026, 9, 29), ts=_NOW,
+                          quotes=[_tick("0.50", "0.40")])
+    value = current_atm_iv([later, expiring, next_week], today)
+    assert value is not None and abs(value - 0.21) < 1e-12
+    assert current_atm_iv([expiring], today) is None
+    assert current_atm_iv([], today) is None
 
 
 def test_with_current_needs_enough_history_and_a_current_reading():

@@ -271,7 +271,7 @@ async def build_context(
     session_open_ts, _ = session_window_utc(segment.market, local_day)
     iv_history = iv_history_module.with_current(
         await iv_history_module.load_prior_iv(session, underlying.instrument_id, local_day),
-        iv_history_module.current_atm_iv(chain),
+        iv_history_module.current_atm_iv(chain, local_day),
         as_of,
     )
     return FeatureContext(
