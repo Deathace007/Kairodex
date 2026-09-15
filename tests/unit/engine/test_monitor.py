@@ -476,3 +476,64 @@ def test_stop_loss_still_outranks_the_session_close():
     result = evaluate_exits(position, datetime.datetime(2026, 8, 5, 9, 46, tzinfo=datetime.UTC))
     assert result is not None
     assert result.reason == "STOP_LOSS"
+
+
+# --- breakeven floor + stop labelling (2026-09-15) ---------------------
+
+
+def test_breakeven_floor_exits_at_entry_after_trigger_even_inside_the_trail():
+    """Entry 100, initial stop 80 (20%), trail 20% of peak. Peak 115 trails
+    to 92 — the old rule would ride this back to -8%. With a +10% trigger
+    the floor is 100, so a mark of 99 exits, labelled BREAKEVEN_STOP."""
+    pos = _position(
+        stop_price=Decimal(80), initial_stop_price=Decimal(80),
+        high_water_mark_price=Decimal(115), current_mark=Decimal(99),
+        breakeven_trigger_pct=0.10,
+    )
+    result = trailing_stop_check(pos)
+    assert result is not None
+    assert result.reason == "BREAKEVEN_STOP"
+    assert result.new_stop_price == Decimal(100)
+
+
+def test_breakeven_floor_inactive_below_trigger():
+    pos = _position(
+        stop_price=Decimal(80), initial_stop_price=Decimal(80),
+        high_water_mark_price=Decimal(109), current_mark=Decimal(99),
+        breakeven_trigger_pct=0.10,
+    )
+    result = trailing_stop_check(pos)
+    # 109 * 0.8 = 87.2 trail, no floor: a ratchet, not an exit
+    assert result is not None and result.qty_lots == 0
+    assert result.new_stop_price == Decimal("87.2")
+
+
+def test_breakeven_floor_ratchets_then_stop_loss_check_labels_it():
+    pos = _position(
+        stop_price=Decimal(80), initial_stop_price=Decimal(80),
+        high_water_mark_price=Decimal(112), current_mark=Decimal(105),
+        breakeven_trigger_pct=0.10,
+    )
+    ratchet = trailing_stop_check(pos)
+    assert ratchet is not None and ratchet.qty_lots == 0
+    assert ratchet.new_stop_price == Decimal(100)
+    after = dataclasses.replace(pos, stop_price=Decimal(100), current_mark=Decimal(100))
+    decision = evaluate_exits(after, _NOW)
+    assert decision is not None and decision.reason == "BREAKEVEN_STOP"
+
+
+def test_trail_above_the_floor_is_labelled_trailing_stop():
+    """Peak 150 trails to 120 — above the floor, so it's the trail that fired."""
+    pos = _position(
+        stop_price=Decimal(120), initial_stop_price=Decimal(80),
+        high_water_mark_price=Decimal(150), current_mark=Decimal(119),
+        breakeven_trigger_pct=0.10,
+    )
+    decision = evaluate_exits(pos, _NOW)
+    assert decision is not None and decision.reason == "TRAILING_STOP"
+
+
+def test_untouched_initial_stop_still_reads_stop_loss():
+    pos = _position(current_mark=Decimal(89), breakeven_trigger_pct=0.10)
+    decision = stop_loss_check(pos)
+    assert decision is not None and decision.reason == "STOP_LOSS"

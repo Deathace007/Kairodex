@@ -76,7 +76,12 @@ min_confidence: 0.51
 # in the first 20 minutes, and they are where the losses are — the
 # intraday features they score on (ATR, VWAP, opening range, volume
 # profile, price acceptance) have no session history to read yet.
-entry_warmup_minutes: 20
+entry_warmup_minutes: 45
+# 20 -> 45 on 2026-09-15: entries 09:35-10:00 lost Rs 9,462 on 43 trades
+# (negative in 9 of 11 real sessions, both halves of the sample). Not a
+# direction problem — signals in that window resolve no worse — but noise:
+# -4.1% average drawdown in the first 10 minutes vs 0.0% for 10:00 entries,
+# and 5 of the book's 6 stop-outs inside 20 minutes.
 
 # Theta guard in trading sessions, not calendar days. The old 3-calendar-
 # day guard killed four positions at Monday's 09:17-09:19 opening bell
@@ -97,8 +102,13 @@ max_holding_sessions: 3
 # The +8% threshold is deliberately unchanged: 45 minutes is the knob the
 # evidence speaks to, and moving both at once would leave neither
 # attributable. Re-measure the threshold separately.
-scratch_exit_after_minutes: 45
-scratch_exit_min_mfe_pct: 0.08
+scratch_exit_after_minutes: 15
+scratch_exit_min_mfe_pct: 0.03
+# 45/0.08 -> 15/0.03 on 2026-09-15 — the separate threshold measurement the
+# note above deferred. Trades below +3% at 15 min (n=63) reached a best-ever
+# +3.1% and lost Rs 26,685; those above (n=69) reached +23.8% and made
+# Rs 22,510. Replay over 159 trades: +Rs 7,078 (+4,734 without the best
+# trade), positive in both halves; every 10-30 min x 2-3% cell helps.
 
 # No new entries this close to the bell. Everything is intraday (user's
 # call, 2026-08-10: nothing held overnight), so a trade opened with less
@@ -106,3 +116,14 @@ scratch_exit_min_mfe_pct: 0.08
 # window, from the same evidence: every winner reached +10% within 82
 # session-minutes.
 entry_cutoff_minutes: 90
+
+# --- 2026-09-15 fix plan (docs/reports/2026-09-15-two-segment-audit-and-fix-plan.html)
+# Veto: the 11 trades admitted at >= 0.90 lost Rs 8,318 (both halves).
+# min_confidence above stays a volume throttle; this is the only
+# confidence rule with evidence behind it. Re-check once relative_strength
+# is back — its absence is what made >= 0.95 common.
+max_confidence: 0.90
+# Once +10%, the stop may not fall below entry. The proportional 20% trail
+# alone returned 19 trades that peaked >= +15% to <= +5% (-Rs 6,124).
+breakeven_trigger_pct: 0.10
+breakeven_floor_pct: 0.0

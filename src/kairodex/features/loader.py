@@ -13,6 +13,7 @@ make silently on a caller's behalf.
 
 from __future__ import annotations
 
+import dataclasses
 import datetime
 from collections import defaultdict
 
@@ -54,9 +55,14 @@ _CHAIN_QUOTE_LOOKBACK = datetime.timedelta(minutes=15)
 # broad-market proxy, already tracked as one of the four US_INDEX
 # constituents per ADR 0007) for both US segments. First-pass, documented,
 # freely revisitable.
+#
+# "NIFTY", not "Nifty 50": the 2026-08-20 instrument merge renamed the row,
+# the old string stopped matching, and `relative_strength` was absent from
+# every one of 3,655 signals for 26 days with no error anywhere. Which is
+# why a missing benchmark now raises instead of returning [].
 _BENCHMARK_SYMBOL: dict[Segment, str] = {
-    Segment.NSE_STOCK: "Nifty 50",
-    Segment.NSE_INDEX: "Nifty 50",
+    Segment.NSE_STOCK: "NIFTY",
+    Segment.NSE_INDEX: "NIFTY",
     Segment.US_STOCK: "SPY",
     Segment.US_INDEX: "SPY",
 }
@@ -109,17 +115,19 @@ async def load_index_bars(
     code populated `FeatureContext.index_bars`, which defaults to `[]`,
     which makes `relative_strength_detector` return `None` on every single
     call — one of only two detector families that can ever fire without
-    an option chain, permanently dead). Returns `[]`, not an error, if the
-    benchmark instrument isn't in `instruments` yet — a missing benchmark
-    degrades `relative_strength_vs_index` to `None`, same as any other
-    missing feature input, rather than crashing the caller."""
+    an option chain, permanently dead).
+
+    Raises `LookupError` if the benchmark instrument does not exist. It used
+    to return `[]`, and that polite degradation is exactly how a renamed
+    instrument killed the detector for 26 days unnoticed. `[]` now only
+    means "the benchmark exists but has no bars in the window"."""
     symbol = _BENCHMARK_SYMBOL[segment]
     exchange = "NSE" if segment.market is Market.NSE else "US"
     benchmark = await session.scalar(
         select(Instrument).where(Instrument.exchange == exchange, Instrument.symbol == symbol)
     )
     if benchmark is None:
-        return []
+        raise LookupError(f"benchmark instrument {symbol!r} not found on {exchange}")
     return await load_underlying_bars(
         session, benchmark.instrument_id, as_of, lookback_days=lookback_days, timeframe=timeframe
     )
@@ -229,6 +237,15 @@ async def build_context(
     bars = await load_underlying_bars(
         session, underlying.instrument_id, as_of, lookback_days=bars_lookback_days
     )
+    if underlying.kind is InstrumentKind.INDEX:
+        future = await near_month_future(session, underlying, as_of)
+        if future is not None:
+            bars = with_proxy_volume(
+                bars,
+                await load_underlying_bars(
+                    session, future.instrument_id, as_of, lookback_days=bars_lookback_days
+                ),
+            )
     chain = await load_chain(
         session,
         exchange=underlying.exchange,
@@ -248,3 +265,42 @@ async def build_context(
     return FeatureContext(
         as_of=as_of, segment=segment, underlying_bars=bars, chain=chain, prior_chain=prior_chain
     )
+
+
+async def near_month_future(
+    session: AsyncSession, underlying: Instrument, as_of: datetime.datetime
+) -> Instrument | None:
+    """The nearest unexpired future on an index — the traded instrument
+    whose volume stands in for the index's own (see `with_proxy_volume`).
+    Also used by the recorder to decide which future's bars to fetch."""
+    today = as_of.astimezone(datetime.UTC).date()
+    row: Instrument | None = await session.scalar(
+        select(Instrument)
+        .where(
+            Instrument.exchange == underlying.exchange,
+            Instrument.kind == InstrumentKind.FUTURE,
+            Instrument.underlying_symbol == underlying.symbol,
+            Instrument.expiry >= today,
+        )
+        .order_by(Instrument.expiry)
+        .limit(1)
+    )
+    return row
+
+
+def with_proxy_volume(bars: list[Bar], proxy_bars: list[Bar]) -> list[Bar]:
+    """Index bars with each minute's volume taken from the same minute of
+    `proxy_bars` (the near-month future). Prices are untouched.
+
+    An index is a calculation, not a traded instrument: NIFTY and BANKNIFTY
+    1m bars carry volume 0, so `vwap_position` and `price_acceptance` were
+    MISSING on 100% of nse_index feature vectors (2026-09-15) — the
+    segment best placed to use the one feature that ever beat its session
+    baseline in 6 of 6 sessions (§21c) could not compute it. Minutes the
+    future has no bar for keep volume 0 rather than inventing one."""
+    if not proxy_bars:
+        return bars
+    volume_at = {b.ts: b.volume for b in proxy_bars}
+    return [
+        dataclasses.replace(b, volume=volume_at[b.ts]) if b.ts in volume_at else b for b in bars
+    ]

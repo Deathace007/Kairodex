@@ -75,6 +75,28 @@ class SegmentRiskConfig(BaseModel):
     scratch_exit_after_minutes: int
     scratch_exit_min_mfe_pct: float
 
+    # --- 2026-09-15 fix plan (docs/reports/2026-09-15-*). Optional so the
+    # dormant US configs still load unchanged.
+
+    # Veto ceiling. Confidence is monotone in intraday extension, so the
+    # scorer is most certain where a move is most stretched: the 11
+    # nse_stock trades admitted at >= 0.90 lost Rs 8,318, below baseline
+    # in both halves of the sample. None = no ceiling.
+    max_confidence: float | None = None
+
+    # Breakeven floor (monitor.trailing_stop_check): once the mark has
+    # reached entry x (1 + trigger), the stop may not fall below
+    # entry x (1 + floor). None = off. Replayed over 159 trades: +Rs 7,156,
+    # positive in both halves, worst single-trade cost -Rs 703.
+    breakeven_trigger_pct: float | None = None
+    breakeven_floor_pct: float = 0.0
+
+    # Never buy an expiry closer than this many calendar days. Measured on
+    # index weeklies 2026-09-11/15 (|delta| 0.45-0.55, 121-min hold): hurdle
+    # 12.2 ATR at 0 DTE, 1.01 at 4, 0.97 at 7, 0.74-0.87 at 11-18. Theta,
+    # not spread, dominates near expiry on index legs. 0 = no floor.
+    min_dte: int = 0
+
 
 @lru_cache
 def get_segment_config(segment: Segment) -> SegmentRiskConfig:

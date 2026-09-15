@@ -458,7 +458,7 @@ async def _backtest_run(segment: Segment, frm: datetime.date, to: datetime.date)
     from kairodex.data.recorder import watchlist_instruments
     from kairodex.store.models import BacktestRun
     from kairodex.store.models import Strategy as StrategyRow
-    from kairodex.strategy.protocol import ReferenceStrategy
+    from kairodex.strategy.protocol import strategy_for
     from kairodex.strategy.scorer import ConfluenceScorer
 
     start_dt = datetime.datetime.combine(frm, datetime.time.min, tzinfo=datetime.UTC)
@@ -467,7 +467,7 @@ async def _backtest_run(segment: Segment, frm: datetime.date, to: datetime.date)
     assert_not_touching_holdout(end_dt, now=now)  # raises before touching the DB at all
 
     sessionmaker = get_sessionmaker()
-    strategy = ReferenceStrategy()
+    strategy = strategy_for(segment)
     scorer = ConfluenceScorer()
     async with sessionmaker() as session:
         row = await session.scalar(
@@ -658,13 +658,12 @@ def status_cmd() -> None:
 
 async def _status() -> None:
     from kairodex.status import build_report
-    from kairodex.strategy.protocol import ReferenceStrategy
+    from kairodex.strategy.protocol import strategy_for
 
+    wired = {segment.value: strategy_for(segment).detector_names for segment in Segment}
     sessionmaker = get_sessionmaker()
     async with sessionmaker() as session:
-        typer.echo(
-            await build_report(session, wired_detectors=ReferenceStrategy().detector_names)
-        )
+        typer.echo(await build_report(session, wired_detectors=wired))
 
 
 @app.command("jobs")

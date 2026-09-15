@@ -12,7 +12,7 @@
 # trading_symbol is "BANKNIFTY", not "Nifty Bank".
 
 nse_index:
-  - "Nifty 50"
+  - NIFTY  # was "Nifty 50" — the 2026-08-20 instrument merge renamed the row
   - BANKNIFTY
 
 nse_stock:

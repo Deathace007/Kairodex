@@ -3,7 +3,7 @@ currency: INR
 base_risk_pct: 0.07
 hard_ceiling_pct: 0.25
 max_premium_pct: 0.35
-max_concurrent: 2
+max_concurrent: 1  # 2 -> 1 on 2026-09-15: NIFTY and BANKNIFTY are one bet
 daily_loss_limit_pct: 0.14
 weekly_loss_limit_pct: 0.28
 max_drawdown_pct: 0.35
@@ -52,7 +52,14 @@ reentry_cooldown_minutes: 45
 #
 # WATCH THIS: if nse_index goes silent for a full week, that is the signal
 # to re-measure on a real sample — not a bug to chase.
-min_confidence: 0.61
+min_confidence: 0.50
+# 0.61 -> 0.50 on 2026-09-15. This segment now runs trend_structure +
+# oi_price_flow only (relative_strength measures an index against itself
+# and is unwired here — strategy.protocol.strategy_for). That two-detector
+# distribution is what 0.61 sat on top of since 2026-08-20: it admitted
+# 2.8% of signals on 09-11 and 0 of 80 correctly-signed puts on 09-15.
+# 0.50 is p80 of 338 signals across 11 sessions — the same pass-rate
+# method as nse_stock's 0.51, throttle maintenance, not a quality claim.
 
 # --- P7 hardening (2026-08-10), all derived from the first ten closed
 # trades and the 33k signals behind them. See PROGRESS.md §15.
@@ -61,7 +68,7 @@ min_confidence: 0.61
 # in the first 20 minutes, and they are where the losses are — the
 # intraday features they score on (ATR, VWAP, opening range, volume
 # profile, price acceptance) have no session history to read yet.
-entry_warmup_minutes: 20
+entry_warmup_minutes: 45  # 20 -> 45 on 2026-09-15, same evidence as nse_stock; 7 of 8 index entries were 09:36-09:48
 
 # Theta guard in trading sessions, not calendar days. The old 3-calendar-
 # day guard killed four positions at Monday's 09:17-09:19 opening bell
@@ -73,8 +80,9 @@ max_holding_sessions: 3
 # almost entirely nse_stock's (4 nse_index trades in the sample), and the
 # window is kept in step across both NSE segments deliberately rather
 # than fitted twice on samples that cannot support it.
-scratch_exit_after_minutes: 45
-scratch_exit_min_mfe_pct: 0.08
+scratch_exit_after_minutes: 15
+scratch_exit_min_mfe_pct: 0.03
+# Kept in step with nse_stock (2026-09-15) — 8 index trades cannot fit their own values.
 
 # No new entries this close to the bell. Everything is intraday (user's
 # call, 2026-08-10: nothing held overnight), so a trade opened with less
@@ -82,3 +90,10 @@ scratch_exit_min_mfe_pct: 0.08
 # window, from the same evidence: every winner reached +10% within 82
 # session-minutes.
 entry_cutoff_minutes: 90
+
+# --- 2026-09-15 fix plan
+breakeven_trigger_pct: 0.10
+breakeven_floor_pct: 0.0
+# Index weeklies: hurdle 12.2 ATR at 0 DTE, 1.01 at 4, 0.97 at 7, 0.74-0.87
+# at 11-18 (09-11/09-15 quotes). Never buy this week's expiry.
+min_dte: 7

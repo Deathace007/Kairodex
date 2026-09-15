@@ -22,6 +22,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Protocol
 
+from kairodex.core.enums import Segment
 from kairodex.engine.monitor import ExitDecision as MonitorExitDecision
 from kairodex.engine.monitor import Position, evaluate_exits
 from kairodex.strategy.detectors.flow import oi_price_flow_detector
@@ -126,3 +127,23 @@ class ReferenceStrategy:
         to `evaluate_exits`'s default thresholds (stop-loss, trailing
         stop, profit target, R-multiple partials, time/event exit)."""
         return evaluate_exits(pos, ctx.feature_ctx.as_of)
+
+
+def strategy_for(segment: Segment) -> ReferenceStrategy:
+    """The detector set each segment actually trades on (SPEC.md,
+    "Segment-Specific Intelligence").
+
+    `nse_index` drops `relative_strength`: its benchmark is NIFTY, so the
+    feature measures NIFTY against itself (structurally zero) or BANKNIFTY
+    against NIFTY (a sector spread, not relative strength). It read above
+    the agreement threshold on 0 of 30 index evaluations (§19d). Declaring
+    it anyway would make the engine's dead-detector guard halt the segment
+    for a detector that can never fire there. Everything else gets the full
+    reference set."""
+    if segment is Segment.NSE_INDEX:
+        return ReferenceStrategy(
+            detectors=(trend_structure_detector, oi_price_flow_detector),
+            required_features=frozenset({"trend_state_strength", "oi_change"}),
+            detector_names=frozenset({"trend_structure", "oi_price_flow"}),
+        )
+    return ReferenceStrategy()

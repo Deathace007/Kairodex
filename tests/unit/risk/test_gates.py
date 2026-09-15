@@ -283,9 +283,9 @@ def test_baseline_passes_for_every_segment_config(segment):
 
 
 def test_session_timing_rejects_at_the_opening_bell():
-    """09:18 IST = 03:48 UTC, 3 minutes in, against nse_stock's 20-minute
-    warm-up. That is the minute five of the thirteen NSE entries ever
-    taken were opened at."""
+    """09:18 IST = 03:48 UTC, 3 minutes in, against nse_stock's warm-up.
+    That is the minute five of the thirteen NSE entries ever taken were
+    opened at."""
     at_open = datetime.datetime(2026, 8, 5, 3, 48, tzinfo=datetime.UTC)
     result = run_gate_chain(_proposal(), _account(), _CONFIG, now=at_open)
     assert result.reject_stage == "session_timing"
@@ -294,8 +294,9 @@ def test_session_timing_rejects_at_the_opening_bell():
 
 
 def test_session_timing_allows_once_the_window_has_passed():
-    """09:36 IST = 04:06 UTC, 21 minutes in — past the 20-minute floor."""
-    warmed = datetime.datetime(2026, 8, 5, 4, 6, tzinfo=datetime.UTC)
+    """10:01 IST = 04:31 UTC, 46 minutes in — past the 45-minute floor
+    (20 -> 45 on 2026-09-15)."""
+    warmed = datetime.datetime(2026, 8, 5, 4, 31, tzinfo=datetime.UTC)
     assert run_gate_chain(_proposal(), _account(), _CONFIG, now=warmed).allowed
 
 

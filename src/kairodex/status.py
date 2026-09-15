@@ -6,6 +6,7 @@ criterion). A CLI text report rather than a dashboard/API endpoint
 from __future__ import annotations
 
 import datetime
+from collections.abc import Mapping
 
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -101,8 +102,94 @@ def _fmt_age(ts: datetime.datetime | None, now: datetime.datetime) -> str:
     return f"{seconds / 3600:.1f}h ago"
 
 
+# Thresholds for `health_checks`. Each one names the failure it would have
+# caught (docs/reports/2026-09-15-two-segment-audit-and-fix-plan.html §5).
+_MIN_SWEEPS_PER_HOUR = 12  # healthy ~24-40; nine sessions ran at 0-3 (chain-scan bug)
+_MAX_LABEL_LAG = datetime.timedelta(days=2)  # labels stalled 33 days unnoticed
+_FROZEN_LEGS_ALERT = 0.60  # normal day 35-48% (quiet far strikes); holiday 100%
+
+
+async def health_checks(session: AsyncSession, now: datetime.datetime) -> list[str]:
+    """The conditions that each silently broke the engine for days or weeks.
+    Every line is `ok` or starts with `<<<` so it can be grepped."""
+
+    async def one(sql: str, **params: object) -> object:
+        return (await session.execute(text(sql), params)).scalar()
+
+    lines = ["health"]
+    hour_ago = now - datetime.timedelta(hours=1)
+    day_ago = now - datetime.timedelta(hours=24)
+
+    for event, what in (("EXIT_FAILED", "exits that could not fill"),
+                        ("EXIT_FORCED", "mandatory exits forced at a penalty")):
+        n = await one(
+            "SELECT count(*) FROM trade_events WHERE event_type = :e AND ts >= :since",
+            e=event, since=day_ago,
+        )
+        flag = "<<< " if n else ""
+        lines.append(f"  {flag}{event} (24h): {n} — {what}")
+
+    last_label = await one("SELECT max(ts) FROM signals WHERE forward_outcome IS NOT NULL")
+    lag_flag = (
+        "<<< " if isinstance(last_label, datetime.datetime) and now - last_label > _MAX_LABEL_LAG
+        else ""
+    )
+    lines.append(f"  {lag_flag}newest labelled signal: {last_label}")
+
+    rows = (
+        await session.execute(
+            text(
+                "SELECT fv.segment::text AS segment, count(*) AS vectors, "
+                "(SELECT count(*) FROM watchlist_membership w WHERE w.segment = fv.segment "
+                " AND w.valid_from <= current_date AND w.valid_to >= current_date) AS names "
+                "FROM feature_vectors fv WHERE fv.as_of >= :since GROUP BY fv.segment"
+            ),
+            {"since": hour_ago},
+        )
+    ).all()
+    for segment, vectors, names in rows:
+        sweeps = vectors / names if names else 0
+        flag = "<<< " if sweeps < _MIN_SWEEPS_PER_HOUR else ""
+        lines.append(f"  {flag}{segment} sweeps (last hour): {sweeps:.0f}")
+        dead = (
+            await session.execute(
+                text(
+                    "SELECT q.key FROM feature_vectors fv, jsonb_each_text(fv.quality) q "
+                    "WHERE fv.segment::text = :seg AND fv.as_of >= :since "
+                    "GROUP BY q.key HAVING bool_and(q.value = 'MISSING') ORDER BY 1"
+                ),
+                {"seg": segment, "since": hour_ago},
+            )
+        ).scalars().all()
+        if dead:
+            lines.append(f"  <<< {segment} features MISSING on 100% (last hour): {', '.join(dead)}")
+
+    frozen = (
+        await session.execute(
+            text(
+                "SELECT count(*) AS legs, count(*) FILTER (WHERE rows >= 3 AND variants = 1) "
+                "AS frozen FROM (SELECT instrument_id, count(*) AS rows, "
+                "count(DISTINCT (bid, ask, ltp, volume)) AS variants FROM option_quotes "
+                "WHERE ts >= :since GROUP BY instrument_id) x"
+            ),
+            {"since": now - datetime.timedelta(minutes=10)},
+        )
+    ).one()
+    if frozen.legs:
+        share = frozen.frozen / frozen.legs
+        flag = "<<< " if share > _FROZEN_LEGS_ALERT else ""
+        lines.append(
+            f"  {flag}option legs with frozen content (10 min): {frozen.frozen}/{frozen.legs} "
+            f"({share:.0%}) — ~100% means a shut exchange or a replaying feed"
+        )
+    lines.append("")
+    return lines
+
+
 async def build_report(
-    session: AsyncSession, *, wired_detectors: frozenset[str] | None = None
+    session: AsyncSession,
+    *,
+    wired_detectors: frozenset[str] | Mapping[str, frozenset[str]] | None = None,
 ) -> str:
     """`wired_detectors` is passed IN rather than read from
     `kairodex.strategy` here, and that is a layering constraint, not a
@@ -111,8 +198,10 @@ async def build_report(
     `kairodex.api` from reaching `kairodex.strategy`/`kairodex.engine`.
     Importing the strategy here put the whole engine behind a health
     endpoint and import-linter rejected it, which is the contract doing
-    its job. The CLI supplies the set; callers that leave it `None` get
-    the per-detector counts without the is-one-dead verdict.
+    its job. The CLI supplies the set — or a per-segment mapping, since
+    nse_index trades a different detector set (strategy.protocol.
+    strategy_for); callers that leave it `None` get the per-detector counts
+    without the is-one-dead verdict.
     """
     now = datetime.datetime.now(datetime.UTC)
     since = now - datetime.timedelta(hours=24)
@@ -142,15 +231,19 @@ async def build_report(
             lines.append("  last error:       none")
         lines.append("")
 
+    lines += await health_checks(session, now)
+
     coverage = await detector_coverage(session, since)
-    wired = wired_detectors
-    lines.append(
-        "detectors (24h)" if wired is None else f"detectors (24h, {len(wired)} wired)"
-    )
+    lines.append("detectors (24h)")
     if not coverage:
         lines.append("  no signals with evidence in the last 24h")
     for segment in sorted(coverage):
         seen = coverage[segment]
+        wired = (
+            wired_detectors.get(segment)
+            if isinstance(wired_detectors, Mapping)
+            else wired_detectors
+        )
         verdict = f"{len(seen)} firing"
         if wired is not None:
             missing = sorted(wired - seen.keys())

@@ -144,6 +144,26 @@ async def watchlist_instruments(session: AsyncSession, segment: Segment) -> list
     return list(rows)
 
 
+async def with_index_futures(
+    session: AsyncSession, underlyings: list[Instrument]
+) -> list[Instrument]:
+    """`underlyings` plus the near-month future of every index among them,
+    so the bar refresh also records a traded instrument's volume for each
+    index (features.loader.with_proxy_volume — index bars carry volume 0).
+    The futures rows already exist from sync-instruments; they had simply
+    not been recorded since 2026-08-05."""
+    from kairodex.features.loader import near_month_future
+
+    now = datetime.datetime.now(datetime.UTC)
+    futures = []
+    for u in underlyings:
+        if u.kind is InstrumentKind.INDEX:
+            future = await near_month_future(session, u, now)
+            if future is not None:
+                futures.append(future)
+    return underlyings + futures
+
+
 async def update_feed_health(session: AsyncSession, provider: str, **fields: object) -> None:
     """A healthy update clears `last_error`/`last_error_at`.
 
@@ -333,7 +353,9 @@ async def t1_poll_loop(
                     client,
                     provider,
                     market,
-                    [u for us in underlyings_by_segment.values() for u in us],
+                    await with_index_futures(
+                        session, [u for us in underlyings_by_segment.values() for u in us]
+                    ),
                 )
         except Exception:
             logger.exception("bar refresh failed for %s", provider)
@@ -589,7 +611,8 @@ async def run_market(market: Market) -> None:
             )
 
         async with sessionmaker() as session:
-            await recover_underlying_bars(session, client, provider, market, all_underlyings)
+            bar_instruments = await with_index_futures(session, all_underlyings)
+            await recover_underlying_bars(session, client, provider, market, bar_instruments)
 
         await asyncio.gather(
             t1_poll_loop(sessionmaker, client, provider, market, underlyings_by_segment),

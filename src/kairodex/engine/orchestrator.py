@@ -32,7 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from kairodex.config.segments import SegmentRiskConfig
 from kairodex.core.enums import Market, Segment, Side
-from kairodex.core.sessions import session_length_secs, session_seconds_between
+from kairodex.core.sessions import local_date_for, session_length_secs, session_seconds_between
 from kairodex.data.types import ChainSnapshot, Tick
 from kairodex.engine import event_log
 from kairodex.engine.monitor import Position, evaluate_exits
@@ -162,6 +162,83 @@ def _candidates_from_chain(
     return out
 
 
+# Exits that fire because of the clock or the calendar, not the price. These
+# are the only ones allowed to fall back to `forced_exit_quote`.
+MANDATORY_EXITS = frozenset({"EOD_EXIT", "OVERNIGHT_EXIT", "EXPIRY_EXIT"})
+FORCED_EXIT_PENALTY_PCT = 0.05
+
+
+def forced_exit_quote(quote: QuoteSnapshot, *, qty: int, now: datetime.datetime) -> QuoteSnapshot:
+    """A last-resort book for a mandatory exit whose real quote was refused:
+    a locked market at the last bid less `FORCED_EXIT_PENALTY_PCT`, fresh
+    by construction and deep enough (4x, against `compute_fill`'s 25%
+    top-of-book cap) to take the whole position. Pure, so it is tested."""
+    base = quote.bid if quote.bid > 0 else quote.ask
+    price = base * Decimal(str(1 - FORCED_EXIT_PENALTY_PCT))
+    size = max(qty, 1) * 4
+    return QuoteSnapshot(
+        bid=price, ask=price, bid_sz=size, ask_sz=size, quote_ts=now, oi=None, chain_complete=True
+    )
+
+
+def chain_at_min_dte(
+    chain: list[ChainSnapshot], today: datetime.date, min_dte: int
+) -> list[ChainSnapshot]:
+    """Drop expiries closer than `min_dte` calendar days. See
+    `SegmentRiskConfig.min_dte` for the index measurement (12.2 ATR hurdle
+    at 0 DTE)."""
+    return [snapshot for snapshot in chain if (snapshot.expiry - today).days >= min_dte]
+
+
+# How far back `_quote_content_since` looks for the last price change.
+# Same bound as `features.loader._CHAIN_QUOTE_LOOKBACK`, for the same
+# hypertable-scan reason.
+_CONTENT_LOOKBACK = datetime.timedelta(minutes=15)
+
+
+async def _quote_content_since(
+    session: AsyncSession, instrument_id: int, latest_ts: datetime.datetime
+) -> datetime.datetime:
+    """When the latest quote row's *content* first appeared.
+
+    The recorder writes a fresh row every poll whether or not anything
+    changed, so row age says nothing about price age. On 2026-09-14 the
+    exchange was shut and 100% of option legs repeated the previous
+    session's bid/ask/LTP/volume under fresh timestamps; the entry path's
+    STALE_QUOTE check passed and three ONGC 232.5 P trades filled at
+    identical prices. Content unchanged for the whole window returns the
+    window start, i.e. definitely stale. Entries only: an exit on a leg
+    that has gone quiet must still be able to leave."""
+    latest = await session.scalar(
+        select(OptionQuote)
+        .where(OptionQuote.instrument_id == instrument_id, OptionQuote.ts == latest_ts)
+        .limit(1)
+    )
+    if latest is None:
+        return latest_ts
+    window_start = latest_ts - _CONTENT_LOOKBACK
+    in_window = (
+        OptionQuote.instrument_id == instrument_id,
+        OptionQuote.ts >= window_start,
+        OptionQuote.ts <= latest_ts,
+    )
+    last_different = await session.scalar(
+        select(func.max(OptionQuote.ts)).where(
+            *in_window,
+            OptionQuote.bid.is_distinct_from(latest.bid)
+            | OptionQuote.ask.is_distinct_from(latest.ask)
+            | OptionQuote.ltp.is_distinct_from(latest.ltp)
+            | OptionQuote.volume.is_distinct_from(latest.volume),
+        )
+    )
+    if last_different is None:
+        return window_start
+    first_same = await session.scalar(
+        select(func.min(OptionQuote.ts)).where(*in_window, OptionQuote.ts > last_different)
+    )
+    return first_same or latest_ts
+
+
 def _select_across_expiries(
     chain: list[ChainSnapshot],
     direction: Side,
@@ -245,6 +322,7 @@ async def run_entry_tick(
     broker: ExecutionPort,
     now: datetime.datetime,
     prior_as_of: datetime.datetime | None = None,
+    halt_reason: str | None = None,
 ) -> TickOutcome | None:
     """One evaluation pass for one underlying. Returns `None` only if no
     signal was generated at all (nothing to log) — a signal that *was*
@@ -257,8 +335,8 @@ async def run_entry_tick(
     # build_context deliberately leaves index_bars for the caller (its own
     # docstring) — nothing was ever supplying it, which made
     # relative_strength_detector permanently dead (see load_index_bars's
-    # docstring). Missing benchmark data degrades to [] (unchanged), not
-    # an error.
+    # docstring). A missing benchmark *instrument* raises (fails the tick,
+    # logged by live_loop); no bars in the window is still just [].
     index_bars = await feature_loader.load_index_bars(session, segment, now)
     if index_bars:
         feature_ctx = dataclasses.replace(feature_ctx, index_bars=index_bars)
@@ -308,8 +386,20 @@ async def run_entry_tick(
     # Rejected here rather than skipped entirely, because a below-threshold
     # signal is real training data (ARCHITECTURE.md §11) — unlike an
     # out-of-hours one, it says something about the setup, not the clock.
+    # Engine health (live_loop): a dead detector or a closed exchange. The
+    # signal and its feature vector are still written above, so the
+    # condition clearing is visible in the data rather than a guess.
+    if halt_reason is not None:
+        signal.reject_stage, signal.reject_reason = "health", halt_reason
+        await session.commit()
+        return TickOutcome(signal.signal_id, False, signal.reject_stage, signal.reject_reason)
+
     if result.confidence < config.min_confidence:
         signal.reject_stage, signal.reject_reason = "confidence", "BELOW_MIN_CONFIDENCE"
+        await session.commit()
+        return TickOutcome(signal.signal_id, False, signal.reject_stage, signal.reject_reason)
+    if config.max_confidence is not None and result.confidence >= config.max_confidence:
+        signal.reject_stage, signal.reject_reason = "confidence", "ABOVE_MAX_CONFIDENCE"
         await session.commit()
         return TickOutcome(signal.signal_id, False, signal.reject_stage, signal.reject_reason)
 
@@ -332,8 +422,16 @@ async def run_entry_tick(
     # using the wrong lot_size there would silently pass contracts that are actually
     # unaffordable once sized for real.
 
+    chain = chain_at_min_dte(
+        feature_ctx.chain, local_date_for(segment.market, now), config.min_dte
+    )
+    if not chain:
+        signal.reject_stage, signal.reject_reason = "contract_selection", "NO_EXPIRY_AT_MIN_DTE"
+        await session.commit()
+        return TickOutcome(signal.signal_id, False, signal.reject_stage, signal.reject_reason)
+
     selection = _select_across_expiries(
-        feature_ctx.chain,
+        chain,
         result.direction,
         spot=Decimal(str(feature_ctx.spot)),
         equity=account.equity,
@@ -406,7 +504,9 @@ async def run_entry_tick(
         ask=candidate.ask,
         bid_sz=candidate.bid_sz or 0,
         ask_sz=candidate.ask_sz or 0,
-        quote_ts=candidate.quote_ts or now,
+        # When the price last *changed*, not when the row was written — see
+        # `_quote_content_since`.
+        quote_ts=await _quote_content_since(session, instrument_id, candidate.quote_ts or now),
         oi=candidate.oi,
         chain_complete=proposal.chain_complete,
     )
@@ -436,6 +536,7 @@ async def run_entry_tick(
         spot=feature_ctx.spot,
         values=values,
         synthetic_quote=synthetic_quotes,
+        delta=candidate.delta,
     )
     signal.decision = "TAKEN"
     await session.commit()
@@ -498,6 +599,7 @@ async def _record_fill(
     spot: float | None,
     values: dict[str, float],
     synthetic_quote: bool = False,
+    delta: Decimal | None = None,
 ) -> int:
     assert execution.price is not None
     premium_paid = execution.price * execution.filled_qty * lot_size
@@ -514,6 +616,7 @@ async def _record_fill(
         avg_entry=execution.price,
         premium_paid=premium_paid,
         fees=execution.costs.total if execution.costs is not None else Decimal(0),
+        greeks_entry={"delta": str(delta)} if delta is not None else None,
         # regime/profile-state/liquidity snapshot at entry (§5.4's own
         # docstring for this column) — everything here was already
         # computed by run_entry_tick's feature pass, so this costs no
@@ -553,6 +656,14 @@ async def _record_fill(
             ),
             "scratch_after_secs": config.scratch_exit_after_minutes * 60,
             "scratch_min_mfe_pct": config.scratch_exit_min_mfe_pct,
+            "breakeven_trigger_pct": config.breakeven_trigger_pct,
+            "breakeven_floor_pct": config.breakeven_floor_pct,
+            # `qty_lots` and `premium_paid` are *remaining* quantities —
+            # partial exits and the P&L arithmetic decrement them, so both
+            # read 0 on every closed trade. The size actually traded lives
+            # here instead of changing what those columns mean.
+            "entry_qty_lots": execution.filled_qty,
+            "entry_premium_paid": str(premium_paid),
         },
     )
     session.add(trade)
@@ -657,6 +768,16 @@ async def run_exit_tick(
     scratch_min_mfe_pct = (
         float(scratch_min_mfe_raw) if isinstance(scratch_min_mfe_raw, int | float) else 0.08
     )
+    # Absent on trades opened before 2026-09-15 -> None -> no floor, so a
+    # deploy never changes the rules under an already-open position.
+    breakeven_trigger_raw = risk_params.get("breakeven_trigger_pct")
+    breakeven_trigger_pct = (
+        float(breakeven_trigger_raw) if isinstance(breakeven_trigger_raw, int | float) else None
+    )
+    breakeven_floor_raw = risk_params.get("breakeven_floor_pct", 0.0)
+    breakeven_floor_pct = (
+        float(breakeven_floor_raw) if isinstance(breakeven_floor_raw, int | float) else 0.0
+    )
     # Both time-based rules measure open-market seconds, not wall-clock —
     # see core.sessions.session_seconds_between for what that fixed.
     held_session_secs = session_seconds_between(trade.segment.market, trade.opened_at, now)
@@ -690,6 +811,8 @@ async def run_exit_tick(
         expiry=expiry,
         scratch_after_secs=scratch_after_secs,
         scratch_min_mfe_pct=scratch_min_mfe_pct,
+        breakeven_trigger_pct=breakeven_trigger_pct,
+        breakeven_floor_pct=breakeven_floor_pct,
     )
 
     unrealized = (mark - trade.avg_entry) * trade.qty_lots * trade.lot_size
@@ -760,6 +883,18 @@ async def run_exit_tick(
         lot_size=trade.lot_size,
     )
     execution = await broker.execute(order_request, quote, now, attempt=1)
+    forced_from: str | None = None
+    if (execution.rejected or execution.filled_qty <= 0) and decision.reason in MANDATORY_EXITS:
+        # A time-mandatory exit may not simply not happen. The five
+        # positions that hit STALE_QUOTE at the bell (trades 87, 95, 101,
+        # 194, 196; 1,165 EXIT_FAILED events) were carried 21-67 hours and
+        # happened to gap favourably — Rs 6,972, the whole reported profit
+        # of nse_stock at the time. A pessimistic recorded price is an
+        # honest paper result; an unbudgeted overnight position is not.
+        forced_from = execution.reject_reason
+        execution = await broker.execute(
+            order_request, forced_exit_quote(quote, qty=decision.qty_lots, now=now), now, attempt=1
+        )
     if execution.rejected or execution.filled_qty <= 0:
         # An exit that cannot fill is a risk event, not a non-event: the
         # position stays open past whatever level just told it to leave.
@@ -798,6 +933,29 @@ async def run_exit_tick(
         return ExitOutcome(trade.trade_id, f"{decision.reason}_FILL_FAILED", closed=False)
     assert execution.price is not None  # guaranteed once not rejected and filled_qty > 0
 
+    if forced_from is not None:
+        quote_age_s = (now - latest_quote.ts).total_seconds()
+        logger.error(
+            "trade %d: %s FORCED at %s after %s — quote %.1fs old, %.0f%% penalty",
+            trade.trade_id,
+            decision.reason,
+            execution.price,
+            forced_from,
+            quote_age_s,
+            FORCED_EXIT_PENALTY_PCT * 100,
+        )
+        await event_log.append_event(
+            session,
+            trade_id=trade.trade_id,
+            event_type="EXIT_FORCED",
+            payload={
+                "attempted": decision.reason,
+                "reject_reason": forced_from,
+                "penalty_pct": FORCED_EXIT_PENALTY_PCT,
+                "quote_age_s": round(quote_age_s, 1),
+            },
+            ts=now,
+        )
     order = Order(
         trade_id=trade.trade_id, ts=now, instrument_id=trade.instrument_id, side=Side.SELL,
         qty=execution.filled_qty, order_type="MARKET", status="FILLED",
@@ -814,6 +972,15 @@ async def run_exit_tick(
         ),
         slippage_bps=(
             Decimal(str(execution.slippage_bps)) if execution.slippage_bps is not None else None
+        ),
+        fill_model=(
+            {
+                "forced_stale": True,
+                "reject_reason": forced_from,
+                "penalty_pct": FORCED_EXIT_PENALTY_PCT,
+            }
+            if forced_from is not None
+            else None
         ),
     )
     session.add(fill)

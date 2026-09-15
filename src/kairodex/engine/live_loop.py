@@ -12,13 +12,13 @@ import asyncio
 import datetime
 import logging
 
-from sqlalchemy import select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from kairodex.config.segments import get_segment_config
 from kairodex.core.clock import LiveClock
 from kairodex.core.enums import Market, Segment, StrategyStatus
-from kairodex.core.sessions import is_session_open_now
+from kairodex.core.sessions import is_session_open_now, local_date_for, session_window_utc
 from kairodex.data.recorder import watchlist_instruments
 from kairodex.engine.orchestrator import run_entry_tick, run_exit_tick
 from kairodex.execution.costs import compute_nse_costs, compute_us_costs
@@ -26,10 +26,10 @@ from kairodex.execution.simulator import ExecutionPort, ShadowLogger, SimulatedB
 from kairodex.risk.accounting import update_equity_and_risk_state
 from kairodex.risk.loader import build_account_state
 from kairodex.store.base import get_sessionmaker
-from kairodex.store.models import PositionMark, RiskState, Trade
+from kairodex.store.models import PositionMark, RiskState, Trade, UnderlyingBar
 from kairodex.store.models import Strategy as StrategyRow
 from kairodex.strategy.detectors import flow
-from kairodex.strategy.protocol import ReferenceStrategy
+from kairodex.strategy.protocol import strategy_for
 from kairodex.strategy.scorer import ConfluenceScorer
 from kairodex.streaming.bus import publish
 from kairodex.streaming.types import StreamMessage
@@ -84,6 +84,63 @@ CLOSED_MARKET_INTERVAL = datetime.timedelta(minutes=5)
 # fixed. One session, one task, deterministic — the exits simply get
 # looked at more often.
 EXIT_SWEEP_EVERY_N_UNDERLYINGS = 5
+# Signals this process must have written before a declared detector's
+# absence counts as dead rather than quiet. ~2 nse_stock sweeps' worth, far
+# more than a live detector has ever gone without firing; relative_strength
+# was absent from 3,655 in a row (2026-08-20..09-15).
+DETECTOR_LIVENESS_MIN_SIGNALS = 200
+# Minutes into the session before "no underlying bars today" means the
+# exchange is shut rather than the first bar not having landed yet.
+NO_BARS_GRACE_MINUTES = 10
+# A sweep this slow is the frozen-cycle-clock failure mode (commit 75e4731:
+# 2-20 sweeps a session for nine sessions) coming back.
+SLOW_SWEEP_WARN = datetime.timedelta(minutes=5)
+
+
+async def dead_detectors(
+    session: AsyncSession, segment: Segment, declared: frozenset[str], since: datetime.datetime
+) -> frozenset[str]:
+    """Declared detectors absent from every signal this process has written
+    since `since` — once there are enough signals to say so.
+
+    Scoped to this process's own signals, not a trailing window, so a
+    restart after fixing a dead detector isn't halted by the rows that
+    recorded it dead. Signals keep being written while halted, so the halt
+    lifts by itself the moment the detector fires again."""
+    row = (
+        await session.execute(
+            text(
+                "SELECT count(DISTINCT s.signal_id) AS n, "
+                "array_remove(array_agg(DISTINCT d->>'detector'), NULL) AS seen "
+                "FROM signals s LEFT JOIN LATERAL jsonb_array_elements(s.evidence) d ON true "
+                "WHERE s.segment::text = :segment AND s.ts >= :since"
+            ),
+            {"segment": segment.value, "since": since},
+        )
+    ).one()
+    if row.n < DETECTOR_LIVENESS_MIN_SIGNALS:
+        return frozenset()
+    return declared - frozenset(row.seen or [])
+
+
+async def exchange_shut_today(
+    session: AsyncSession, segment: Segment, now: datetime.datetime
+) -> bool:
+    """The session clock says open but no underlying bar exists today.
+
+    There is no holiday calendar (core.sessions). On 2026-09-14 the exchange
+    was shut and the engine ran a normal day off the previous session's
+    frozen quotes — 885 signals, 3 fills. This needs no calendar: a real
+    session produces bars within minutes."""
+    open_dt, _ = session_window_utc(segment.market, local_date_for(segment.market, now))
+    if now < open_dt + datetime.timedelta(minutes=NO_BARS_GRACE_MINUTES):
+        return False
+    latest = await session.scalar(
+        select(func.max(UnderlyingBar.ts)).where(
+            UnderlyingBar.timeframe == "1m", UnderlyingBar.ts >= open_dt, UnderlyingBar.ts <= now
+        )
+    )
+    return latest is None
 
 
 async def _ensure_strategy_row(
@@ -180,7 +237,9 @@ async def _sweep_exits(
 async def run_segment(segment: Segment, *, shadow: bool = True) -> None:
     sessionmaker = get_sessionmaker()
     clock = LiveClock()
-    strategy = ReferenceStrategy()
+    strategy = strategy_for(segment)
+    started_at = clock.now()
+    halt_logged: str | None = None
     scorer = ConfluenceScorer()
     cost_model = compute_nse_costs if segment.market is Market.NSE else compute_us_costs
     broker = SimulatedBroker(cost_model=cost_model, max_quote_age_ms=ENTRY_MAX_QUOTE_AGE_MS)
@@ -229,6 +288,7 @@ async def run_segment(segment: Segment, *, shadow: bool = True) -> None:
             logger.info("%s: market open — evaluating", segment.value)
             market_was_open = True
 
+        cycle_started = clock.now()
         async with sessionmaker() as session:
             underlyings = await watchlist_instruments(session, segment)
             if not underlyings:
@@ -256,6 +316,27 @@ async def run_segment(segment: Segment, *, shadow: bool = True) -> None:
             # arithmetic here would be free to drift from it. One extra
             # query per *taken* trade, not per underlying.
             account = await build_account_state(session, segment, now)
+
+            # Health halts: entries are rejected at reject_stage "health"
+            # (signals and features still recorded), exits run normally.
+            halt_reason: str | None = None
+            try:
+                if await exchange_shut_today(session, segment, now):
+                    halt_reason = "EXCHANGE_SHUT_NO_BARS"
+                else:
+                    dead = await dead_detectors(
+                        session, segment, strategy.detector_names, started_at
+                    )
+                    if dead:
+                        halt_reason = "DETECTOR_DEAD:" + ",".join(sorted(dead))
+            except Exception:
+                logger.exception("%s: health check failed", segment.value)
+            if halt_reason != halt_logged:
+                if halt_reason is not None:
+                    logger.error("%s: ENTRIES HALTED — %s", segment.value, halt_reason)
+                else:
+                    logger.warning("%s: entries resumed (was %s)", segment.value, halt_logged)
+                halt_logged = halt_reason
 
             # Risk protection ahead of opportunity search. An open position
             # past its stop is unbounded risk that is already running; a
@@ -307,6 +388,7 @@ async def run_segment(segment: Segment, *, shadow: bool = True) -> None:
                         # permanently dead (see run_entry_tick's own comment):
                         # a `build_context` parameter nothing ever supplied.
                         prior_as_of=now - flow.OI_LOOKBACK,
+                        halt_reason=halt_reason,
                     )
                     if outcome is not None and outcome.taken:
                         account = await build_account_state(session, segment, now)
@@ -346,6 +428,15 @@ async def run_segment(segment: Segment, *, shadow: bool = True) -> None:
                     await _sweep_exits(
                         session, segment=segment, exit_execution=exit_execution, clock=clock
                     )
+
+            sweep_took = clock.now() - cycle_started
+            if sweep_took > SLOW_SWEEP_WARN:
+                logger.error(
+                    "%s: SLOW SWEEP — %d underlyings took %.0fs (expected ~150s)",
+                    segment.value,
+                    len(underlyings),
+                    sweep_took.total_seconds(),
+                )
 
             # Final sweep: the interleaved calls above only fire on exact
             # multiples, so a watchlist whose length is not a multiple of

@@ -109,3 +109,24 @@ def test_missing_features_yield_fewer_evidence_items_not_a_crash():
     assert evidence == []
     result = ConfluenceScorer().score(evidence)
     assert result.direction is None
+
+
+def test_nse_index_strategy_drops_relative_strength_and_names_match():
+    """The engine's dead-detector guard halts a segment whose declared
+    detector never fires, so the index set must not declare one that
+    measures NIFTY against itself."""
+    from kairodex.strategy.protocol import strategy_for
+
+    bars = [_bar(0, 100.0), _bar(_FLOW_SPAN, 102.0)]
+    ctx = MarketContext(
+        feature_ctx=FeatureContext(as_of=_T0, segment=Segment.NSE_INDEX, underlying_bars=bars),
+        features={
+            "trend_state_strength": 0.10,
+            "oi_change": 0.20,
+            "relative_strength_vs_index": 0.05,
+        },
+    )
+    index = strategy_for(Segment.NSE_INDEX)
+    assert {e.detector for e in index.evaluate(ctx)} == index.detector_names
+    assert "relative_strength" not in index.detector_names
+    assert strategy_for(Segment.NSE_STOCK).detector_names == ReferenceStrategy().detector_names

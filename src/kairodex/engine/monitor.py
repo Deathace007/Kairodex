@@ -62,6 +62,11 @@ class Position:
     # waiting for the full stop. See `scratch_exit_check`.
     scratch_after_secs: int | None = None
     scratch_min_mfe_pct: float = 0.08
+    # Breakeven floor: once the high-water mark reaches entry x (1 +
+    # trigger), the stop may not sit below entry x (1 + floor). None = off.
+    # See `_breakeven_floor`.
+    breakeven_trigger_pct: float | None = None
+    breakeven_floor_pct: float = 0.0
 
     @property
     def r_multiple(self) -> float | None:
@@ -83,8 +88,39 @@ class ExitDecision:
 
 def stop_loss_check(position: Position) -> ExitDecision | None:
     if position.current_mark <= position.stop_price:
-        return ExitDecision("STOP_LOSS", position.qty_lots)
+        return ExitDecision(_stop_reason(position, position.stop_price), position.qty_lots)
     return None
+
+
+def _breakeven_floor(position: Position) -> Decimal | None:
+    """The level a position that has already worked may not give back
+    through, or None while it hasn't worked (or the rule is off).
+
+    The trail alone is proportional to the peak, so its fixed point sits
+    almost exactly at entry: a position that runs to +22% and retraces
+    exits at 1.22 x 0.80 = -2.4%. 19 trades peaked >= +15% and closed
+    <= +5% that way (-Rs 6,124). Replayed over 159 trades, a floor at
+    entry once +10% was reached: +Rs 7,156, positive in both halves of the
+    sample, worst single-trade cost -Rs 703 (PROGRESS.md §25)."""
+    if position.breakeven_trigger_pct is None:
+        return None
+    trigger = position.avg_entry * Decimal(str(1 + position.breakeven_trigger_pct))
+    if position.high_water_mark_price < trigger:
+        return None
+    return position.avg_entry * Decimal(str(1 + position.breakeven_floor_pct))
+
+
+def _stop_reason(position: Position, level: Decimal) -> str:
+    """Which stop a breach of `level` actually is. They all used to read
+    STOP_LOSS once the ratchet had written the trailed level into
+    `stop_price`, so an audit could not tell an initial-risk stop from a
+    trail exit without re-deriving it from `risk_params`."""
+    floor = _breakeven_floor(position)
+    if floor is not None and level == floor:
+        return "BREAKEVEN_STOP"
+    if level > position.initial_stop_price:
+        return "TRAILING_STOP"
+    return "STOP_LOSS"
 
 
 def _initial_stop_pct(position: Position) -> float | None:
@@ -128,12 +164,17 @@ def trailing_stop_check(
     -29.0%. An explicit float still overrides, for callers that genuinely
     want a different give-back from their entry risk."""
     effective_trail_pct = trail_pct if trail_pct is not None else _initial_stop_pct(position)
-    if effective_trail_pct is None:
-        return None
-    trailed_stop = position.high_water_mark_price * Decimal(str(1 - effective_trail_pct))
-    effective_stop = max(position.stop_price, trailed_stop)
+    levels = [position.stop_price]
+    if effective_trail_pct is not None:
+        levels.append(position.high_water_mark_price * Decimal(str(1 - effective_trail_pct)))
+    floor = _breakeven_floor(position)
+    if floor is not None:
+        levels.append(floor)
+    effective_stop = max(levels)
     if position.current_mark <= effective_stop:
-        return ExitDecision("TRAILING_STOP", position.qty_lots, new_stop_price=effective_stop)
+        return ExitDecision(
+            _stop_reason(position, effective_stop), position.qty_lots, new_stop_price=effective_stop
+        )
     if effective_stop > position.stop_price:
         # no exit, just report the stop should move up
         return ExitDecision("STOP_RATCHET", 0, new_stop_price=effective_stop)

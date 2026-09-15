@@ -12,7 +12,7 @@ from kairodex.core.enums import Segment
     "segment,capital,currency,base_risk_pct,hard_ceiling_pct,max_premium_pct,max_concurrent",
     [
         (Segment.NSE_STOCK, 50000, "INR", 0.08, 0.35, 0.35, 5),
-        (Segment.NSE_INDEX, 50000, "INR", 0.07, 0.25, 0.35, 2),
+        (Segment.NSE_INDEX, 50000, "INR", 0.07, 0.25, 0.35, 1),  # 2 -> 1, 2026-09-15
         (Segment.US_STOCK, 50000, "USD", 0.015, 0.03, 0.05, 6),
         (Segment.US_INDEX, 50000, "USD", 0.015, 0.03, 0.05, 6),
     ],
@@ -63,3 +63,18 @@ def test_every_segment_declares_a_confidence_floor_above_zero():
     for segment in Segment:
         config = get_segment_config(segment)
         assert 0.0 < config.min_confidence < 1.0, segment
+
+
+def test_2026_09_15_fix_plan_values():
+    """Pinned so a later edit to either YAML fails loudly rather than
+    silently changing what the replay measured."""
+    stock = get_segment_config(Segment.NSE_STOCK)
+    assert (stock.entry_warmup_minutes, stock.scratch_exit_after_minutes) == (45, 15)
+    assert stock.scratch_exit_min_mfe_pct == 0.03
+    assert stock.max_confidence == 0.90
+    assert (stock.breakeven_trigger_pct, stock.breakeven_floor_pct) == (0.10, 0.0)
+    assert stock.min_dte == 0
+    index = get_segment_config(Segment.NSE_INDEX)
+    assert (index.min_confidence, index.min_dte, index.max_confidence) == (0.50, 7, None)
+    us = get_segment_config(Segment.US_STOCK)
+    assert (us.max_confidence, us.breakeven_trigger_pct, us.min_dte) == (None, None, 0)
