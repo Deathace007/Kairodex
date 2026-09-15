@@ -11,7 +11,7 @@ import datetime
 import statistics
 from decimal import Decimal
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -122,6 +122,15 @@ async def record_atm_iv(
     ).one()
     median, n = row
     if median is None or not n:
+        # Remove any earlier value for this session, so a re-run after a
+        # definition change can't leave a stale row behind.
+        await session.execute(
+            delete(AtmIvDaily).where(
+                AtmIvDaily.instrument_id == underlying.instrument_id,
+                AtmIvDaily.session_date == day,
+            )
+        )
+        await session.commit()
         return None
     value = Decimal(str(median)).quantize(Decimal("0.000001"))
     stmt = pg_insert(AtmIvDaily).values(
