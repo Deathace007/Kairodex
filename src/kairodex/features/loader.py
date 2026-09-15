@@ -4,11 +4,10 @@ separate from `compute/*.py` so "is the math right" (DB-free, tested
 locally) and "did we fetch the right rows" (needs a live DB, verified on
 the VM per CLAUDE.md) stay two independently-answerable questions.
 
-`index_bars`/`iv_history`/`session_open_ts` are left for the caller to
-fill in afterward (`dataclasses.replace`) rather than auto-derived here —
-"which index is the benchmark for this underlying" and "where does
-historical ATM IV come from" are real decisions this loader shouldn't
-make silently on a caller's behalf.
+`index_bars` is left for the caller (`dataclasses.replace`) — "which index
+is the benchmark" is the caller's decision. `session_open_ts` and
+`iv_history` are set here since 2026-09-15: leaving them to callers meant no
+caller ever set them, and three features were MISSING on every row.
 """
 
 from __future__ import annotations
@@ -21,7 +20,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from kairodex.core.enums import InstrumentKind, Market, Segment
+from kairodex.core.sessions import local_date_for, session_window_utc
 from kairodex.data.types import Bar, ChainSnapshot, Tick, Timeframe
+from kairodex.features import iv_history as iv_history_module
 from kairodex.features.types import FeatureContext
 from kairodex.store.models import Instrument, OptionQuote, UnderlyingBar
 
@@ -262,8 +263,25 @@ async def build_context(
             as_of=prior_as_of,
             max_expiries=max_expiries,
         )
+    local_day = local_date_for(segment.market, as_of)
+    # Set from 2026-09-15 (REGISTRY_VERSION "2"). Before, it was "left for
+    # the caller" and no caller set it, so `opening_range_position` was
+    # MISSING on every row and `vwap_position`/`price_acceptance`/POC
+    # silently used all 5 days of loaded bars instead of the session.
+    session_open_ts, _ = session_window_utc(segment.market, local_day)
+    iv_history = iv_history_module.with_current(
+        await iv_history_module.load_prior_iv(session, underlying.instrument_id, local_day),
+        iv_history_module.current_atm_iv(chain),
+        as_of,
+    )
     return FeatureContext(
-        as_of=as_of, segment=segment, underlying_bars=bars, chain=chain, prior_chain=prior_chain
+        as_of=as_of,
+        segment=segment,
+        underlying_bars=bars,
+        chain=chain,
+        prior_chain=prior_chain,
+        iv_history=iv_history,
+        session_open_ts=session_open_ts,
     )
 
 

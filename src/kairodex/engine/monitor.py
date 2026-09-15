@@ -67,6 +67,9 @@ class Position:
     # See `_breakeven_floor`.
     breakeven_trigger_pct: float | None = None
     breakeven_floor_pct: float = 0.0
+    # Seconds since this leg's quoted price last changed (not since the row
+    # was written). Supplied by the caller near the close only; None = unknown.
+    price_unchanged_secs: float | None = None
 
     @property
     def r_multiple(self) -> float | None:
@@ -269,6 +272,12 @@ def scratch_exit_check(position: Position) -> ExitDecision | None:
     return None
 
 
+# A leg whose price hasn't moved for this long, this close to the bell, has
+# stopped trading for the day — leave while a fill is still possible.
+_QUIET_LEG_CLOSE_BEFORE_SECS = 1800
+_QUIET_LEG_AFTER_SECS = 300
+
+
 def session_close_exit_check(
     position: Position, now: datetime.datetime, *, close_before_secs: int = 900
 ) -> ExitDecision | None:
@@ -298,6 +307,16 @@ def session_close_exit_check(
         position.segment.market, local_date_for(position.segment.market, now)
     )
     if now >= close_dt - datetime.timedelta(seconds=close_before_secs):
+        return ExitDecision("EOD_EXIT", position.qty_lots)
+    # Early for quiet legs (2026-09-15). All five positions that could not be
+    # closed at 15:15 had quotes 15-58 minutes old by then: the leg went quiet
+    # well before the bell. Starting their exit at 15:00 gives the real book
+    # a chance before `forced_exit_quote`'s penalty fill is needed.
+    if (
+        position.price_unchanged_secs is not None
+        and position.price_unchanged_secs >= _QUIET_LEG_AFTER_SECS
+        and now >= close_dt - datetime.timedelta(seconds=_QUIET_LEG_CLOSE_BEFORE_SECS)
+    ):
         return ExitDecision("EOD_EXIT", position.qty_lots)
     return None
 

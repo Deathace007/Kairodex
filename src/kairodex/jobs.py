@@ -1,5 +1,8 @@
 """`kairodex jobs` (ARCHITECTURE.md §3): APScheduler-driven periodic checks.
 
+Current jobs: Upstox token expiry (06:00), ATM IV history (16:05 IST) and
+forward-outcome labelling (16:15 IST) — the last two added 2026-09-15.
+
 P1 scope is just the annual Upstox token-expiry check named in the roadmap
 row ("annual token-expiry alerting"). EOD rollups, exports, retention, and
 FX snapshot are also listed against this process in §3, but none has a
@@ -19,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import logging
+import zoneinfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -28,6 +32,7 @@ from kairodex.core.enums import Market, Segment
 from kairodex.data.upstox.auth import AnalyticsToken
 
 logger = logging.getLogger(__name__)
+_IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 
 
 def check_upstox_token_expiry() -> None:
@@ -72,6 +77,38 @@ async def resolve_recent_outcomes() -> None:
             logger.exception("%s outcome resolution failed", segment.value)
 
 
+async def record_atm_iv_for_day(day: datetime.date) -> int:
+    """Store `day`'s ATM IV for every NSE watchlist underlying
+    (`features.iv_history`). Skips weekends and NSE holidays. Returns how
+    many underlyings got a value."""
+    from kairodex.core.sessions import is_market_holiday
+    from kairodex.data.recorder import watchlist_instruments
+    from kairodex.features.iv_history import record_atm_iv
+    from kairodex.store.base import get_sessionmaker
+
+    if day.weekday() >= 5 or is_market_holiday(Market.NSE, day):
+        return 0
+    written = 0
+    sessionmaker = get_sessionmaker()
+    for segment in (s for s in Segment if s.market is Market.NSE):
+        async with sessionmaker() as session:
+            underlyings = await watchlist_instruments(session, segment)
+            for u in underlyings:
+                try:
+                    if await record_atm_iv(session, u, day) is not None:
+                        written += 1
+                except Exception:
+                    await session.rollback()
+                    logger.exception("ATM IV for %s on %s failed", u.symbol, day)
+    return written
+
+
+async def record_todays_atm_iv() -> None:
+    today = datetime.datetime.now(datetime.UTC).astimezone(_IST).date()
+    n = await record_atm_iv_for_day(today)
+    logger.info("atm_iv_daily %s: %d underlyings", today, n)
+
+
 async def _run_forever() -> None:
     scheduler = AsyncIOScheduler()
     # Once/day is enough for a check against a ~1 year token (ADR 0006) —
@@ -81,6 +118,10 @@ async def _run_forever() -> None:
     # because the VM clock is UTC.
     scheduler.add_job(
         resolve_recent_outcomes, CronTrigger(hour=16, minute=15, timezone="Asia/Kolkata")
+    )
+    # iv_rank / iv_percentile history (features.iv_history).
+    scheduler.add_job(
+        record_todays_atm_iv, CronTrigger(hour=16, minute=5, timezone="Asia/Kolkata")
     )
     scheduler.start()
     check_upstox_token_expiry()  # also run once at startup, don't wait a day to notice

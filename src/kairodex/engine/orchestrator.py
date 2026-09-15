@@ -31,8 +31,13 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from kairodex.config.segments import SegmentRiskConfig
-from kairodex.core.enums import Market, Segment, Side
-from kairodex.core.sessions import local_date_for, session_length_secs, session_seconds_between
+from kairodex.core.enums import InstrumentKind, Market, Segment, Side
+from kairodex.core.sessions import (
+    local_date_for,
+    session_length_secs,
+    session_seconds_between,
+    session_window_utc,
+)
 from kairodex.data.types import ChainSnapshot, Tick
 from kairodex.engine import event_log
 from kairodex.engine.monitor import Position, evaluate_exits
@@ -44,7 +49,16 @@ from kairodex.features import store as feature_store
 from kairodex.risk.gates import run_gate_chain
 from kairodex.risk.sizing import size_position
 from kairodex.risk.types import AccountState, TradeProposal
-from kairodex.store.models import Fill, Instrument, OptionQuote, Order, PositionMark, Signal, Trade
+from kairodex.store.models import (
+    Fill,
+    Instrument,
+    InstrumentSpec,
+    OptionQuote,
+    Order,
+    PositionMark,
+    Signal,
+    Trade,
+)
 from kairodex.strategy.contract_selector import ContractCandidate, SelectionResult, select_contract
 from kairodex.strategy.protocol import Strategy
 from kairodex.strategy.scorer import ConfluenceScorer
@@ -160,6 +174,44 @@ def _candidates_from_chain(
             )
         )
     return out
+
+
+async def underlying_lot_size(
+    session: AsyncSession, underlying: Instrument, today: datetime.date
+) -> int | None:
+    """The F&O lot size in force today for contracts on `underlying` —
+    taken from its nearest unexpired future/option with a spec. Looked up
+    per underlying rather than per option row because the chain poller
+    creates option rows for new expiries with no spec; `sync-instruments`
+    attaches specs to the provider-key-matched rows."""
+    lot: int | None = await session.scalar(
+        select(InstrumentSpec.lot_size)
+        .join(Instrument, Instrument.instrument_id == InstrumentSpec.instrument_id)
+        .where(
+            Instrument.exchange == underlying.exchange,
+            Instrument.underlying_symbol == underlying.symbol,
+            Instrument.kind.in_((InstrumentKind.OPTION, InstrumentKind.FUTURE)),
+            Instrument.expiry >= today,
+            InstrumentSpec.valid_from <= today,
+            InstrumentSpec.valid_to >= today,
+        )
+        .order_by(Instrument.expiry)
+        .limit(1)
+    )
+    return lot
+
+
+async def leg_lot_size(
+    session: AsyncSession, instrument_id: int, today: datetime.date
+) -> int | None:
+    lot: int | None = await session.scalar(
+        select(InstrumentSpec.lot_size).where(
+            InstrumentSpec.instrument_id == instrument_id,
+            InstrumentSpec.valid_from <= today,
+            InstrumentSpec.valid_to >= today,
+        )
+    )
+    return lot
 
 
 # Exits that fire because of the clock or the calendar, not the price. These
@@ -414,13 +466,23 @@ async def run_entry_tick(
     # never take this path.
     synthetic_quotes = segment.market is Market.US
 
-    lot_size = 25 if segment.market.value == "nse" else 100  # ponytail: instrument_specs (P0
-    # table, SCD-2 lot size) isn't wired into this path yet — a fixed per-market default
-    # stands in; real per-underlying lot sizes vary (see docs/PROGRESS.md's next-steps).
-    # Resolved *before* select_contract, not after: the affordability filter inside it
-    # depends on the real lot_size (premium * lot_size <= max_premium_pct * equity) —
-    # using the wrong lot_size there would silently pass contracts that are actually
-    # unaffordable once sized for real.
+    # Resolved *before* select_contract, not after: the affordability filter
+    # inside it depends on the real lot_size (premium * lot_size <=
+    # max_premium_pct * equity). NSE reads `instrument_specs`; until
+    # 2026-09-15 this was a hardcoded 25 for every NSE contract. No silent
+    # default any more — a missing spec rejects the signal. US options are a
+    # 100-share contract by exchange rule (the segment is dormant).
+    if segment.market is Market.NSE:
+        found_lot = await underlying_lot_size(
+            session, underlying, local_date_for(segment.market, now)
+        )
+        if found_lot is None:
+            signal.reject_stage, signal.reject_reason = "sizing", "NO_LOT_SIZE"
+            await session.commit()
+            return TickOutcome(signal.signal_id, False, signal.reject_stage, signal.reject_reason)
+        lot_size = found_lot
+    else:
+        lot_size = 100
 
     chain = chain_at_min_dte(
         feature_ctx.chain, local_date_for(segment.market, now), config.min_dte
@@ -452,6 +514,14 @@ async def run_entry_tick(
         signal.reject_reason = "LEG_INSTRUMENT_NOT_FOUND"
         await session.commit()
         return TickOutcome(signal.signal_id, False, signal.reject_stage, signal.reject_reason)
+    if segment.market is Market.NSE:
+        # The traded contract's own lot wins over the underlying's nearest
+        # expiry, for the weeks NSE runs old and revised lots side by side.
+        # `size_position` below re-applies every cap with this value.
+        lot_size = (
+            await leg_lot_size(session, instrument_id, local_date_for(segment.market, now))
+            or lot_size
+        )
 
     stop_distance = selection.mid_price * Decimal(str(_DEFAULT_STOP_LOSS_PCT))
     proposal = TradeProposal(
@@ -788,6 +858,15 @@ async def run_exit_tick(
     expiry = await session.scalar(
         select(Instrument.expiry).where(Instrument.instrument_id == trade.instrument_id)
     )
+    # Only in the last 30 minutes (monitor._QUIET_LEG_CLOSE_BEFORE_SECS):
+    # two extra quote queries per open position, not all day.
+    price_unchanged_secs: float | None = None
+    _, close_dt = session_window_utc(
+        trade.segment.market, local_date_for(trade.segment.market, now)
+    )
+    if now >= close_dt - datetime.timedelta(minutes=30):
+        changed_at = await _quote_content_since(session, trade.instrument_id, latest_quote.ts)
+        price_unchanged_secs = (now - changed_at).total_seconds()
 
     position = Position(
         trade_id=trade.trade_id,
@@ -813,6 +892,7 @@ async def run_exit_tick(
         scratch_min_mfe_pct=scratch_min_mfe_pct,
         breakeven_trigger_pct=breakeven_trigger_pct,
         breakeven_floor_pct=breakeven_floor_pct,
+        price_unchanged_secs=price_unchanged_secs,
     )
 
     unrealized = (mark - trade.avg_entry) * trade.qty_lots * trade.lot_size

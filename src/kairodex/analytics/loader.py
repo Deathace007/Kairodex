@@ -20,6 +20,22 @@ from kairodex.store.models import EquitySnapshot, Instrument, PositionMark, Trad
 
 _LIVE_RUN_ID = 0  # EquitySnapshot's own "live paper book" sentinel (risk.loader's same constant)
 
+# Trades whose outcome was not a strategy decision (PROGRESS.md §25/§26).
+# They stay in `trades` and in the equity curve — the paper money really
+# moved — but performance metrics must not credit or blame the strategy for
+# them. Before this, nse_stock's reported +Rs 6,545 (2026-09-11) was
+# entirely these five overnight carries.
+NON_ATTRIBUTABLE_TRADES: dict[int, str] = {
+    87: "EXIT_FAILED_CARRIED_OVERNIGHT",
+    95: "EXIT_FAILED_CARRIED_OVERNIGHT",
+    101: "EXIT_FAILED_CARRIED_OVERNIGHT",
+    194: "EXIT_FAILED_CARRIED_OVERNIGHT",
+    196: "EXIT_FAILED_CARRIED_OVERNIGHT",
+    218: "TRADED_ON_EXCHANGE_HOLIDAY",
+    219: "TRADED_ON_EXCHANGE_HOLIDAY",
+    220: "TRADED_ON_EXCHANGE_HOLIDAY",
+}
+
 
 async def _load_mfe_mae(
     session: AsyncSession, trade_ids: list[int]
@@ -103,6 +119,10 @@ async def load_trades(
                 context_entry=trade.context_entry,
                 mfe=mfe,
                 mae=mae,
+                # Backtest runs have their own trades; the list is live-book ids.
+                excluded_reason=NON_ATTRIBUTABLE_TRADES.get(trade.trade_id)
+                if trade.run_id is None
+                else None,
             )
         )
     return out

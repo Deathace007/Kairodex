@@ -145,3 +145,24 @@ def test_equity_curve_stats_empty():
     stats = performance.equity_curve_stats([])
     assert stats.n_points == 0
     assert stats.current_equity is None
+
+
+def test_non_attributable_trades_are_left_out_of_every_metric():
+    import dataclasses
+
+    kept = [_trade(net_pnl=Decimal(100)), _trade(net_pnl=Decimal(-50))]
+    carried = dataclasses.replace(
+        _trade(net_pnl=Decimal(3190)), excluded_reason="EXIT_FAILED_CARRIED_OVERNIGHT"
+    )
+    with_it = performance.summarize([*kept, carried])
+    without = performance.summarize(kept)
+    assert with_it.net_pnl == without.net_pnl == Decimal(50)
+    assert with_it.win_rate == without.win_rate == 0.5
+    assert with_it.n_closed == 2
+    assert with_it.n_excluded == 1
+
+
+def test_non_attributable_list_is_exactly_the_audited_eight():
+    from kairodex.analytics.loader import NON_ATTRIBUTABLE_TRADES
+
+    assert sorted(NON_ATTRIBUTABLE_TRADES) == [87, 95, 101, 194, 196, 218, 219, 220]

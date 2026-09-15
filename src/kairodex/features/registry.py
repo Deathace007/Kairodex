@@ -19,7 +19,12 @@ FeatureFn = Callable[[FeatureContext], float | None]
 # mixes with old values under the same name. Not per-feature: one version
 # for the whole registry is the simplest thing that satisfies "never
 # silently reinterpret history," and matches the single JSONB blob per row.
-REGISTRY_VERSION = "1"
+# "1" -> "2" on 2026-09-15: build_context now sets `session_open_ts`, so
+# vwap_position / price_acceptance / POC distance are session-scoped (they
+# silently used 5 days of bars under "1"), opening_range_position computes,
+# and iv_rank / iv_percentile have a history. Do not mix versions in one
+# dataset — `backtest.metalabel.load_dataset` refuses to.
+REGISTRY_VERSION = "2"
 
 
 @dataclass(frozen=True, slots=True)

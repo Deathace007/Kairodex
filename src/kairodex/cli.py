@@ -285,6 +285,29 @@ async def _backfill_outcomes(
     )
 
 
+@backtest_app.command("backfill-atm-iv")
+def backfill_atm_iv_cmd(
+    since: str = typer.Option(..., help="YYYY-MM-DD — first session to record"),
+    until: str = typer.Option("", help="YYYY-MM-DD, inclusive — default today"),
+) -> None:
+    """Fill `atm_iv_daily` for every NSE watchlist underlying, one session
+    at a time (~1.3 s per underlying per session). Idempotent. The jobs
+    process keeps it current nightly after this."""
+    start = datetime.date.fromisoformat(since)
+    end = datetime.date.fromisoformat(until) if until else datetime.date.today()
+    asyncio.run(_backfill_atm_iv(start, end))
+
+
+async def _backfill_atm_iv(start: datetime.date, end: datetime.date) -> None:
+    from kairodex.jobs import record_atm_iv_for_day
+
+    day = start
+    while day <= end:
+        written = await record_atm_iv_for_day(day)
+        typer.echo(f"{day}: {written} underlyings")
+        day += datetime.timedelta(days=1)
+
+
 @backtest_app.command("backfill-features")
 def backfill_features_cmd(
     segment: Segment = typer.Option(..., help="nse_stock, nse_index, us_stock, or us_index"),
@@ -335,6 +358,9 @@ def metalabel_cmd(
     features: str = typer.Option(
         "all", help="all | used (the 3 detectors read) | discarded (the other 12)"
     ),
+    registry_version: str | None = typer.Option(
+        None, help="feature registry version to train on — required once rows span two"
+    ),
 ) -> None:
     """MEASURE whether a meta-label model can rank winning signals above
     losing ones. Trades nothing and wires nothing.
@@ -347,7 +373,9 @@ def metalabel_cmd(
     Read the AUC per fold, not the mean: three of four hypotheses tested
     on 2026-08-14 looked good in aggregate and died on the per-session
     split. An AUC at 0.5 means no edge, and that is a valid result."""
-    asyncio.run(_metalabel(segment, folds, show_features, permutations, features))
+    asyncio.run(
+        _metalabel(segment, folds, show_features, permutations, features, registry_version)
+    )
 
 
 async def _metalabel(
@@ -356,6 +384,7 @@ async def _metalabel(
     show_features: bool,
     permutations: int = 0,
     features: str = "all",
+    registry_version: str | None = None,
 ) -> None:
     from kairodex.backtest.metalabel import (
         STRATEGY_FEATURES,
@@ -368,7 +397,7 @@ async def _metalabel(
 
     sessionmaker = get_sessionmaker()
     async with sessionmaker() as session:
-        data = await load_dataset(session, segment=segment)
+        data = await load_dataset(session, segment=segment, registry_version=registry_version)
     if len(data) == 0:
         typer.echo(f"{segment.value}: no signals with BOTH features and outcomes — run "
                    "`backtest backfill-features` and `backtest backfill-outcomes` first")

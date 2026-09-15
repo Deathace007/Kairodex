@@ -537,3 +537,19 @@ def test_untouched_initial_stop_still_reads_stop_loss():
     pos = _position(current_mark=Decimal(89), breakeven_trigger_pct=0.10)
     decision = stop_loss_check(pos)
     assert decision is not None and decision.reason == "STOP_LOSS"
+
+
+def test_quiet_leg_exits_from_15_00_but_a_live_leg_waits_for_15_15():
+    """15:05 IST = 09:35 UTC. A leg frozen for 10 minutes leaves now; one
+    that just traded holds until the normal 15-minute cushion."""
+    at_1505 = datetime.datetime(2026, 8, 5, 9, 35, tzinfo=datetime.UTC)
+    opened = datetime.datetime(2026, 8, 5, 5, 0, tzinfo=datetime.UTC)
+    quiet = _position(opened_at=opened, price_unchanged_secs=600.0)
+    live = _position(opened_at=opened, price_unchanged_secs=20.0)
+    unknown = _position(opened_at=opened)
+    decision = session_close_exit_check(quiet, at_1505)
+    assert decision is not None and decision.reason == "EOD_EXIT"
+    assert session_close_exit_check(live, at_1505) is None
+    assert session_close_exit_check(unknown, at_1505) is None
+    at_1440 = datetime.datetime(2026, 8, 5, 9, 10, tzinfo=datetime.UTC)
+    assert session_close_exit_check(quiet, at_1440) is None

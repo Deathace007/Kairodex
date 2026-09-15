@@ -41,3 +41,6 @@ alembic/versions/__pycache__/
 # never pushed. Left untracked by hand until 2026-08-14, when a `git add -A`
 # nearly committed three of them.
 docs/reports/
+
+# VM database backups (dumps can be GBs — local only, never committed)
+backups/

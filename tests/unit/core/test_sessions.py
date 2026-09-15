@@ -2,7 +2,13 @@ import datetime
 import zoneinfo
 
 from kairodex.core.enums import Market
-from kairodex.core.sessions import is_session_open_now, local_date_for, session_window_utc
+from kairodex.core.sessions import (
+    is_session_open_now,
+    local_date_for,
+    nse_holidays,
+    session_seconds_between,
+    session_window_utc,
+)
 
 
 def test_nse_session_window_is_fixed_ist_offset():
@@ -79,3 +85,22 @@ def test_weekday_is_taken_on_the_markets_own_local_date():
     sat_early_ist = datetime.datetime(2026, 8, 8, 0, 30, tzinfo=zoneinfo.ZoneInfo("Asia/Kolkata"))
     assert sat_early_ist.astimezone(datetime.UTC).weekday() == 4  # Friday in UTC
     assert is_session_open_now(Market.NSE, sat_early_ist) is False
+
+
+def test_nse_holiday_is_closed_all_day_and_excluded_from_session_time():
+    """2026-09-14 (Ganesh Chaturthi): the engine traded it before the
+    calendar existed. 10:30 IST = 05:00 UTC."""
+    holiday = datetime.datetime(2026, 9, 14, 5, 0, tzinfo=datetime.UTC)
+    assert datetime.date(2026, 9, 14) in nse_holidays()
+    assert not is_session_open_now(Market.NSE, holiday)
+    assert is_session_open_now(Market.NSE, holiday + datetime.timedelta(days=1))
+    # Friday 11 Sep close -> Tuesday 15 Sep 10:30 IST: the holiday Monday adds nothing.
+    fri_close = datetime.datetime(2026, 9, 11, 10, 0, tzinfo=datetime.UTC)
+    tue = datetime.datetime(2026, 9, 15, 5, 0, tzinfo=datetime.UTC)
+    assert session_seconds_between(Market.NSE, fri_close, tue) == 75 * 60
+
+
+def test_nse_holiday_file_matches_the_verified_2026_list():
+    days = {d for d in nse_holidays() if d.year == 2026}
+    assert len(days) == 16
+    assert all(d.weekday() < 5 for d in days)

@@ -92,6 +92,26 @@ class InstrumentSpec(Base):
     tick_size: Mapped[Decimal] = mapped_column(Numeric(10, 4), nullable=False)
 
 
+class AtmIvDaily(Base):
+    """One at-the-money implied volatility reading per underlying per
+    session — the history `iv_rank`/`iv_percentile` rank against
+    (`features.iv_history`). Written nightly by the jobs process; computing
+    it live cost ~1.3 s per underlying per day of history on option_quotes.
+
+    `atm_iv` is the median `option_quotes.vendor_iv` of legs with |delta|
+    0.40-0.60 between 15:00 and 15:15 IST on that session, in the vendor's
+    units (a fraction, e.g. 0.1868)."""
+
+    __tablename__ = "atm_iv_daily"
+
+    instrument_id: Mapped[int] = mapped_column(
+        ForeignKey("instruments.instrument_id"), primary_key=True
+    )
+    session_date: Mapped[datetime.date] = mapped_column(Date, primary_key=True)
+    atm_iv: Mapped[Decimal] = mapped_column(Numeric(10, 6), nullable=False)
+    n_quotes: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
 class TradingCalendar(Base):
     __tablename__ = "trading_calendar"
 

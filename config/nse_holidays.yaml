@@ -1,0 +1,33 @@
+# NSE equity-derivatives (F&O) trading holidays — read by
+# kairodex.core.sessions, so the engine and the recorder both treat these
+# days as closed.
+#
+# Source: NSE's own holiday master, https://www.nseindia.com/api/holiday-master?type=trading
+# (segment "FO"), fetched 2026-09-15. Weekend-dated entries (15-Feb, 21-Mar,
+# 15-Aug) are omitted — weekends are already closed. The 08-Nov Diwali
+# Muhurat special session is not modelled.
+#
+# Verified against recorded data before use: the weekdays in 2026 up to
+# 09-14 with no NIFTY bars are exactly the 11 pre-09-15 dates below, no
+# more and no fewer.
+#
+# UPDATE EVERY DECEMBER when NSE publishes the next year's list —
+# `kairodex status` flags a year with no dates. The engine's no-bars guard
+# (live_loop.exchange_shut_today) is the backstop if a date is missed.
+2026:
+  - 2026-01-15  # Municipal Corporation Election - Maharashtra
+  - 2026-01-26  # Republic Day
+  - 2026-03-03  # Holi
+  - 2026-03-26  # Shri Ram Navami
+  - 2026-03-31  # Shri Mahavir Jayanti
+  - 2026-04-03  # Good Friday
+  - 2026-04-14  # Dr. Baba Saheb Ambedkar Jayanti
+  - 2026-05-01  # Maharashtra Day
+  - 2026-05-28  # Bakri Id
+  - 2026-06-26  # Muharram
+  - 2026-09-14  # Ganesh Chaturthi
+  - 2026-10-02  # Mahatma Gandhi Jayanti
+  - 2026-10-20  # Dussehra
+  - 2026-11-10  # Diwali-Balipratipada
+  - 2026-11-24  # Prakash Gurpurb Sri Guru Nanak Dev
+  - 2026-12-25  # Christmas

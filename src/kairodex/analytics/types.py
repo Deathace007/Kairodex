@@ -65,6 +65,10 @@ class TradeRecord:
     context_entry: dict[str, object] | None
     mfe: Decimal | None
     mae: Decimal | None
+    # Set for trades whose P&L the strategy did not decide (see
+    # `analytics.loader.NON_ATTRIBUTABLE_TRADES`). Still listed everywhere
+    # trades are listed; left out of every performance metric.
+    excluded_reason: str | None = None
 
     @property
     def is_closed(self) -> bool:
@@ -121,6 +125,7 @@ class PerformanceSummary:
     avg_win: Decimal | None
     avg_loss: Decimal | None
     avg_holding_secs: float | None
+    n_excluded: int = 0  # trades left out as non-attributable (TradeRecord.excluded_reason)
 
 
 @dataclass(frozen=True, slots=True)

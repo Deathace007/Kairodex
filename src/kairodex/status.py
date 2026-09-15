@@ -11,6 +11,13 @@ from collections.abc import Mapping
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from kairodex.core.enums import Market
+from kairodex.core.sessions import (
+    is_session_open_now,
+    local_date_for,
+    nse_holidays,
+    session_window_utc,
+)
 from kairodex.data.quality import QualityFlag
 from kairodex.store.models import FeedHealth, OptionQuote
 
@@ -118,6 +125,22 @@ async def health_checks(session: AsyncSession, now: datetime.datetime) -> list[s
 
     lines = ["health"]
     hour_ago = now - datetime.timedelta(hours=1)
+
+    year = local_date_for(Market.NSE, now).year
+    if not any(d.year == year for d in nse_holidays()):
+        lines.append(f"  <<< config/nse_holidays.yaml has no dates for {year} — add NSE's list")
+    if is_session_open_now(Market.NSE, now):
+        open_dt, _ = session_window_utc(Market.NSE, local_date_for(Market.NSE, now))
+        if now - open_dt > datetime.timedelta(minutes=10):
+            bars_today = await one(
+                "SELECT count(*) FROM underlying_bars WHERE timeframe = '1m' AND ts >= :open",
+                open=open_dt,
+            )
+            flag = "" if bars_today else "<<< "
+            lines.append(
+                f"  {flag}NSE underlying bars today: {bars_today}"
+                + ("" if bars_today else " — session open but no bars: exchange shut or feed down")
+            )
     day_ago = now - datetime.timedelta(hours=24)
 
     for event, what in (("EXIT_FAILED", "exits that could not fill"),

@@ -14,8 +14,14 @@ from decimal import Decimal
 from kairodex.analytics.types import EquityCurveStats, EquityPoint, PerformanceSummary, TradeRecord
 
 
+def _attributable(trades: list[TradeRecord]) -> list[TradeRecord]:
+    """Every metric below starts here, so a non-attributable trade (see
+    `TradeRecord.excluded_reason`) can't leak into one of them."""
+    return [t for t in trades if t.excluded_reason is None]
+
+
 def _closed(trades: list[TradeRecord]) -> list[TradeRecord]:
-    return [t for t in trades if t.is_closed]
+    return [t for t in _attributable(trades) if t.is_closed]
 
 
 def win_rate(trades: list[TradeRecord]) -> float | None:
@@ -58,7 +64,7 @@ def expectancy(trades: list[TradeRecord]) -> Decimal | None:
 
 
 def avg_r_multiple(trades: list[TradeRecord]) -> float | None:
-    values = [t.r_multiple for t in trades if t.r_multiple is not None]
+    values = [t.r_multiple for t in _attributable(trades) if t.r_multiple is not None]
     if not values:
         return None
     return statistics.mean(values)
@@ -86,6 +92,8 @@ def avg_holding_secs(trades: list[TradeRecord]) -> float | None:
 
 
 def summarize(trades: list[TradeRecord]) -> PerformanceSummary:
+    n_excluded = len(trades) - len(_attributable(trades))
+    trades = _attributable(trades)
     closed = _closed(trades)
     gross = sum((t.gross_pnl for t in closed if t.gross_pnl is not None), Decimal(0))
     net = sum((t.net_pnl for t in closed if t.net_pnl is not None), Decimal(0))
@@ -104,6 +112,7 @@ def summarize(trades: list[TradeRecord]) -> PerformanceSummary:
         avg_win=avg_win(trades),
         avg_loss=avg_loss(trades),
         avg_holding_secs=avg_holding_secs(trades),
+        n_excluded=n_excluded,
     )
 
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime
 import uuid
+from decimal import Decimal
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -17,7 +18,7 @@ from kairodex.core.enums import InstrumentKind, Segment
 from kairodex.data.quality import flag_tick
 from kairodex.data.types import Bar, ChainSnapshot, InstrumentRecord, Tick
 from kairodex.store.models import ChainSnapshot as ChainSnapshotRow
-from kairodex.store.models import Instrument, OptionQuote, UnderlyingBar
+from kairodex.store.models import Instrument, InstrumentSpec, OptionQuote, UnderlyingBar
 
 
 async def upsert_instrument(session: AsyncSession, rec: InstrumentRecord, provider: str) -> int:
@@ -99,6 +100,7 @@ async def upsert_instrument(session: AsyncSession, rec: InstrumentRecord, provid
         if rec.underlying_symbol is not None:
             existing.underlying_symbol = rec.underlying_symbol
         await session.flush()
+        await record_spec(session, existing.instrument_id, rec, now.date())
         return existing.instrument_id
 
     row = Instrument(
@@ -119,7 +121,55 @@ async def upsert_instrument(session: AsyncSession, rec: InstrumentRecord, provid
     )
     session.add(row)
     await session.flush()
+    await record_spec(session, row.instrument_id, rec, now.date())
     return row.instrument_id
+
+
+async def record_spec(
+    session: AsyncSession, instrument_id: int, rec: InstrumentRecord, today: datetime.date
+) -> None:
+    """Keep `instrument_specs` (SCD-2) in step with the vendor's lot/tick
+    size for derivatives.
+
+    The instrument master has always carried `lot_size`
+    (`upstox.client._parse_instrument` parses it) and it was dropped here:
+    `instrument_specs` held 0 rows on 2026-09-15, so the engine sized every
+    NSE contract as 25 units — wrong sizing, exposure and P&L for every
+    name whose real lot isn't 25. Futures and options only: an equity
+    record's lot_size is 1, the cash-market lot, which is not the unit an
+    option on it trades in.
+
+    Unchanged -> no write. Changed -> the open row is closed yesterday and
+    a new one opens today (or, if the open row already started today, it
+    is corrected in place — valid_from is part of the key)."""
+    if rec.kind not in (InstrumentKind.OPTION, InstrumentKind.FUTURE) or not rec.lot_size:
+        return
+    tick_size = rec.tick_size if rec.tick_size is not None else Decimal(0)
+    current = await session.scalar(
+        select(InstrumentSpec).where(
+            InstrumentSpec.instrument_id == instrument_id,
+            InstrumentSpec.valid_to == datetime.date.max,
+        )
+    )
+    if current is not None:
+        if current.lot_size == rec.lot_size and current.tick_size == tick_size:
+            return
+        if current.valid_from == today:
+            current.lot_size = rec.lot_size
+            current.tick_size = tick_size
+            await session.flush()
+            return
+        current.valid_to = today - datetime.timedelta(days=1)
+    session.add(
+        InstrumentSpec(
+            instrument_id=instrument_id,
+            valid_from=today,
+            valid_to=datetime.date.max,
+            lot_size=rec.lot_size,
+            tick_size=tick_size,
+        )
+    )
+    await session.flush()
 
 
 async def store_chain_snapshot(

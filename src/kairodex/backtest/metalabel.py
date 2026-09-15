@@ -133,6 +133,7 @@ async def load_dataset(
     *,
     segment: Segment,
     min_ts: datetime.datetime | None = None,
+    registry_version: str | None = None,
 ) -> Dataset:
     """Join `feature_vectors` (X) to `signals.forward_outcome` (y).
 
@@ -153,7 +154,18 @@ async def load_dataset(
     )
     if min_ts is not None:
         query = query.where(Signal.ts >= min_ts)
+    if registry_version is not None:
+        query = query.where(FeatureVector.registry_version == registry_version)
     rows = list((await session.execute(query)).all())
+    # Registry "1" and "2" compute session-scoped features differently
+    # (features.registry.REGISTRY_VERSION); a model across both learns the
+    # seam, not the market — the hazard §21e measured for backfilled rows.
+    versions = {fv.registry_version for _sig, fv in rows}
+    if len(versions) > 1:
+        raise ValueError(
+            f"feature_vectors span registry versions {sorted(versions)} — "
+            "pass registry_version to train on one"
+        )
     if not rows:
         return Dataset([], np.empty((0, 0)), np.empty(0), [])
 

@@ -1,9 +1,10 @@
-"""Approximate NSE/US session windows — no holiday/half-day calendar
-(ARCHITECTURE.md §6's `trading_calendar` sync doesn't exist yet, same
-documented gap named in `kairodex.risk.gates.session_window_gate`'s own
-docstring), just "is this instant inside the market's own regular hours
-today." Shared by the two places that both needed this and, until now,
-each carried their own copy: `kairodex.risk.loader.is_session_open` (the
+"""NSE/US session windows. NSE trading holidays come from
+`config/nse_holidays.yaml` (NSE's own list, added 2026-09-15 after the
+engine traded the 09-14 holiday); US has no holiday calendar (segment
+dormant), and neither market models half-days or special sessions.
+
+Shared by the two places that both needed this and, until now, each
+carried their own copy: `kairodex.risk.loader.is_session_open` (the
 live trading gate — every entry signal passes through this) and
 `kairodex.analytics.breakdowns` (the "which third of the session"
 bucketer). Caught live: a P6 subagent review fixed the analytics copy's
@@ -18,6 +19,10 @@ from __future__ import annotations
 
 import datetime
 import zoneinfo
+from functools import lru_cache
+from pathlib import Path
+
+import yaml
 
 from kairodex.core.enums import Market
 
@@ -32,6 +37,21 @@ _NSE_SESSION = (datetime.time(9, 15), datetime.time(15, 30))  # 09:15-15:30 IST
 # date automatically.
 _NY = zoneinfo.ZoneInfo("America/New_York")
 _US_SESSION = (datetime.time(9, 30), datetime.time(16, 0))  # 09:30-16:00 ET
+
+
+# CWD-relative, same convention as config/segments (processes run from the repo root).
+_NSE_HOLIDAYS_FILE = Path("config/nse_holidays.yaml")
+
+
+@lru_cache
+def nse_holidays() -> frozenset[datetime.date]:
+    with _NSE_HOLIDAYS_FILE.open() as f:
+        raw = yaml.safe_load(f) or {}
+    return frozenset(d for dates in raw.values() for d in (dates or []))
+
+
+def is_market_holiday(market: Market, local_date: datetime.date) -> bool:
+    return market is Market.NSE and local_date in nse_holidays()
 
 
 def _market_zone(market: Market) -> zoneinfo.ZoneInfo:
@@ -88,16 +108,15 @@ def session_seconds_between(
 
     Counted by walking calendar dates rather than integrating, because
     the windows are per-local-date (DST moves the US one) and a position
-    is never held long enough for the loop to matter. Holidays are the
-    same known gap as everywhere else in this module — a holiday counts
-    as a session here, which errs toward exiting early, not late."""
+    is never held long enough for the loop to matter. NSE holidays
+    (`nse_holidays`) are excluded like weekends."""
     if end <= start:
         return 0.0
     total = 0.0
     day = local_date_for(market, start)
     last_day = local_date_for(market, end)
     while day <= last_day:
-        if day.weekday() < 5:
+        if day.weekday() < 5 and not is_market_holiday(market, day):
             open_dt, close_dt = session_window_utc(market, day)
             overlap_start = max(open_dt, start)
             overlap_end = min(close_dt, end)
@@ -123,19 +142,20 @@ def is_session_open_now(market: Market, now: datetime.datetime) -> bool:
     live trading (`risk.loader.is_session_open`'s fallback) and to
     bucket a past trade's entry time (`analytics.breakdowns`).
 
-    Weekends are closed for both markets. This is deliberately NOT the
-    "no holiday calendar" gap in this module's own docstring — a holiday
-    is an irregular exception needing real exchange data, whereas
-    Saturday and Sunday are the regular weekly schedule and need no feed
-    to know. Without this the time-of-day check alone answered True at
-    e.g. 09:15 IST on a Saturday, so the engine would have evaluated and
-    logged signals against a shut exchange all weekend.
+    Weekends are closed for both markets, and NSE holidays from
+    `config/nse_holidays.yaml` (an irregular exception needing the
+    exchange's own list, unlike the regular weekly schedule). Without the
+    weekend check the time-of-day check alone answered True at e.g. 09:15
+    IST on a Saturday, so the engine would have evaluated and logged
+    signals against a shut exchange all weekend.
 
     The weekday is taken on the *market's* local date, not UTC's: at
     2026-08-08 00:30 IST it is already Saturday in Mumbai while still
     Friday in UTC, and NSE's schedule follows Mumbai."""
     local_date = local_date_for(market, now)
     if local_date.weekday() >= 5:  # 5=Saturday, 6=Sunday
+        return False
+    if is_market_holiday(market, local_date):
         return False
     open_dt, close_dt = session_window_utc(market, local_date)
     return open_dt <= now <= close_dt
