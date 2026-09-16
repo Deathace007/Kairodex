@@ -3961,3 +3961,37 @@ Every variant goes negative once its best three trades are removed. The
 *ranking* is robust across all three lenses; the *level* is not. This
 sweep picks the least-bad exit ruleset, it does not demonstrate the
 strategy is profitable. That question needs the 8 clean sessions.
+
+### 28e. Shipped 2026-09-17
+
+`nse_stock.scratch_exit_after_minutes: 15 -> 40`. Nothing else — the
+runner guard is deliberately held back (§28c) so this change stays
+attributable, and `scratch_exit_min_mfe_pct` stays at 0.03 for the same
+reason.
+
+`nse_index` is left at 15. The sweep is nse_stock evidence and that
+segment has taken zero trades, so its scratch setting is inert; re-run
+`backtest.exit_replay` against it once it has a book, rather than
+copying a number across on the assumption the mechanism transfers.
+
+Also fixed on the way through: `test_bars_refresh_when_the_newest_is_
+older_than_max_age` compared a market-derived `end` against
+`date.today()`. The process clock is IST, so between 00:00 and 05:30 IST
+the local date is a day ahead of UTC and the test failed purely on what
+time of day the suite ran (caught at 02:45 IST). It now uses
+`local_date_for`, the same clock `recover_underlying_bars` deliberately
+uses. Production code was correct; only the assertion was wrong.
+
+**Watch, from the 09-17 session:**
+
+1. `SCRATCH_EXIT` share falls sharply — it was 5 of 9 exits on 09-16, all
+   at exactly 15 minutes. Expect far fewer, and none before minute 40.
+2. `STOP_LOSS` does not climb much. The sweep says switching scratch off
+   entirely moves it from 4 to 10 across 174 trades; at 40 minutes it
+   should barely move. A jump here is the signal that this was wrong.
+3. Trades that would have been scratched now resolve as
+   `BREAKEVEN_STOP`, `TRAILING_STOP` or `EOD_EXIT` — the overlap the
+   sweep attributes the gain to.
+4. Positions held longer means slots are occupied longer, so expect MORE
+   `MAX_CONCURRENT_POSITIONS_REACHED` than 09-16's 500, and fewer trades
+   per session than nine. That is the intended trade, not a regression.

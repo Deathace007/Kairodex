@@ -107,13 +107,40 @@ max_holding_sessions: 3
 # The +8% threshold is deliberately unchanged: 45 minutes is the knob the
 # evidence speaks to, and moving both at once would leave neither
 # attributable. Re-measure the threshold separately.
-scratch_exit_after_minutes: 15
+scratch_exit_after_minutes: 40
 scratch_exit_min_mfe_pct: 0.03
 # 45/0.08 -> 15/0.03 on 2026-09-15 — the separate threshold measurement the
 # note above deferred. Trades below +3% at 15 min (n=63) reached a best-ever
 # +3.1% and lost Rs 26,685; those above (n=69) reached +23.8% and made
 # Rs 22,510. Replay over 159 trades: +Rs 7,078 (+4,734 without the best
 # trade), positive in both halves; every 10-30 min x 2-3% cell helps.
+#
+# 15 -> 40 on 2026-09-17. The 09-15 replay above was measured over
+# `position_marks`, which STOP AT THE ORIGINAL EXIT — so every variant
+# that would have held LONGER than the live rule had no prices left to
+# hold over and was scored at its own truncation point. That method can
+# only ever favour a shorter window. `backtest.exit_replay` re-ran the
+# sweep over the legs' own `option_quotes` for the full session, 174
+# trades x 17 sessions, holding out 09-16 (the session that raised the
+# question, so it cannot also be the evidence):
+#
+#            full     hold-out   -best1   -best3
+#   15m      -853       +1,365   -4,033   -8,199
+#   25m   +11,433      +12,515   +2,779   -5,549
+#   40m   +13,858      +14,269   +4,534   -3,795   <- best under every lens
+#   off   +15,841      +12,859   +3,123   -5,205
+#
+# The optimum sits INSIDE the range, which is a more believable shape
+# than "delete the rule" — and lands back near the 45 this was before
+# 09-15. The mechanism is overlap: `breakeven_trigger_pct` below shipped
+# in the same plan and now does most of the job of cutting a trade before
+# it reaches the full stop (BREAKEVEN_STOP fires 40-54 times across
+# variants), so a 15-minute window was mostly cutting trades that would
+# have recovered. Switching the rule off entirely raises STOP_LOSS from
+# only 4 to 10, so the downside it guards is genuinely small now.
+#
+# `scratch_exit_min_mfe_pct` deliberately NOT moved with it — one knob at
+# a time, same discipline the 08-14 note above asked for. PROGRESS.md §28.
 
 # No new entries this close to the bell. Everything is intraday (user's
 # call, 2026-08-10: nothing held overnight), so a trade opened with less

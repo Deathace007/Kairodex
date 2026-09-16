@@ -8,6 +8,7 @@ calls for SPY/QQQ) to learn dates that change about weekly; re-asking every
 import datetime
 
 from kairodex.core.enums import Market
+from kairodex.core.sessions import local_date_for
 from kairodex.data.recorder import (
     BAR_REFRESH_INTERVAL,
     T1_POLL_INTERVAL,
@@ -159,7 +160,14 @@ async def test_bars_refresh_when_the_newest_is_older_than_max_age(monkeypatch):
     # returned 1327 ending 2026-08-07 14:33. Asking for `today` therefore
     # cannot ever reach today's session — the refresh ran, logged success,
     # and wrote nothing.
-    assert end > datetime.date.today(), "end is exclusive — today's bars are unreachable"
+    # Against the MARKET's own date, not `date.today()`. The process clock
+    # is IST, so between 00:00 and 05:30 IST the local date is already a
+    # day ahead of UTC and this assertion failed purely on what time the
+    # suite was run (caught 2026-09-17, 02:45 IST). `recover_underlying_bars`
+    # derives its own `today` from `local_date_for` for exactly this
+    # reason; the test has to use the same clock the code does.
+    market_today = local_date_for(Market.US, datetime.datetime.now(datetime.UTC))
+    assert end > market_today, "end is exclusive — today's bars are unreachable"
 
 
 async def test_bars_not_refetched_while_still_fresh():

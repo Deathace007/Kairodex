@@ -67,9 +67,15 @@ def test_every_segment_declares_a_confidence_floor_above_zero():
 
 def test_2026_09_15_fix_plan_values():
     """Pinned so a later edit to either YAML fails loudly rather than
-    silently changing what the replay measured."""
+    silently changing what the replay measured.
+
+    `scratch_exit_after_minutes` is the exception: it is no longer the
+    09-15 value. That plan set 15 from a replay over `position_marks`,
+    which stop at the original exit and so could not price any longer
+    hold; `backtest.exit_replay` re-measured it over the legs' own quotes
+    and 40 won under every lens (PROGRESS.md §28)."""
     stock = get_segment_config(Segment.NSE_STOCK)
-    assert (stock.entry_warmup_minutes, stock.scratch_exit_after_minutes) == (45, 15)
+    assert (stock.entry_warmup_minutes, stock.scratch_exit_after_minutes) == (45, 40)
     assert stock.scratch_exit_min_mfe_pct == 0.03
     assert stock.max_confidence == 0.90
     assert (stock.breakeven_trigger_pct, stock.breakeven_floor_pct) == (0.10, 0.0)
