@@ -314,17 +314,15 @@ def _fmt(s: dict[str, float]) -> str:
     return f"{s['n']:>4.0f} {s['net']:>10,.0f} {s['mean_r']:>7.3f} {s['win_pct']:>6.1f}% {pf}"
 
 
-async def main() -> None:
-    trades = await load_trades()
+def report(trades: list[TradeInput], title: str) -> None:
     sessions = sorted({t.session_date for t in trades})
     mid = sessions[len(sessions) // 2]
+    first_n = sum(1 for t in trades if t.session_date < mid)
+    print(f"\n\n{'=' * 72}\n{title}\n{'=' * 72}")
     print(
-        f"\n{len(trades)} attributable nse_stock trades with a usable quote path, "
-        f"{len(sessions)} sessions ({sessions[0]} .. {sessions[-1]})"
-    )
-    print(
-        "All replayed at 1 lot of the REAL lot size. Rupee totals are comparable "
-        "BETWEEN variants only, never against the recorded book.\n"
+        f"{len(trades)} trades, {len(sessions)} sessions "
+        f"({sessions[0]} .. {sessions[-1]}); "
+        f"split at {mid} — {first_n} trades first half, {len(trades) - first_n} second"
     )
 
     variants = [
@@ -352,19 +350,36 @@ async def main() -> None:
         pb = "inf" if b["pf"] == float("inf") else f"{b['pf']:.2f}"
         print(f"{label:<26} {a['net']:>10,.0f} {pa:>7} {b['net']:>10,.0f} {pb:>7}")
 
-    print("\nLeave-one-out: total with the single best trade removed")
-    print(f"{'variant':<26} {'net Rs':>10} {'drop':>10}")
-    print("-" * 48)
+    print("\nConcentration: total after removing the best 1 and best 3 trades")
+    print(f"{'variant':<26} {'full':>10} {'-best1':>10} {'-best3':>10}")
+    print("-" * 60)
     for label, outs in results.items():
-        tot = sum(float(o.net) for o in outs)
-        best = max(float(o.net) for o in outs)
-        print(f"{label:<26} {tot - best:>10,.0f} {best:>10,.0f}")
+        nets = sorted((float(o.net) for o in outs), reverse=True)
+        tot = sum(nets)
+        print(f"{label:<26} {tot:>10,.0f} {tot - nets[0]:>10,.0f} {tot - sum(nets[:3]):>10,.0f}")
 
     print("\nExit-reason mix (first exit leg per trade)")
     for label, outs in results.items():
         c = Counter(o.reasons[0] if o.reasons else "NONE" for o in outs)
         top = "  ".join(f"{k}={v}" for k, v in c.most_common(6))
         print(f"{label:<26} {top}")
+
+
+async def main() -> None:
+    trades = await load_trades()
+    print(
+        "All trades replayed at 1 lot of the REAL lot size. Rupee totals are "
+        "comparable BETWEEN variants only, never against the recorded book."
+    )
+    report(trades, "FULL SAMPLE")
+    # The 2026-09-16 session is what raised the question, so it cannot also
+    # be the evidence for the answer. If the ranking survives its removal
+    # the result is about the ruleset; if it collapses, it was about one day.
+    latest = max(t.session_date for t in trades)
+    report(
+        [t for t in trades if t.session_date != latest],
+        f"HOLD-OUT: excluding {latest}, the session that motivated the question",
+    )
 
 
 if __name__ == "__main__":
