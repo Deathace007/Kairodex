@@ -3880,3 +3880,84 @@ this codebase throughput failures look exactly like a quiet market.
    tonight; NIFTY iv_rank computes from 16 Sep; 02 Oct engine idle.
 4. Trade rate for the rest of today is now the first honest sample of
    the repaired ruleset — everything before 10:37 was throughput-capped.
+
+## 28. Exit-ladder sweep: the 09-15 scratch change went the wrong way (2026-09-16)
+
+`kairodex.backtest.exit_replay` — 174 attributable nse_stock trades, 17
+sessions, each replayed at 1 lot of its real lot size over its own
+1-minute quote path, calling `monitor.evaluate_exits` directly so the
+replay cannot drift from the engine.
+
+### 28a. Result
+
+Held out the 09-16 session — the one that raised the question, so it
+cannot also be the evidence. **That removal changed the answer**, which
+is the main reason to record this at all:
+
+| scratch | full sample | hold-out | hold-out −best1 | hold-out −best3 |
+|---|---|---|---|---|
+| 15m (live) | −853 | +1,365 | −4,033 | −8,199 |
+| 25m | +11,433 | +12,515 | +2,779 | −5,549 |
+| **40m** | +13,858 | **+14,269** | **+4,534** | **−3,795** |
+| off | +15,841 | +12,859 | +3,123 | −5,205 |
+
+On the full sample "scratch off" looked best. Without 09-16 it drops to
+third and the maximum moves **inside** the range, to 40 minutes — which
+is a far more believable shape than a monotone ride to deleting the
+rule. 40m is top under every lens in the hold-out: full, best-1 removed,
+best-3 removed. Second-half OOS agrees (40m +13,797, PF 2.15).
+
+The first half is near-flat for every variant (totals of ±800 across 70
+trades), so the earlier "the halves disagree" reading was wrong — the
+first half simply carries almost no signal.
+
+### 28b. Why 09-15 got it backwards
+
+`scratch_exit_after_minutes` went 45 → 15 on 2026-09-15 on a replay that
+reported +Rs 7,078. The measured optimum is ~40 — i.e. approximately
+where it already was. Two things account for it:
+
+1. **That replay priced trades over `position_marks`, which stop at the
+   original exit.** A variant that holds *longer* than the live rule did
+   has no prices to hold over, so every longer window was scored at its
+   truncation point. The method could only ever favour shorter windows.
+   This sweep reads `option_quotes` for the whole session instead, which
+   is why it can see 40 beating 15.
+2. **The breakeven floor shipped in the same plan.** The scratch rule's
+   job was cutting trades before they reached the full stop; the floor
+   now does much of that (`BREAKEVEN_STOP` fires 40-54 times across
+   variants). The two overlap, so scratch at 15 is mostly cutting trades
+   that would have recovered. Switching it off entirely raises
+   `STOP_LOSS` from 4 to only 10 — the downside it guards is now small.
+
+Lesson for the next replay: **`position_marks` cannot answer any
+question of the form "what if we had held longer".** Use the leg's own
+quotes.
+
+### 28c. The runner guard — real but small, NOT shipped yet
+
+With the guard on, `PARTIAL_EXIT_R2` goes to zero and reappears as
+`EOD_EXIT`/`TRAILING_STOP`, and `PROFIT_TARGET` fires for the first time
+(1-2 trades reach +100%). The 2026-08-14 revert's fear — that abstaining
+hands 1-lot positions to the stop — does not materialise: `STOP_LOSS`
+counts are identical guard-on vs guard-off in every cell. The breakeven
+floor is catching them, which is exactly the protection that did not
+exist when the guard was reverted.
+
+But the effect is small and partly rested on 09-16: in the hold-out it
+is +747/+748/+945 in three cells and −36 in the fourth, and on
+leave-one-out it is mildly negative in two. Mean R improves in every
+cell of both samples, which is the measure least dominated by one trade.
+
+Deliberately **not shipped with the scratch change**: moving both at once
+would leave neither attributable, which is the mistake
+`scratch_exit_after_minutes`' own config comment warns about. Revisit
+after 8 sessions, when there will be many more 1-lot trades — exactly
+the population it acts on.
+
+### 28d. Honest limit
+
+Every variant goes negative once its best three trades are removed. The
+*ranking* is robust across all three lenses; the *level* is not. This
+sweep picks the least-bad exit ruleset, it does not demonstrate the
+strategy is profitable. That question needs the 8 clean sessions.
