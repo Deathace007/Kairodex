@@ -484,9 +484,7 @@ async def run_entry_tick(
     else:
         lot_size = 100
 
-    chain = chain_at_min_dte(
-        feature_ctx.chain, local_date_for(segment.market, now), config.min_dte
-    )
+    chain = chain_at_min_dte(feature_ctx.chain, local_date_for(segment.market, now), config.min_dte)
     if not chain:
         signal.reject_stage, signal.reject_reason = "contract_selection", "NO_EXPIRY_AT_MIN_DTE"
         await session.commit()
@@ -508,7 +506,7 @@ async def run_entry_tick(
         return TickOutcome(signal.signal_id, False, signal.reject_stage, signal.reject_reason)
 
     candidate = selection.selected
-    instrument_id = await _resolve_leg_instrument_id(session, underlying, candidate)
+    instrument_id = await _resolve_leg_instrument_id(session, underlying, candidate, now)
     if instrument_id is None:
         signal.reject_stage = "contract_selection"
         signal.reject_reason = "LEG_INSTRUMENT_NOT_FOUND"
@@ -581,7 +579,10 @@ async def run_entry_tick(
         chain_complete=proposal.chain_complete,
     )
     order_request = OrderRequest(
-        trade_id=0, instrument_id=instrument_id, side=Side.BUY, qty=sizing.lots,
+        trade_id=0,
+        instrument_id=instrument_id,
+        side=Side.BUY,
+        qty=sizing.lots,
         lot_size=lot_size,
     )
     execution = await broker.execute(order_request, quote, now, attempt=1)
@@ -613,8 +614,14 @@ async def run_entry_tick(
     return TickOutcome(signal.signal_id, True, None, None, trade_id=trade_id)
 
 
+_LEG_TIEBREAK_LOOKBACK = datetime.timedelta(days=30)
+
+
 async def _resolve_leg_instrument_id(
-    session: AsyncSession, underlying: Instrument, candidate: ContractCandidate
+    session: AsyncSession,
+    underlying: Instrument,
+    candidate: ContractCandidate,
+    now: datetime.datetime,
 ) -> int | None:
     """The (underlying, strike, type, expiry) key is not unique in
     `instruments` — two rows for one real contract were reachable, and
@@ -631,26 +638,50 @@ async def _resolve_leg_instrument_id(
     quoted anyway: the same money path must not go back to picking
     arbitrarily if a duplicate ever reappears from some other direction,
     and "the row the feed is actually writing to" is the only defensible
-    tiebreak."""
-    last_quote = (
-        select(OptionQuote.instrument_id, func.max(OptionQuote.ts).label("last_ts"))
-        .group_by(OptionQuote.instrument_id)
-        .subquery()
-    )
-    row = await session.scalar(
-        select(Instrument)
-        .outerjoin(last_quote, last_quote.c.instrument_id == Instrument.instrument_id)
-        .where(
-            Instrument.exchange == underlying.exchange,
-            Instrument.underlying_symbol == underlying.symbol,
-            Instrument.strike == candidate.strike,
-            Instrument.option_type == candidate.option_type,
-            Instrument.expiry == candidate.expiry,
+    tiebreak.
+
+    The tiebreak is resolved in a *second* query over an explicit id
+    list, not as a joined subquery, and only when there is actually more
+    than one candidate row. Written as one join it read
+    `max(ts) GROUP BY instrument_id` over the whole of `option_quotes`
+    with no instrument filter and no `ts` bound — a ~90M-row aggregate
+    materialised before the join, on every leg of every entry tick. That
+    is what the 2026-09-16 SLOW SWEEP was: nse_stock cycles of 485-1477s
+    against an expected ~150s, so 20 underlyings got swept roughly three
+    times in the first 75 minutes instead of twenty. Filtering by an
+    explicit id list plus a bounded `ts` window turns it into a PK
+    (instrument_id, ts) index scan over a handful of chunks, and the
+    common single-row case now costs no quote query at all."""
+    rows = (
+        await session.scalars(
+            select(Instrument).where(
+                Instrument.exchange == underlying.exchange,
+                Instrument.underlying_symbol == underlying.symbol,
+                Instrument.strike == candidate.strike,
+                Instrument.option_type == candidate.option_type,
+                Instrument.expiry == candidate.expiry,
+            )
         )
-        .order_by(last_quote.c.last_ts.desc().nullslast())
+    ).all()
+    if not rows:
+        return None
+    if len(rows) == 1:
+        return rows[0].instrument_id
+    ids = [r.instrument_id for r in rows]
+    freshest = await session.scalar(
+        select(OptionQuote.instrument_id)
+        .where(
+            OptionQuote.instrument_id.in_(ids),
+            OptionQuote.ts >= now - _LEG_TIEBREAK_LOOKBACK,
+            OptionQuote.ts <= now,
+        )
+        .order_by(OptionQuote.ts.desc())
         .limit(1)
     )
-    return row.instrument_id if row is not None else None
+    # No quote for any duplicate inside the window: the old query's
+    # `nullslast` had no better answer either, so keep its stable
+    # fallback of the first matching row.
+    return freshest if freshest is not None else ids[0]
 
 
 async def _record_fill(
@@ -1037,8 +1068,13 @@ async def run_exit_tick(
             ts=now,
         )
     order = Order(
-        trade_id=trade.trade_id, ts=now, instrument_id=trade.instrument_id, side=Side.SELL,
-        qty=execution.filled_qty, order_type="MARKET", status="FILLED",
+        trade_id=trade.trade_id,
+        ts=now,
+        instrument_id=trade.instrument_id,
+        side=Side.SELL,
+        qty=execution.filled_qty,
+        order_type="MARKET",
+        status="FILLED",
     )
     session.add(order)
     await session.flush()
@@ -1170,9 +1206,7 @@ async def run_exit_tick(
     )
 
 
-def _exit_quote(
-    segment: Segment, latest_quote: OptionQuote, mark: Decimal
-) -> QuoteSnapshot | None:
+def _exit_quote(segment: Segment, latest_quote: OptionQuote, mark: Decimal) -> QuoteSnapshot | None:
     """The book to price an exit against — modelled for US, observed for NSE.
 
     `bid_sz`/`ask_sz` used to fall back to **0** when the vendor published
