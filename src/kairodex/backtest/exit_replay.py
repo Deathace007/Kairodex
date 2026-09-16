@@ -234,21 +234,35 @@ _TRADES_SQL = text(
     """
 )
 
-# One instrument, one bounded ts window — a PK (instrument_id, ts) range
-# scan. Deliberately NOT a single join across every trade: an unbounded
-# scan of this hypertable is what crippled the engine on 2026-09-16.
+# One instrument, one bounded ts window, ordered by the PK itself — a
+# pure (instrument_id, ts) range scan with no sort step. Deliberately NOT
+# a single join across every trade: an unbounded scan of this hypertable
+# is what crippled the engine on 2026-09-16. Resampling to 1-minute
+# happens in Python (`_resample`) rather than as a `DISTINCT ON
+# date_trunc(...)`, which is not indexable and made the planner sort the
+# whole window — 4s per trade against roughly 0.2s this way.
 _PATH_SQL = text(
     """
-    SELECT DISTINCT ON (date_trunc('minute', q.ts))
-           date_trunc('minute', q.ts) AS m, q.ltp
+    SELECT q.ts, q.ltp
       FROM option_quotes q
      WHERE q.instrument_id = :iid
        AND q.ts >= :frm
        AND q.ts <= :to
        AND q.ltp IS NOT NULL
-     ORDER BY date_trunc('minute', q.ts), q.ts DESC
+     ORDER BY q.ts
     """
 )
+
+
+def _resample(
+    rows: list[tuple[datetime.datetime, object]],
+) -> tuple[tuple[datetime.datetime, Decimal], ...]:
+    """Last LTP in each wall-clock minute. The rows arrive in ts order, so
+    one pass overwrites its way to the last value per minute."""
+    per_minute: dict[datetime.datetime, Decimal] = {}
+    for ts, ltp in rows:
+        per_minute[ts.replace(second=0, microsecond=0)] = Decimal(str(ltp))
+    return tuple(sorted(per_minute.items()))
 
 
 async def load_trades() -> list[TradeInput]:
@@ -258,12 +272,13 @@ async def load_trades() -> list[TradeInput]:
         rows = (await session.execute(_TRADES_SQL, {"excluded": list(NON_ATTRIBUTABLE)})).all()
         for r in rows:
             _, close_utc = session_window_utc(Segment.NSE_STOCK.market, r.sdate)
-            path = (
+            rows_q = (
                 await session.execute(
                     _PATH_SQL,
                     {"iid": r.instrument_id, "frm": r.opened_at, "to": close_utc},
                 )
             ).all()
+            path = _resample([(ts, ltp) for ts, ltp in rows_q])
             if len(path) < 2:
                 continue
             out.append(
@@ -275,7 +290,7 @@ async def load_trades() -> list[TradeInput]:
                     avg_entry=Decimal(str(r.avg_entry)),
                     lot_size=int(r.lot_size),
                     expiry=r.expiry,
-                    path=tuple((m, Decimal(str(ltp))) for m, ltp in path),
+                    path=path,
                 )
             )
     return out
