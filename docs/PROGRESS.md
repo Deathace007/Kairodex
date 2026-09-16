@@ -3790,3 +3790,93 @@ exposure cap. Capital stays Rs 50,000 (ADR 0005 unchanged).
 3. 16:05 IST job writes 22 `atm_iv_daily` rows; NIFTY iv_rank computes from 16 Sep.
 4. New feature vectors carry `registry_version = '2'`.
 5. 02 Oct: engine and recorder idle all day (first calendar holiday since the fix).
+
+## 27. First live session on the repaired build (2026-09-16)
+
+### 27a. What the repairs did, measured live
+
+Checked against §26c, 09:15-10:40 IST:
+
+1. **`relative_strength` alive.** Present in 63 of 63 nse_stock signals.
+   No `DETECTOR_DEAD` halt in either segment. F1 is closed.
+2. **Lot sizing real, `max_concurrent 2` respected.** Trades opened at
+   real lot sizes — M&M 1 lot x 200, HDFCBANK 1 x 650, AXISBANK 1 x 625 —
+   and `NO_TRADE_MIN_SIZE` rejected one signal whose leg did not fit the
+   Rs 11,430 slot. Two positions open at once, then
+   `MAX_CONCURRENT_POSITIONS_REACHED` on 6 later signals. Affordability
+   is per *leg premium*, not per name: AXISBANK rejected in the 09-15
+   bench (at a pricier leg) and fits today at 13.32.
+3. **`max_confidence` veto fires.** One `ABOVE_MAX_CONFIDENCE` rejection —
+   the 0.90 ceiling is doing work, not sitting inert.
+4. **Scratch rule fires at the new window.** Trade 234 (HDFCBANK) closed
+   `SCRATCH_EXIT` at 19 minutes for -Rs 91. Under the old 45-minute /
+   0.08 rule it would still have been open.
+5. **`registry_version = '2'`** on all 325 feature vectors written today.
+6. **nse_index silent by design.** 9 signals, all `BELOW_MIN_CONFIDENCE`.
+   2-of-2 unanimity plus `min_dte: 7` is a high bar; not a fault.
+
+A note on reading `trades` rows: `qty_lots` and `premium_paid` are
+*remaining* quantities, so a fully closed trade shows `qty_lots = 0` and
+`premium_paid = 0`. The entry is preserved in
+`risk_params.entry_qty_lots` / `entry_premium_paid`. Trade 234 looks
+like a zero-size trade and is not one.
+
+### 27b. F2 was not fixed — it had a second, larger cause
+
+The engine logged `SLOW SWEEP` four times before 10:30: 485s, 491s,
+1477s, 1154s against an expected ~150s. nse_stock got through its 20
+underlyings roughly **three times in the first 75 minutes instead of
+twenty**. Every repair above was working, on a loop running at a
+seventh of its intended rate.
+
+Sampling `pg_stat_activity` during a sweep found two backends pinned on
+the same statement for 136s and climbing, waiting on `IO/DataFileRead`.
+It came from `_resolve_leg_instrument_id`, which tie-broke duplicate
+`instruments` rows with
+
+```sql
+LEFT JOIN (SELECT instrument_id, max(ts) FROM option_quotes
+           GROUP BY instrument_id) ...
+```
+
+— no instrument filter, no `ts` bound. At ~90M rows that aggregate was
+materialised in full before the join, **on every leg of every entry
+tick**. It is the same root-cause class as the 09-01..09-09 chain-scan
+slowdown that §25 recorded as F2: an unbounded scan of the quotes
+hypertable. The 09-15 work fixed one instance of it and left this one.
+
+Fix (`ff61b50`): resolve the instrument rows first and return
+immediately when there is only one — the common case, which now costs no
+quote query at all. Tie-break only on a genuine duplicate, over an
+explicit id list plus a 30-day `ts` window, which is a PK
+`(instrument_id, ts)` index scan across a few chunks. Falls back to the
+first matching row when no duplicate has a quote in the window, matching
+the old `nullslast` behaviour.
+
+Deployed mid-session at 10:37 IST (engine state lives in the DB, so a
+restart carries open positions). Signals per minute, same watchlist,
+same market:
+
+| | before | after |
+|---|---|---|
+| nse_stock signals/min | 1-3 | 9-12 |
+
+No `SLOW SWEEP` since. A full 20-underlying cycle is back under two
+minutes.
+
+**Lesson worth keeping.** §26 verified every repair by unit test, by API
+response and by config read, and all of those passed. None of them could
+see this, because nothing was wrong with any repair — the loop carrying
+them was starved. The check that found it was watching the live
+system's own rate. Correctness tests do not measure throughput, and on
+this codebase throughput failures look exactly like a quiet market.
+
+### 27c. Watch
+
+1. No `SLOW SWEEP` for a full session; nse_stock sweeps stay under ~150s.
+2. Grep the rest of the codebase for other unbounded `option_quotes`
+   aggregates — two instances have now bitten, so assume a third.
+3. Carried over from §26c: 16:05 IST job writes 22 `atm_iv_daily` rows
+   tonight; NIFTY iv_rank computes from 16 Sep; 02 Oct engine idle.
+4. Trade rate for the rest of today is now the first honest sample of
+   the repaired ruleset — everything before 10:37 was throughput-capped.
