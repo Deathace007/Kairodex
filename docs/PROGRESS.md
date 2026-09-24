@@ -4083,3 +4083,42 @@ no spurious drawdown and no accidental de-risking via `risk_multiplier`.
 5. NIFTY still will not trade: p90 0.485 < 0.50 gate, and its clears land
    in warmup. Unchanged on purpose — a gate re-siting is a separate,
    measured decision.
+
+### 29e. Correction to §29b — the index funnel has a layer above the money
+
+§29b said nse_index was "deadlocked, not selective" because 109 signals
+cleared `min_confidence` and none were rejected on conviction. True, but
+incomplete, and the incompleteness matters: **most index ticks never
+create a signal at all.**
+
+`orchestrator.run_entry_tick` returns `None` at
+`if result.direction is None` when the scorer finds no direction — and
+that path writes no signal row and logs nothing. nse_index runs two
+detectors with `min_families: 2`, so it needs **2-of-2 unanimity** to
+produce a signal at all. Today, 09-24: 91 feature vectors written per
+underlying (the engine is sweeping normally), but only 12 NIFTY and 21
+BANKNIFTY signals — **~18% of evaluations produce a signal; 82% die at
+detector disagreement, silently.**
+
+This is why the engine looks dead in the journal for 40 minutes at a
+stretch, and why index signal counts swing 9-190 a day. Feature vectors
+and both detector inputs (`trend_state_strength`, `oi_change`) were
+present in all 39 post-10:07 vectors on 09-24, so it is not a feature
+gap — it is the unanimity requirement working as designed.
+
+So the real index funnel is three gates, not one:
+
+| layer | effect |
+|---|---|
+| 2-of-2 detector unanimity | ~82% of evaluations produce no signal |
+| `min_confidence: 0.50` | most survivors rejected (NIFTY p90 is 0.485) |
+| money (cap / min size) | 78 rejections over 6 sessions — **fixed 09-24** |
+
+The capital raise addresses the third layer only. **Expect the index to
+trade rarely even now** — a handful of BANKNIFTY trades a week at best.
+Anyone reading §29b alone would over-predict the effect.
+
+A silent `return None` on the segment's dominant path is also a
+monitoring gap worth closing: nothing in the logs or `kairodex status`
+distinguishes "evaluated and found nothing" from "engine wedged". That
+cost 20 minutes of misdiagnosis on 09-24.
