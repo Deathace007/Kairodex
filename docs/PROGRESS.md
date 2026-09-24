@@ -4122,3 +4122,105 @@ A silent `return None` on the segment's dominant path is also a
 monitoring gap worth closing: nothing in the logs or `kairodex status`
 distinguishes "evaluated and found nothing" from "engine wedged". That
 cost 20 minutes of misdiagnosis on 09-24.
+
+## 30. The meta-label model does not validate — and the label is why (2026-09-24)
+
+Ran `backtest metalabel` on nse_stock, both registry versions, with
+label-shuffle nulls. **It does not validate, so nothing was wired.**
+
+### 30a. The numbers
+
+v2 (correct features, 6 sessions, n=17,623, base rate 0.308) — 3 folds
+requested, only **1** materialised, because 6 sessions cannot support 3
+purged/embargoed folds:
+
+| test start | n_train | n_test | AUC | lift@10% |
+|---|---|---|---|---|
+| 2026-09-20 | 9,084 | 8,539 | 0.515 | 1.09 |
+
+v1 (22 sessions, n=26,573, base 0.321) — `relative_strength` was dead for
+most of this window, so one of the three detector features is unreliable
+here:
+
+| test start | n_test | AUC | lift@10% |
+|---|---|---|---|
+| 2026-08-14 | 3,414 | **0.501** | 0.96 |
+| 2026-08-30 | 896 | 0.565 | 1.28 |
+| 2026-09-07 | 1,063 | **0.498** | 1.01 |
+
+Both runs clear the permutation null on the *mean* (p = 0.048). That is
+not enough, and the module's own docstring says why: **judge the per-fold
+column.** Two of v1's three folds sit at chance (0.501, 0.498) with
+lift@10% of 0.96 and 1.01 — the top decile performing at or *below* base
+rate. The mean is carried entirely by one middle fold. This is precisely
+the aggregate-vs-per-session trap §20f recorded, where 3 of 4 hypotheses
+died.
+
+Two further tells that this is noise, not signal:
+
+- **Coefficient signs flip between the two samples.** `index_correlation`
+  +0.1139 in v2 vs −0.0378 in v1; `trend_state_strength` −0.0322 vs
+  +0.0526. The features v1 leans on hardest (`vwap_position` −0.229,
+  `volume_profile_poc_distance` +0.206) do not appear in v2's top eight at
+  all. Two samples of the same market should broadly agree if there were
+  structure.
+- **No feature shows a monotone quintile gradient.** All 15 wobble around
+  the ~0.31 base rate. `net_gamma_exposure`: 0.352, 0.287, 0.322, 0.265,
+  0.312. `index_correlation`: 0.279, 0.292, 0.307, 0.348, 0.311.
+
+### 30b. The label measures something we do not trade
+
+This is the finding that matters, and it reframes the negative result.
+
+`backtest.resolve.resolve_forward_outcome` is explicit in its own
+docstring: "a synthetic stop/target walk over the **underlying's** own
+subsequent bars, in ATR units… no option, no fill, no fees — that's Track
+B." Defaults: stop 1.0 ATR, target 2.0 ATR, 10 bars.
+
+What we actually trade is an **option premium** with a 20% stop, a
+40-minute (now 15) scratch test, a 20% trail, a 2R rung, fees and spread,
+over a 30-90 minute hold with theta running. §27b measured the gap
+directly: **a 0.28% adverse move in M&M cost 16.2% of premium and
+triggered a full stop-out.** Our effective stop is roughly 0.3% of
+underlying travel — an order of magnitude tighter than 1 ATR.
+
+So a signal can pass the label (underlying reaches +2 ATR before −1 ATR)
+while the real option position was stopped out long before, on a wiggle
+well inside 1 ATR. 2026-09-16 is the case in point: 7 of 9 trades were
+directionally right and 1 made money.
+
+**We have been training a filter to predict an outcome we do not trade.**
+
+Two consequences:
+
+1. §30a does **not** establish "the features carry no information about
+   our P&L." It establishes that they do not predict a 1-ATR/2-ATR
+   underlying walk. Those are different claims and only the second was
+   tested.
+2. The long-standing §17/§19/§20 conclusion that `confidence` is
+   *anti*-predictive rests on this same label. That conclusion is
+   therefore also untested against option P&L, and deserves re-measuring
+   before more is built on it.
+
+### 30c. Next measurement, not next change
+
+Relabel on **simulated option P&L**: for each historical signal, select
+the leg it would have bought, replay the live exit ladder over that leg's
+real quote path with real fees, and label by realised R. Then re-run the
+meta-label against that target.
+
+Most of the machinery exists — `backtest.exit_replay` already replays the
+ladder over a leg's quote path with `execution.costs` — but note its
+docstring warning: it holds the trade population fixed, which is fine for
+*labelling individual signals* and not fine for choosing a rule that
+changes holding time.
+
+Known caveats to state up front:
+
+- The label becomes co-dependent on the exit rules, so it must be
+  regenerated whenever those change. That is correct rather than
+  unfortunate: it is the objective we actually want to rank against.
+- Cost: ~44k signals each needing a bounded quote-path query. Will need
+  restricting to signals that reached contract selection, or sampling.
+- It may still come back "no edge." That remains a valid and useful
+  result, and is cheaper than another hand-written detector.
