@@ -18,7 +18,32 @@ They are swept together because they interact: a longer scratch window
 only pays if what it keeps alive can still run, and a runner only pays if
 it is not scratched first.
 
-METHOD, and its limits, stated plainly:
+READ THIS BEFORE TRUSTING ANY NUMBER THIS PRINTS
+------------------------------------------------
+It holds the TRADE POPULATION FIXED, and on a slot-limited book that is
+enough to invert the answer. It replays trades that were actually entered
+under whatever rule was live and asks "what if we had exited later" — but
+with `max_concurrent: 2` the exit rule decides which trades get entered at
+all. Holding losers longer keeps the slots busy; live, MAX_CONCURRENT
+rejections went 500 -> 737 -> 626 and mean holding time 47 -> 87 -> 142
+minutes as the scratch window moved 15 -> 40, so the engine took fewer and
+different trades. This module cannot see any of that, because it only
+knows about trades that WERE taken.
+
+It picked a 40-minute scratch window on that basis in September 2026 and
+the change cost ~Rs 6,168 over six live sessions before being reverted
+(PROGRESS.md §29). Holding time and slot occupancy are the same variable
+here; a fixed-population replay measures an exit rule in a world where
+capacity is free, and capacity is the binding constraint.
+
+So: use it to RANK exit rules on a fixed set of trades, which is what it
+honestly does. Do NOT use it to choose a rule that changes holding time on
+a slot-limited segment without separately modelling the entry stream. And
+if the leave-out columns flip the sign of every variant, the experiment
+cannot resolve the question — that is not a licence to trust the ordering,
+which is exactly the mistake made in §28.
+
+METHOD, and its other limits, stated plainly:
 
   * The ladder is not re-implemented. `monitor.evaluate_exits` is called
     directly, so the replay cannot drift from what the engine does. The

@@ -3995,3 +3995,91 @@ uses. Production code was correct; only the assertion was wrong.
 4. Positions held longer means slots are occupied longer, so expect MORE
    `MAX_CONCURRENT_POSITIONS_REACHED` than 09-16's 500, and fewer trades
    per session than nine. That is the intended trade, not a regression.
+
+## 29. Six sessions, −Rs 8,187: the §28 sweep was wrong (2026-09-24)
+
+nse_stock 43 trades over 09-16..09-23, 6 winners (14%), net −Rs 8,187.
+nse_index zero trades. Full analysis in
+`docs/reports/2026-09-24-six-session-review.html`.
+
+### 29a. The scratch change cost most of it — reverted
+
+| window | sessions | n | avg Rs | avg exit % | total |
+|---|---|---|---|---|---|
+| 15 | 09-16 | 5 | −216 | −2.6% | −1,080 |
+| 40 | 09-17..23 | 12 | **−730** | **−9.9%** | −8,757 |
+
+3.4× worse per trade, ~Rs 6,168 of the Rs 8,187. Reverted to 15.
+
+**Why §28 got it backwards.** `backtest.exit_replay` holds the trade
+population fixed: it replays trades that were actually entered under the
+live rule and asks "what if we had exited later". On a `max_concurrent: 2`
+book the exit rule decides *which trades get entered at all* — holding
+losers 25 minutes longer keeps both slots busy:
+
+| session | MAX_CONCURRENT rejects | trades | avg hold |
+|---|---|---|---|
+| 09-16 (window 15) | 500 | 9 | 47 min |
+| 09-17 (window 40) | 737 | 7 | 87 min |
+| 09-18 (window 40) | 626 | 4 | 142 min |
+
+Holding time and slot occupancy are the same variable here. The replay
+cannot see it, because it only knows about trades that were taken.
+
+**Two method rules, both earned the hard way** (now also in the module's
+own docstring so it cannot mislead again):
+
+1. Any exit-rule replay on a slot-limited book must model the entry
+   stream, or it is measuring the rule in a world where capacity is free.
+2. "The ranking is robust" is not a licence to ship when leave-out flips
+   the sign of every variant. §28 recorded exactly that and shipped
+   anyway. A leave-out that flips every sign is saying the experiment
+   cannot resolve the question.
+
+### 29b. nse_index was deadlocked, not selective — capital 50k → 100k
+
+109 index signals cleared `min_confidence` across six sessions and **not
+one** was rejected on conviction. 78 died on money (51
+`EXPOSURE_CAP_EXCEEDED` + 27 `NO_TRADE_MIN_SIZE`), 31 on the warmup clock.
+
+- **BANKNIFTY** cleared the gate 98×, but lot 30 × near-ATM premium
+  Rs 377–1,339 = Rs 11,325–40,161 per lot against a 30% cap of Rs 13,824.
+- **NIFTY** is affordable (one lot ~Rs 8,197) but its confidence p90 is
+  0.485, *below* the 0.50 gate; it cleared 11× and all 11 were in warmup.
+
+The segment could afford the instrument it never liked and liked the one it
+could not afford. User's call: raise capital to Rs 100,000 rather than drop
+BANKNIFTY. At ~Rs 96,079 equity the 30% cap is ~Rs 28,824, admitting a
+BANKNIFTY lot up to ~Rs 960 premium. Percentage risk limits are unchanged.
+
+`risk.accounting` derives equity as capital + realized + unrealized, so no
+DB edit was needed; the next snapshot picks it up. HWM re-bases upward, so
+no spurious drawdown and no accidental de-risking via `risk_multiplier`.
+
+### 29c. Not fixed, and why
+
+- **Trailing stop: 11 trades, 0 winners, −Rs 10,319.** Arithmetic, not
+  luck: the trail sits at `hwm × 0.80`, so profit at the trail is
+  `(1+MFE) × 0.80 − 1`, which is zero at exactly **+25% MFE**. Anything
+  peaking below that and retracing to the trail must lose. Left alone
+  deliberately — the fix needs measurement, and §29a is what shipping an
+  unmeasured exit change looks like.
+- **65% of trades never work.** 19 of 43 never exceeded +3% MFE
+  (−Rs 12,583); 28 of 43 never exceeded +10% (−Rs 20,818). Four trades
+  that reached 2R made +Rs 12,898. No exit rule fixes this — exits only
+  set the price of a bad entry. The filter that should catch them is
+  `min_confidence`, already measured twice as having *negative* predictive
+  value. **The system has no working entry-quality filter.** That is the
+  real problem and the next real project.
+
+### 29d. Watch, from 09-24
+
+1. `SCRATCH_EXIT` average back toward −Rs 216 and exits near −2.6%.
+2. `MAX_CONCURRENT` rejections fall back toward 500 and trades/session
+   toward 9 as holds shorten.
+3. nse_index takes its first trade since 09-15 — expect BANKNIFTY, a few
+   per session at most given `max_concurrent: 1` and a 45-min cooldown.
+4. nse_index equity reads ~Rs 96,079 on the next snapshot, not Rs 46,079.
+5. NIFTY still will not trade: p90 0.485 < 0.50 gate, and its clears land
+   in warmup. Unchanged on purpose — a gate re-siting is a separate,
+   measured decision.

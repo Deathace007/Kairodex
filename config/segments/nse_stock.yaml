@@ -107,7 +107,7 @@ max_holding_sessions: 3
 # The +8% threshold is deliberately unchanged: 45 minutes is the knob the
 # evidence speaks to, and moving both at once would leave neither
 # attributable. Re-measure the threshold separately.
-scratch_exit_after_minutes: 40
+scratch_exit_after_minutes: 15
 scratch_exit_min_mfe_pct: 0.03
 # 45/0.08 -> 15/0.03 on 2026-09-15 — the separate threshold measurement the
 # note above deferred. Trades below +3% at 15 min (n=63) reached a best-ever
@@ -141,6 +141,32 @@ scratch_exit_min_mfe_pct: 0.03
 #
 # `scratch_exit_min_mfe_pct` deliberately NOT moved with it — one knob at
 # a time, same discipline the 08-14 note above asked for. PROGRESS.md §28.
+#
+# 40 -> 15 on 2026-09-24. REVERTED: the 40 above was measured wrong and
+# cost real money. Live, over 6 sessions:
+#
+#   window 15 (09-16)      n=5   avg -Rs 216   avg exit -2.6%
+#   window 40 (09-17..23)  n=12  avg -Rs 730   avg exit -9.9%
+#
+# 3.4x worse per trade, ~Rs 6,168 of an Rs 8,187 six-session loss. A trade
+# that is not working does not sit still for 25 more minutes, it bleeds.
+#
+# The flaw in the sweep that produced 40: `backtest.exit_replay` holds the
+# TRADE POPULATION FIXED. It replays trades that were actually entered
+# under the 15-minute rule and asks "what if we had exited later" — but on
+# a `max_concurrent: 2` book the exit rule decides which trades get
+# entered at all. Holding losers 25 minutes longer keeps both slots busy:
+# MAX_CONCURRENT rejections went 500 -> 737 -> 626 and average holding time
+# 47 -> 87 -> 142 minutes, so live took fewer and different trades. The
+# replay cannot see that, because it only knows about trades that were
+# taken. Holding time and slot occupancy are the same variable on this
+# book; a fixed-population replay measures an exit rule in a world where
+# capacity is free, and capacity is the binding constraint.
+#
+# Its leave-out already said so and was overruled: EVERY variant went
+# negative with its best 3 trades removed, and it shipped anyway on "the
+# ranking is robust". A leave-out that flips every sign is saying the
+# experiment cannot resolve the question. PROGRESS.md §29.
 
 # No new entries this close to the bell. Everything is intraday (user's
 # call, 2026-08-10: nothing held overnight), so a trade opened with less

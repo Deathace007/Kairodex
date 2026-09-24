@@ -1,4 +1,27 @@
-capital: 50000
+# 50000 -> 100000 on 2026-09-24 (user's call), to break a DEADLOCK rather
+# than to take more risk. Over 6 sessions 109 index signals cleared
+# `min_confidence` and NOT ONE was rejected on conviction: 78 died on money
+# (51 EXPOSURE_CAP_EXCEEDED + 27 NO_TRADE_MIN_SIZE) and 31 on the warmup
+# clock. The segment could afford the instrument it never liked and liked
+# the instrument it could not afford:
+#
+#   BANKNIFTY  cleared the gate 98x; lot 30, near-ATM premium Rs 377-1,339,
+#              so ONE lot costs Rs 11,325-40,161 against a 30% cap of
+#              Rs 13,824 on the old Rs 46,079 equity. Almost never fit.
+#   NIFTY      lot 65, one lot ~Rs 8,197 — affordable, but its confidence
+#              p90 is 0.485, BELOW the 0.50 gate. Cleared 11x in 6
+#              sessions, all 11 inside the 45-minute warmup.
+#
+# `risk.accounting` derives equity as capital + realized + unrealized, so
+# this flows through on the next snapshot with no DB edit. At ~Rs 96,079
+# equity the 30% cap becomes ~Rs 28,824, which admits a BANKNIFTY lot up to
+# ~Rs 960 of premium — most of the observed near-ATM range.
+#
+# NOT a risk increase in percentage terms: base_risk_pct, hard_ceiling_pct,
+# max_premium_pct and exposure_cap_pct are all fractions of equity and are
+# unchanged. It raises absolute position size, which is the point — the
+# segment was structurally unable to buy one lot of its own instrument.
+capital: 100000
 currency: INR
 base_risk_pct: 0.07
 hard_ceiling_pct: 0.25

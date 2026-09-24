@@ -12,7 +12,7 @@ from kairodex.core.enums import Segment
     "segment,capital,currency,base_risk_pct,hard_ceiling_pct,max_premium_pct,max_concurrent",
     [
         (Segment.NSE_STOCK, 50000, "INR", 0.08, 0.35, 0.35, 2),  # 5 -> 2, 2026-09-15
-        (Segment.NSE_INDEX, 50000, "INR", 0.07, 0.25, 0.35, 1),  # 2 -> 1, 2026-09-15
+        (Segment.NSE_INDEX, 100000, "INR", 0.07, 0.25, 0.35, 1),  # capital 50k -> 100k, 2026-09-24
         (Segment.US_STOCK, 50000, "USD", 0.015, 0.03, 0.05, 6),
         (Segment.US_INDEX, 50000, "USD", 0.015, 0.03, 0.05, 6),
     ],
@@ -69,13 +69,13 @@ def test_2026_09_15_fix_plan_values():
     """Pinned so a later edit to either YAML fails loudly rather than
     silently changing what the replay measured.
 
-    `scratch_exit_after_minutes` is the exception: it is no longer the
-    09-15 value. That plan set 15 from a replay over `position_marks`,
-    which stop at the original exit and so could not price any longer
-    hold; `backtest.exit_replay` re-measured it over the legs' own quotes
-    and 40 won under every lens (PROGRESS.md §28)."""
+    `scratch_exit_after_minutes` is back to the 09-15 value of 15 after a
+    round trip: `backtest.exit_replay` re-measured it over full quote
+    paths and picked 40 (§28), which then cost ~Rs 6,168 over six live
+    sessions because that replay holds the trade population fixed and so
+    cannot see slot occupancy (§29). Reverted 2026-09-24."""
     stock = get_segment_config(Segment.NSE_STOCK)
-    assert (stock.entry_warmup_minutes, stock.scratch_exit_after_minutes) == (45, 40)
+    assert (stock.entry_warmup_minutes, stock.scratch_exit_after_minutes) == (45, 15)
     assert stock.scratch_exit_min_mfe_pct == 0.03
     assert stock.max_confidence == 0.90
     assert (stock.breakeven_trigger_pct, stock.breakeven_floor_pct) == (0.10, 0.0)
